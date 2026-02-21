@@ -536,6 +536,7 @@ def train_anomagic(
 
     pbar = tqdm(range(start_step, n_steps), desc="Training", initial=start_step, total=n_steps)
     skipped_nan = 0
+    prev_ckpt_dir = None
 
     for step in pbar:
         batch = next(data_iter)
@@ -658,15 +659,21 @@ def train_anomagic(
         # Save checkpoints + samples
         if (step + 1) % save_every == 0:
             print(f"\n  Checkpoint at step {step + 1}...", flush=True)
+            ckpt_dir = save_dir / f"checkpoint_{step + 1}"
             save_anomagic_checkpoint(
                 ip_adapter, optimizer,
-                save_dir / f"checkpoint_{step + 1}",
+                ckpt_dir,
                 band_mode=band_mode,
                 t2i_adapter=t2i_adapter,
                 unet=pipeline.unet if lora_rank > 0 else None,
                 step=step + 1,
                 losses=losses,
             )
+            # Delete previous checkpoint (keep only latest + final)
+            if prev_ckpt_dir is not None and prev_ckpt_dir.exists():
+                import shutil
+                shutil.rmtree(prev_ckpt_dir)
+            prev_ckpt_dir = ckpt_dir
             torch.cuda.empty_cache()
             try:
                 generate_anomagic_samples(
