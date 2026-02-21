@@ -1,0 +1,16 @@
+# Ignore everything at repo root
+/*
+
+# Keep the ignore file itself
+!/.gitignore
+
+# Keep code folder
+!/src/
+!/src/**
+
+!/scripts/
+!/scripts/**
+
+# Keep config file
+!/requirements.txt
+!/.gitattributes
