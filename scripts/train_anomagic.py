@@ -78,6 +78,8 @@ def train_anomagic(
     # LoRA on UNet
     lora_rank: int = 0,
     lora_alpha: int = 16,
+    lora_lr: float = 5e-5,
+    lora_mode: str = "all",  # "all" = self+cross, "cross" = cross-attention only
     # Conditioning dropout for CFG (mutually exclusive per-sample)
     drop_image_prob: float = 0.10,
     drop_text_prob: float = 0.10,
@@ -149,7 +151,7 @@ def train_anomagic(
     print(f"Loss ratio: {loss_core_ratio:.0%} core / {1-loss_core_ratio:.0%} band")
     print(f"Cross-attn mask: {'binary' if binary_cross_attn_mask else 'soft alpha'}")
     print(f"T2I-Adapter: {t2i_adapter_mode}")
-    print(f"LoRA: {'off' if lora_rank == 0 else f'rank={lora_rank}, alpha={lora_alpha}'}")
+    print(f"LoRA: {'off' if lora_rank == 0 else f'rank={lora_rank}, alpha={lora_alpha}, mode={lora_mode}, lr={lora_lr}'}")
     print(f"Conditioning dropout: image={drop_image_prob:.0%}, text={drop_text_prob:.0%}, both={drop_both_prob:.0%}")
     print(f"Data augmentation: {augment}")
     print(f"Visual mode: {visual_mode}")
@@ -250,11 +252,17 @@ def train_anomagic(
     # =========================================
     if lora_rank > 0:
         from peft import LoraConfig
+        if lora_mode == "cross":
+            # Cross-attention only: attn2 layers (text/IP conditioning)
+            target_modules = [r"attn2\.(to_k|to_q|to_v|to_out\.0)"]
+        else:
+            # All attention layers: self-attention (attn1) + cross-attention (attn2)
+            target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
         lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_alpha,
             init_lora_weights="gaussian",
-            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+            target_modules=target_modules,
         )
         pipeline.unet.add_adapter(lora_config)
         # Cast LoRA params to fp32 (they inherit fp16 from UNet base weights)
@@ -265,7 +273,7 @@ def train_anomagic(
         ip_proc_ids = {id(p) for proc in ip_adapter.attn_processors.values() for p in proc.parameters()}
         lora_params = [p for p in pipeline.unet.parameters() if p.requires_grad and id(p) not in ip_proc_ids]
         n_lora = sum(p.numel() for p in lora_params)
-        print(f"\nLoRA (rank={lora_rank}, alpha={lora_alpha}): {n_lora:,} params")
+        print(f"\nLoRA (rank={lora_rank}, alpha={lora_alpha}, mode={lora_mode}, lr={lora_lr}): {n_lora:,} params")
     else:
         lora_params = []
 
@@ -323,7 +331,7 @@ def train_anomagic(
     # Optional Group D: LoRA
     if lora_params:
         param_groups.append(
-            {"params": lora_params, "lr": lr, "weight_decay": 1e-3, "label": "D_lora"}
+            {"params": lora_params, "lr": lora_lr, "weight_decay": 1e-3, "label": "D_lora"}
         )
 
     # --- Verify: no duplicate params across groups ---
@@ -495,6 +503,8 @@ def train_anomagic(
         "visual_mode": visual_mode,
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
+        "lora_lr": lora_lr,
+        "lora_mode": lora_mode,
         "batch_size": batch_size,
         "lr_pretrained": lr_pretrained,
         "lr": lr,
@@ -1572,18 +1582,18 @@ def _generate_ood_grid(
     project_root = Path(__file__).parent.parent
     exp_dir = (
         project_root / "anomverse_extension" / "datasets" / "validation"
-        / "VisA" / "datasets" / "easy_test" / "cashew" / "experiment_UniNet"
+        / "VisA" / "datasets" / "easy_test" / "cashew" / "experiment_ResNet"
     )
     cashew_root = exp_dir.parent
-    canvas_imgs_dir = exp_dir / "source" / "normals" / "canvas" / "imgs"
+    canvas_imgs_dir = exp_dir / "source" / "canvas_normals" / "imgs"
     extra_normals_dir = cashew_root / "Data" / "Images" / "Normal"
     image_anno_csv = cashew_root / "image_anno.csv"
 
     # Check if experiment data exists
     if not exp_dir.exists():
         return
-    easy_manifest = exp_dir / "synthetic" / "placed_masks" / "easy" / "manifest.json"
-    hard_manifest = exp_dir / "synthetic" / "placed_masks" / "hard" / "manifest.json"
+    easy_manifest = exp_dir / "anomaly" / "masks" / "easy" / "manifest.json"
+    hard_manifest = exp_dir / "anomaly" / "masks" / "hard" / "manifest.json"
     if not easy_manifest.exists() and not hard_manifest.exists():
         return
 
@@ -1640,10 +1650,10 @@ def _generate_ood_grid(
             continue
 
         placed_mask_path = (
-            exp_dir / "synthetic" / "placed_masks" / difficulty / f"{canvas_id}.png"
+            exp_dir / "anomaly" / "masks" / difficulty / f"{canvas_id}.png"
         )
-        ref_img_path = exp_dir / "source" / "anomalies" / difficulty / "imgs" / f"{ref_id}.JPG"
-        ref_mask_path = exp_dir / "source" / "anomalies" / difficulty / "masks" / f"{ref_id}.png"
+        ref_img_path = exp_dir / "source" / "reference_anomalies" / difficulty / "imgs" / f"{ref_id}.JPG"
+        ref_mask_path = exp_dir / "source" / "reference_anomalies" / difficulty / "masks" / f"{ref_id}.png"
 
         if not all(p.exists() for p in (placed_mask_path, ref_img_path, ref_mask_path)):
             continue
@@ -1901,6 +1911,10 @@ if __name__ == "__main__":
                         help="LoRA rank for UNet attention layers (0=disabled, 16=matches IP-Adapter Plus K)")
     parser.add_argument("--lora-alpha", type=int, default=16,
                         help="LoRA alpha (scaling factor)")
+    parser.add_argument("--lora-lr", type=float, default=5e-5,
+                        help="Learning rate for LoRA params (default 5e-5)")
+    parser.add_argument("--lora-mode", type=str, default="all", choices=["all", "cross"],
+                        help="LoRA target: 'all' = self+cross attention, 'cross' = cross-attention only")
     parser.add_argument("--lr-pretrained", type=float, default=1e-4,
                         help="Learning rate for pretrained IP-Adapter params (Group A)")
     parser.add_argument("--lambda-sp", type=float, default=0.0,
@@ -1983,6 +1997,8 @@ if __name__ == "__main__":
         t2i_adapter_mode=args.t2i_adapter_mode,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
+        lora_lr=args.lora_lr,
+        lora_mode=args.lora_mode,
         drop_image_prob=args.drop_image_prob,
         drop_text_prob=args.drop_text_prob,
         drop_both_prob=args.drop_both_prob,

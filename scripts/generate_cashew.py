@@ -1,7 +1,11 @@
 """Generate synthetic cashew anomalies using trained Anomagic checkpoint.
 
-Reads placed masks + manifests from viz_mask_placement.py / redo_hard_placement.py,
-loads a trained checkpoint, and generates anomaly images with comparison panels.
+Reads placed masks + manifests, loads a trained checkpoint, and generates
+anomaly images with comparison panels.
+
+Supports both experiment layouts via --experiment flag:
+- ResNet (default): anomaly/masks/, source/reference_anomalies/, source/canvas_normals/
+- UniNet: synthetic/placed_masks/, source/anomalies/, source/normals/canvas/
 
 Two inference modes (matching the two placement strategies):
 - Easy (surface): noise_strength=0.7 — partial denoising preserves canvas context
@@ -28,15 +32,29 @@ from src.inference.generate import generate_anomagic_single
 
 
 # ── Paths ─────────────────────────────────────────────────────────────────
-EXP = Path(
+CASHEW_ROOT = Path(
     r"C:\Users\frede\Desktop\kandidat\speciale\anomverse_extension"
-    r"\datasets\validation\VisA\datasets\easy_test\cashew\experiment_UniNet"
+    r"\datasets\validation\VisA\datasets\easy_test\cashew"
 )
-CASHEW_ROOT = EXP.parent  # .../cashew/
-CANVAS_IMGS = EXP / "source" / "normals" / "canvas" / "imgs"
 EXTRA_NORMALS = CASHEW_ROOT / "Data" / "Images" / "Normal"
 IMAGE_ANNO_CSV = CASHEW_ROOT / "image_anno.csv"
 VIZ_SIZE = 512
+
+# Experiment-specific paths (set in main() via --experiment flag)
+EXPERIMENT = "ResNet"
+EXP = None
+CANVAS_IMGS = None
+
+
+def setup_experiment(experiment: str):
+    """Set experiment-specific global paths."""
+    global EXPERIMENT, EXP, CANVAS_IMGS
+    EXPERIMENT = experiment
+    EXP = CASHEW_ROOT / f"experiment_{experiment}"
+    if experiment == "ResNet":
+        CANVAS_IMGS = EXP / "source" / "canvas_normals" / "imgs"
+    else:  # UniNet
+        CANVAS_IMGS = EXP / "source" / "normals" / "canvas" / "imgs"
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────
@@ -214,8 +232,19 @@ def load_models(checkpoint_dir: Path, device: str = "cuda"):
     mask_visual = config.get("mask_visual", True)
     visual_mode = config.get("visual_mode", 0)
 
+    # Auto-detect self-attention layer count from checkpoint weights
+    ip_state = torch.load(checkpoint_dir / "ip_adapter.pt", map_location="cpu", weights_only=False)
+    sa_layers = set()
+    for k in ip_state:
+        if "masked_self_attn.layers." in k:
+            idx = k.split("masked_self_attn.layers.")[1].split(".")[0]
+            sa_layers.add(int(idx))
+    sa_num_layers = max(sa_layers) + 1 if sa_layers else 1
+    del ip_state
+
     print(f"Checkpoint config: type={adapter_type}, K={num_tokens}, "
-          f"scale={scale}, mask_visual={mask_visual}, visual_mode={visual_mode}")
+          f"scale={scale}, mask_visual={mask_visual}, visual_mode={visual_mode}, "
+          f"sa_layers={sa_num_layers}")
 
     # Pipeline
     from src.models.base import create_pipeline
@@ -237,6 +266,7 @@ def load_models(checkpoint_dir: Path, device: str = "cuda"):
         load_pretrained=True,
         mask_visual=mask_visual,
         visual_mode=visual_mode,
+        sa_num_layers=sa_num_layers,
     )
     ip_adapter.freeze_image_encoder()
     ip_adapter.load_finetuned(checkpoint_dir)
@@ -295,7 +325,10 @@ def generate_one(
     ).permute(2, 0, 1).unsqueeze(0).to(device)  # [1, 3, 512, 512] in [-1, 1]
 
     # 2. Load placed mask (image resolution → 512)
-    placed_dir = EXP / "synthetic" / "placed_masks" / difficulty
+    if EXPERIMENT == "ResNet":
+        placed_dir = EXP / "anomaly" / "masks" / difficulty
+    else:
+        placed_dir = EXP / "synthetic" / "placed_masks" / difficulty
     placed_mask_path = placed_dir / f"{canvas_id}.png"
     if not placed_mask_path.exists():
         print(f"  WARNING: placed mask not found: {placed_mask_path}")
@@ -306,8 +339,12 @@ def generate_one(
     mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).float().to(device)  # [1, 1, 512, 512]
 
     # 3. Load reference anomaly image + its own mask → CLIP crop
-    ref_imgs_dir = EXP / "source" / "anomalies" / difficulty / "imgs"
-    ref_masks_dir = EXP / "source" / "anomalies" / difficulty / "masks"
+    if EXPERIMENT == "ResNet":
+        ref_imgs_dir = EXP / "source" / "reference_anomalies" / difficulty / "imgs"
+        ref_masks_dir = EXP / "source" / "reference_anomalies" / difficulty / "masks"
+    else:
+        ref_imgs_dir = EXP / "source" / "anomalies" / difficulty / "imgs"
+        ref_masks_dir = EXP / "source" / "anomalies" / difficulty / "masks"
     ref_img_path = ref_imgs_dir / f"{ref_id}.JPG"
     ref_mask_path = ref_masks_dir / f"{ref_id}.png"
     if not ref_img_path.exists() or not ref_mask_path.exists():
@@ -512,7 +549,7 @@ def generate_one(
         panel.paste(col, (j * VIZ_SIZE, row_h))
 
     # Save panel to viz/inference_test
-    viz_dir = CASHEW_ROOT / "viz" / "inference_test"
+    viz_dir = CASHEW_ROOT / "viz" / f"inference_{EXPERIMENT}"
     viz_dir.mkdir(parents=True, exist_ok=True)
     dil_tag = f"_dil{1 if dilate else 0}"
     panel_path = viz_dir / f"{difficulty}_{canvas_id}_ref{ref_id}_layout{layout}{dil_tag}.png"
@@ -526,6 +563,9 @@ def main():
     parser = argparse.ArgumentParser(description="Generate cashew anomalies")
     parser.add_argument("--checkpoint", required=True, type=str,
                         help="Path to checkpoint dir")
+    parser.add_argument("--experiment", type=str, default="ResNet",
+                        choices=["ResNet", "UniNet"],
+                        help="Experiment layout (default: ResNet)")
     parser.add_argument("--num-easy", type=int, default=5)
     parser.add_argument("--num-hard", type=int, default=1)
     parser.add_argument("--noise-easy", type=float, default=0.7)
@@ -540,6 +580,8 @@ def main():
                         help="Disable CLIP mask dilation for hard mode")
     args = parser.parse_args()
 
+    setup_experiment(args.experiment)
+
     checkpoint_dir = Path(args.checkpoint)
     if not checkpoint_dir.exists():
         print(f"ERROR: checkpoint not found: {checkpoint_dir}")
@@ -553,8 +595,12 @@ def main():
     print(f"Loaded {len(defect_map)} defect type entries from image_anno.csv")
 
     # Load manifests
-    easy_manifest_path = EXP / "synthetic" / "placed_masks" / "easy" / "manifest.json"
-    hard_manifest_path = EXP / "synthetic" / "placed_masks" / "hard" / "manifest.json"
+    if EXPERIMENT == "ResNet":
+        easy_manifest_path = EXP / "anomaly" / "masks" / "easy" / "manifest.json"
+        hard_manifest_path = EXP / "anomaly" / "masks" / "hard" / "manifest.json"
+    else:
+        easy_manifest_path = EXP / "synthetic" / "placed_masks" / "easy" / "manifest.json"
+        hard_manifest_path = EXP / "synthetic" / "placed_masks" / "hard" / "manifest.json"
 
     easy_entries = []
     if easy_manifest_path.exists():
