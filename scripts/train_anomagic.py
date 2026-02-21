@@ -55,7 +55,7 @@ def train_anomagic(
     lr_pretrained: float = 5e-5,
     lambda_sp: float = 1e-4,
     device: str = "cuda",
-    save_every: int = 1000,
+    save_every: int = 5000,
     anomaly_types: list = None,
     exclude_sources: list = None,
     data_root: Path = None,
@@ -170,9 +170,9 @@ def train_anomagic(
             warmup_steps = int(n_steps * x0_warmup_frac)
             hold_steps = int(n_steps * x0_hold_frac)
             print(f"Context dropout: annealed {x0_start_ratio:.0%}->{x0_end_ratio:.0%}, "
-                  f"warmup={warmup_steps} ({x0_warmup_frac:.0%}), hold={hold_steps} ({x0_hold_frac:.0%}), per-sample")
+                  f"warmup={warmup_steps} ({x0_warmup_frac:.0%}), hold={hold_steps} ({x0_hold_frac:.0%}), per-batch")
         else:
-            print(f"Context dropout: {corrupt_context:.0%} per-sample (fixed)")
+            print(f"Context dropout: {corrupt_context:.0%} per-batch (fixed)")
     if resume_dir:
         print(f"Resume from: {resume_dir}")
     print()
@@ -686,6 +686,23 @@ def train_anomagic(
         del images, masks, references, clip_masks, references_2, clip_masks_2, group_valid, loss, loss_diff, loss_extras
         #torch.cuda.empty_cache()
 
+        # Early sample snapshots (no checkpoint, just samples + loss plot)
+        if (step + 1) in (500, 1000, 2000) and (step + 1) % save_every != 0:
+            torch.cuda.empty_cache()
+            try:
+                generate_anomagic_samples(
+                    pipeline, ip_adapter, dataset,
+                    save_dir / f"samples_{step + 1}.png", device,
+                    band_mode=band_mode,
+                    t2i_adapter=t2i_adapter,
+                    cfg_mode=cfg_mode,
+                )
+            except RuntimeError as e:
+                print(f"  Warning: sample generation failed ({e}), continuing training...")
+            torch.cuda.empty_cache()
+            save_loss_plot(losses, save_dir / "stats.csv",
+                           save_dir / f"loss_{step + 1}.png")
+
         # Save checkpoints + samples
         if (step + 1) % save_every == 0:
             print(f"\n  Checkpoint at step {step + 1}...", flush=True)
@@ -930,15 +947,9 @@ def compute_anomagic_loss(
         else:
             x0_samples = None  # no samples selected, skip x0 logic in loss
 
-    # Context dropout: per-sample zeroing of masked_image_latents
-    if corrupt_context > 0.0:
-        ctx_drop = torch.rand(batch_size, device=device) < corrupt_context
-        if ctx_drop.any():
-            masked_image_latents = torch.where(
-                ctx_drop[:, None, None, None].expand_as(masked_image_latents),
-                torch.zeros_like(masked_image_latents),
-                masked_image_latents,
-            )
+    # Context dropout: per-batch zeroing of masked_image_latents
+    if corrupt_context > 0.0 and random.random() < corrupt_context:
+        masked_image_latents = torch.zeros_like(masked_image_latents)
 
     model_input = torch.cat([noisy_latents, mask_latents, masked_image_latents], dim=1)
 
@@ -1806,7 +1817,7 @@ if __name__ == "__main__":
                         help="Path to checkpoint directory to resume from (e.g. results/anomagic_training/checkpoint_8000)")
     parser.add_argument("--steps", type=int, default=10000,
                         help="Training steps")
-    parser.add_argument("--save-every", type=int, default=1000,
+    parser.add_argument("--save-every", type=int, default=5000,
                         help="Save checkpoint + samples every N steps")
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate for IP-Adapter")
