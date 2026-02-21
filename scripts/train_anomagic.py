@@ -15,6 +15,7 @@ Training loop:
 7. Masked noise prediction loss
 8. Backprop through IP-Adapter params only
 """
+import csv
 import os
 import sys
 import json
@@ -40,6 +41,7 @@ from src.utils.optim_utils import (
     flatten_modules, build_norm_param_id_set, split_decay_no_decay,
     L2SPRegularizer,
 )
+from src.utils.crop_utils import clip_crop_multi
 from src.inference.generate import generate_anomagic_single
 
 
@@ -116,6 +118,7 @@ def train_anomagic(
     x0_end_ratio: float = 1.0,
     x0_no_context: bool = False,
     x0_warmup_frac: float = 0.2,
+    x0_hold_frac: float = 0.1,
 ):
     """Train Anomagic: IP-Adapter + captions (2 pathways)."""
     # Seed everything for reproducibility across ablation runs
@@ -158,8 +161,18 @@ def train_anomagic(
           (f" (mean={logit_normal_mean}, std={logit_normal_std})" if timestep_sampling == "logit_normal" else ""))
     if x0_objective:
         warmup_steps = int(n_steps * x0_warmup_frac)
+        hold_steps = int(n_steps * x0_hold_frac)
         print(f"x0-objective: ratio {x0_start_ratio:.0%}->{x0_end_ratio:.0%}, "
-              f"warmup={warmup_steps} steps ({x0_warmup_frac:.0%}), no_context={x0_no_context}")
+              f"warmup={warmup_steps} ({x0_warmup_frac:.0%}), hold={hold_steps} ({x0_hold_frac:.0%}), "
+              f"no_context={x0_no_context}")
+    if corrupt_context > 0:
+        if x0_start_ratio != x0_end_ratio and not x0_objective:
+            warmup_steps = int(n_steps * x0_warmup_frac)
+            hold_steps = int(n_steps * x0_hold_frac)
+            print(f"Context dropout: annealed {x0_start_ratio:.0%}->{x0_end_ratio:.0%}, "
+                  f"warmup={warmup_steps} ({x0_warmup_frac:.0%}), hold={hold_steps} ({x0_hold_frac:.0%}), per-sample")
+        else:
+            print(f"Context dropout: {corrupt_context:.0%} per-sample (fixed)")
     if resume_dir:
         print(f"Resume from: {resume_dir}")
     print()
@@ -505,6 +518,7 @@ def train_anomagic(
         "x0_end_ratio": x0_end_ratio,
         "x0_no_context": x0_no_context,
         "x0_warmup_frac": x0_warmup_frac,
+        "x0_hold_frac": x0_hold_frac,
     }
     with open(config_file, "w") as cf:
         json.dump(run_config, cf, indent=2)
@@ -532,7 +546,7 @@ def train_anomagic(
     stats_file = save_dir / "stats.csv"
     stats_fh = open(stats_file, "a")
     if stats_fh.tell() == 0:
-        stats_fh.write("step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,x0_ratio,x0_loss,eps_loss,grad_norm\n")
+        stats_fh.write("step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,x0_ratio,x0_loss,eps_loss,grad_norm,ctx_drop\n")
 
     pbar = tqdm(range(start_step, n_steps), desc="Training", initial=start_step, total=n_steps)
     skipped_nan = 0
@@ -555,16 +569,32 @@ def train_anomagic(
 
         optimizer.zero_grad()
 
-        # x0-objective annealing (with warmup)
+        # Annealing schedule: warmup → linear anneal → hold
+        # Used by x0-objective OR context dropout (whichever is active)
+        warmup_steps = int(n_steps * x0_warmup_frac)
+        hold_steps = int(n_steps * x0_hold_frac)
+        anneal_end = n_steps - hold_steps
+        if step < warmup_steps:
+            annealed_ratio = x0_start_ratio
+        elif step >= anneal_end:
+            annealed_ratio = x0_end_ratio
+        else:
+            progress = (step - warmup_steps) / max(anneal_end - warmup_steps - 1, 1)
+            annealed_ratio = x0_start_ratio + (x0_end_ratio - x0_start_ratio) * progress
+
         if x0_objective:
-            warmup_steps = int(n_steps * x0_warmup_frac)
-            if step < warmup_steps:
-                x0_ratio = x0_start_ratio
-            else:
-                anneal_progress = (step - warmup_steps) / max(n_steps - warmup_steps - 1, 1)
-                x0_ratio = x0_start_ratio + (x0_end_ratio - x0_start_ratio) * anneal_progress
+            x0_ratio = annealed_ratio
         else:
             x0_ratio = 0.0
+
+        # Context dropout: fixed rate OR annealed (when x0 annealing params are set)
+        if corrupt_context > 0 and not x0_objective:
+            if x0_start_ratio != x0_end_ratio:
+                ctx_drop = annealed_ratio  # annealed
+            else:
+                ctx_drop = corrupt_context  # fixed
+        else:
+            ctx_drop = 0.0
 
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
             loss_diff, loss_extras = compute_anomagic_loss(
@@ -588,7 +618,7 @@ def train_anomagic(
                 timestep_sampling=timestep_sampling,
                 logit_normal_mean=logit_normal_mean,
                 logit_normal_std=logit_normal_std,
-                corrupt_context=corrupt_context,
+                corrupt_context=ctx_drop,
                 x0_ratio=x0_ratio,
                 x0_no_context=x0_no_context,
             )
@@ -642,7 +672,7 @@ def train_anomagic(
         band_l = loss_extras.get("band_loss", 0.0)
         x0_l = loss_extras.get("x0_loss", 0.0)
         eps_l = loss_extras.get("eps_loss", 0.0)
-        stats_fh.write(f"{step},{loss_val},{lr_pre},{lr_scr},{attn_gate},{ff_gate},{l2sp_val},{core_l},{band_l},{x0_ratio},{x0_l},{eps_l},{grad_norm}\n")
+        stats_fh.write(f"{step},{loss_val},{lr_pre},{lr_scr},{attn_gate},{ff_gate},{l2sp_val},{core_l},{band_l},{x0_ratio},{x0_l},{eps_l},{grad_norm},{ctx_drop}\n")
         stats_fh.flush()
 
         for t in batch_types:
@@ -900,9 +930,15 @@ def compute_anomagic_loss(
         else:
             x0_samples = None  # no samples selected, skip x0 logic in loss
 
-    # Context corruption: zero out masked_image_latents to force cross-attention usage
-    if corrupt_context > 0.0 and random.random() < corrupt_context:
-        masked_image_latents = torch.zeros_like(masked_image_latents)
+    # Context dropout: per-sample zeroing of masked_image_latents
+    if corrupt_context > 0.0:
+        ctx_drop = torch.rand(batch_size, device=device) < corrupt_context
+        if ctx_drop.any():
+            masked_image_latents = torch.where(
+                ctx_drop[:, None, None, None].expand_as(masked_image_latents),
+                torch.zeros_like(masked_image_latents),
+                masked_image_latents,
+            )
 
     model_input = torch.cat([noisy_latents, mask_latents, masked_image_latents], dim=1)
 
@@ -1003,9 +1039,10 @@ def _ema_smooth(values, smoothing: float = 0.99):
 
 
 def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
-    """Render 2x3 training diagnostics plot. Two layouts:
+    """Render 2x3 training diagnostics plot. Three layouts (auto-detected):
     - Default: trend, core/band, band/core ratio, gates, grad norm, (empty)
-    - x0 ablation: trend, core/band, x0 vs eps + annealing, gates, grad norm, band/core ratio
+    - x0 ablation: trend, core/band, x0 vs eps + annealing, gates, band/core ratio, grad norm
+    - ctx annealing: trend, core/band, ctx dropout schedule, gates, band/core ratio, grad norm
     """
     if len(losses) < 2:
         return
@@ -1014,7 +1051,7 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     stats_steps, diff_losses = [], []
     attn_gates, ff_gates, l2sp_vals = [], [], []
     core_losses, band_losses = [], []
-    x0_losses, eps_losses, x0_ratios, grad_norms = [], [], [], []
+    x0_losses, eps_losses, x0_ratios, grad_norms, ctx_drops = [], [], [], [], []
     try:
         with open(stats_file, "r", encoding="utf-8") as f:
             header = f.readline().strip()
@@ -1035,6 +1072,7 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
                 x0_losses.append(float(parts[10]) if len(parts) > 10 else 0.0)
                 eps_losses.append(float(parts[11]) if len(parts) > 11 else 0.0)
                 grad_norms.append(float(parts[12]) if len(parts) > 12 else 0.0)
+                ctx_drops.append(float(parts[13]) if len(parts) > 13 else 0.0)
     except FileNotFoundError:
         pass
 
@@ -1047,6 +1085,7 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     s_eps = np.array(eps_losses)
     s_x0r = np.array(x0_ratios)
     s_gn = np.array(grad_norms)
+    s_ctx = np.array(ctx_drops)
 
     SM = 0.99
     SF = 0.6
@@ -1059,6 +1098,9 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     has_cb = len(s_steps) > 0 and len(s_core) > 0 and s_core.any()
     has_x0 = len(s_steps) > 0 and s_x0.any()
     has_gn = len(s_steps) > 0 and s_gn.any()
+    # Annealed ctx dropout: ctx_drop varies (not all same value)
+    has_ctx = (len(s_steps) > 0 and s_ctx.any()
+               and (s_ctx.max() - s_ctx.min()) > 0.01)
 
     # --- Precompute core/band decomposition (shared by both layouts) ---
     ce = be = core_ps = band_ps = None
@@ -1078,6 +1120,8 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     # =====================================================
     fig, axes = plt.subplots(2, 3, figsize=(21, 10))
 
+    ax_x0eps = None
+    ax_ctx = None
     if has_x0:
         # x0 ABLATION LAYOUT:
         # [0,0] Smooth Trend    [0,1] Core vs Band    [0,2] x0 vs eps + annealing
@@ -1085,6 +1129,16 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
         ax_trend  = axes[0, 0]
         ax_cb     = axes[0, 1]
         ax_x0eps  = axes[0, 2]
+        ax_gates  = axes[1, 0]
+        ax_ratio  = axes[1, 1]
+        ax_gn     = axes[1, 2]
+    elif has_ctx:
+        # CONTEXT DROPOUT ANNEALING LAYOUT:
+        # [0,0] Smooth Trend    [0,1] Core vs Band    [0,2] Ctx dropout schedule
+        # [1,0] Gates           [1,1] Band/Core Ratio  [1,2] Grad Norm
+        ax_trend  = axes[0, 0]
+        ax_cb     = axes[0, 1]
+        ax_ctx    = axes[0, 2]
         ax_gates  = axes[1, 0]
         ax_ratio  = axes[1, 1]
         ax_gn     = axes[1, 2]
@@ -1097,7 +1151,6 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
         ax_ratio  = axes[0, 2]
         ax_gates  = axes[1, 0]
         ax_gn     = axes[1, 1]
-        ax_x0eps  = None
         axes[1, 2].set_visible(False)
 
     # --- Smooth Trend ---
@@ -1207,6 +1260,16 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
         ax_x0eps.set_xlabel("Step"); ax_x0eps.set_ylabel("Loss")
         ax_x0eps.grid(True, alpha=0.3)
 
+    # --- Context dropout schedule (ctx annealing layout only) ---
+    if ax_ctx is not None:
+        ax_ctx.plot(s_steps, s_ctx, color="#D32F2F", linewidth=2.5, label="Ctx dropout rate")
+        ax_ctx.fill_between(s_steps, 0, s_ctx, color="#EF9A9A", alpha=0.3)
+        ax_ctx.set_ylim(-0.05, 1.1)
+        ax_ctx.set_title(f"Context Dropout Schedule \u2014 current: {s_ctx[-1]:.1%}")
+        ax_ctx.set_xlabel("Step"); ax_ctx.set_ylabel("Dropout rate")
+        ax_ctx.legend(loc="upper right", fontsize=8)
+        ax_ctx.grid(True, alpha=0.3)
+
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -1242,11 +1305,21 @@ def generate_anomagic_samples(
     t2i_adapter=None,
     cfg_mode: str = "text",
 ):
-    """Generate samples showing: real | mask | reference | generated.
+    """Generate sample grids showing model outputs under various conditions.
+
+    Produces two grids:
+    1. **Main grid** (7 rows × N cols): Real, Mask, Reference, Gen(CFG=1),
+       Gen(CFG=text), Gen(CFG=visual), Gen(CFG=both).
+    2. **Token-swap grid** (5 rows × N cols): Target, Mask,
+       Gen(correct tokens), Swapped Reference, Gen(swapped tokens).
+       Each column i uses the reference from column (i+1) % N.
 
     Uses a fixed seed so the same samples are shown at every checkpoint,
     making it easy to track visual progress across training.
     """
+    save_path = Path(save_path)
+
+    # --- Phase 1: Sample selection ---
     sample_rng = random.Random(42)
     # Fixed (type, image_path) pairs for consistent visualization across ALL runs
     _fixed_samples = [
@@ -1282,8 +1355,9 @@ def generate_anomagic_samples(
             types_to_show.append(t)
 
     n_cols = len(types_to_show)
-    fig, axes = plt.subplots(6, n_cols, figsize=(3.5 * n_cols, 19), squeeze=False)
 
+    # --- Phase 2: Collect sample data ---
+    all_samples = []
     for i, atype in enumerate(types_to_show):
         if atype in fixed_indices:
             idx = fixed_indices[atype]
@@ -1293,80 +1367,404 @@ def generate_anomagic_samples(
         sample = dataset[idx]
 
         image = sample["image"].unsqueeze(0).to(device)
-        mask = sample["mask"].unsqueeze(0).to(device)
+        mask_t = sample["mask"].unsqueeze(0).to(device)
         reference = sample["reference"].unsqueeze(0).to(device)
 
         img_path = sample.get("image_path", "unknown")
         path_parts = Path(img_path).parts
         short_path = "/".join(path_parts[-3:]) if len(path_parts) >= 3 else img_path
 
-        with torch.no_grad():
-            gen_text_cfg = generate_anomagic_single(
-                pipeline, ip_adapter, image, mask, reference,
-                atype, sample.get("caption", ""),
-                num_steps=30,
-                reference_mode=dataset.reference_mode,
-                band_mode=band_mode,
-                t2i_adapter=t2i_adapter,
-                seed=42 + i,
-                cfg_mode="text",
-            )
-            gen_visual_cfg = generate_anomagic_single(
-                pipeline, ip_adapter, image, mask, reference,
-                atype, sample.get("caption", ""),
-                num_steps=30,
-                reference_mode=dataset.reference_mode,
-                band_mode=band_mode,
-                t2i_adapter=t2i_adapter,
-                seed=42 + i,
-                cfg_mode="visual",
-            )
-            gen_both_cfg = generate_anomagic_single(
-                pipeline, ip_adapter, image, mask, reference,
-                atype, sample.get("caption", ""),
-                num_steps=30,
-                reference_mode=dataset.reference_mode,
-                band_mode=band_mode,
-                t2i_adapter=t2i_adapter,
-                seed=42 + i,
-                cfg_mode="both",
-            )
-
         img_np = ((image[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
-        gen_text_np = ((gen_text_cfg[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
-        gen_vis_np = ((gen_visual_cfg[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
-        gen_both_np = ((gen_both_cfg[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
-        mask_np = mask[0, 0].cpu().numpy()
+        mask_np = mask_t[0, 0].cpu().numpy()
         ref_np = ((reference[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
 
-        axes[0, i].imshow(img_np)
-        axes[0, i].set_title(f"Real ({atype})\n{short_path}", fontsize=6)
+        all_samples.append({
+            "atype": atype,
+            "image": image,
+            "mask": mask_t,
+            "reference": reference,
+            "caption": sample.get("caption", ""),
+            "img_np": img_np,
+            "mask_np": mask_np,
+            "ref_np": ref_np,
+            "short_path": short_path,
+        })
+
+    # --- Phase 3: Generate 4 variants per sample ---
+    gen_kwargs = dict(
+        num_steps=30,
+        reference_mode=dataset.reference_mode,
+        band_mode=band_mode,
+        t2i_adapter=t2i_adapter,
+    )
+    for i, s in enumerate(all_samples):
+        with torch.no_grad():
+            s["gen_no_cfg"] = generate_anomagic_single(
+                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
+                s["atype"], s["caption"],
+                guidance_scale=1.0, cfg_mode="both", seed=42 + i,
+                **gen_kwargs,
+            )
+            s["gen_text"] = generate_anomagic_single(
+                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
+                s["atype"], s["caption"],
+                cfg_mode="text", seed=42 + i,
+                **gen_kwargs,
+            )
+            s["gen_visual"] = generate_anomagic_single(
+                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
+                s["atype"], s["caption"],
+                cfg_mode="visual", seed=42 + i,
+                **gen_kwargs,
+            )
+            s["gen_both"] = generate_anomagic_single(
+                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
+                s["atype"], s["caption"],
+                cfg_mode="both", seed=42 + i,
+                **gen_kwargs,
+            )
+
+    # Helper: tensor [1,C,H,W] in [-1,1] → numpy [H,W,C] in [0,1]
+    def _to_np(t: torch.Tensor):
+        return ((t[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
+
+    # --- Phase 4: Plot main grid (7 rows) ---
+    fig, axes = plt.subplots(7, n_cols, figsize=(3.5 * n_cols, 22), squeeze=False)
+    ref_label = "clip_crop" if dataset.augment else dataset.reference_mode
+
+    for i, s in enumerate(all_samples):
+        axes[0, i].imshow(s["img_np"])
+        axes[0, i].set_title(f"Real ({s['atype']})\n{s['short_path']}", fontsize=6)
         axes[0, i].axis("off")
 
-        axes[1, i].imshow(mask_np, cmap="gray")
-        axes[1, i].set_title(f"Mask ({mask_np.mean() * 100:.1f}%)", fontsize=7)
+        axes[1, i].imshow(s["mask_np"], cmap="gray")
+        axes[1, i].set_title(f"Mask ({s['mask_np'].mean() * 100:.1f}%)", fontsize=7)
         axes[1, i].axis("off")
 
-        axes[2, i].imshow(ref_np)
-        ref_label = "clip_crop" if dataset.augment else dataset.reference_mode
+        axes[2, i].imshow(s["ref_np"])
         axes[2, i].set_title(f"Reference ({ref_label})", fontsize=7)
         axes[2, i].axis("off")
 
-        axes[3, i].imshow(gen_text_np)
-        axes[3, i].set_title("Gen (CFG=text)", fontsize=8)
+        axes[3, i].imshow(_to_np(s["gen_no_cfg"]))
+        axes[3, i].set_title("Gen (CFG=1)", fontsize=8)
         axes[3, i].axis("off")
 
-        axes[4, i].imshow(gen_vis_np)
-        axes[4, i].set_title("Gen (CFG=visual)", fontsize=8)
+        axes[4, i].imshow(_to_np(s["gen_text"]))
+        axes[4, i].set_title("Gen (CFG=text)", fontsize=8)
         axes[4, i].axis("off")
 
-        axes[5, i].imshow(gen_both_np)
-        axes[5, i].set_title("Gen (CFG=both)", fontsize=8)
+        axes[5, i].imshow(_to_np(s["gen_visual"]))
+        axes[5, i].set_title("Gen (CFG=visual)", fontsize=8)
         axes[5, i].axis("off")
+
+        axes[6, i].imshow(_to_np(s["gen_both"]))
+        axes[6, i].set_title("Gen (CFG=both)", fontsize=8)
+        axes[6, i].axis("off")
 
     plt.suptitle("Anomagic Generation Samples", fontsize=12)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # --- Phase 5: Token-swap generation (CFG=visual + CFG=1) ---
+    n = len(all_samples)
+    for i in range(n):
+        j = (i + 1) % n
+        swapped_ref = all_samples[j]["reference"]
+        with torch.no_grad():
+            all_samples[i]["gen_swap_visual"] = generate_anomagic_single(
+                pipeline, ip_adapter,
+                all_samples[i]["image"], all_samples[i]["mask"],
+                swapped_ref,
+                all_samples[i]["atype"], all_samples[i]["caption"],
+                cfg_mode="visual", seed=42 + i,
+                **gen_kwargs,
+            )
+            all_samples[i]["gen_swap_nocfg"] = generate_anomagic_single(
+                pipeline, ip_adapter,
+                all_samples[i]["image"], all_samples[i]["mask"],
+                swapped_ref,
+                all_samples[i]["atype"], all_samples[i]["caption"],
+                guidance_scale=1.0, cfg_mode="visual", seed=42 + i,
+                **gen_kwargs,
+            )
+
+    # --- Phase 6: Plot swap grid (8 rows) ---
+    swap_path = save_path.parent / (save_path.stem + "_swap" + save_path.suffix)
+    fig, axes = plt.subplots(8, n_cols, figsize=(3.5 * n_cols, 25), squeeze=False)
+
+    for i, s in enumerate(all_samples):
+        j = (i + 1) % n
+        swapped_ref_np = all_samples[j]["ref_np"]
+
+        axes[0, i].imshow(s["img_np"])
+        axes[0, i].set_title(f"Target ({s['atype']})\n{s['short_path']}", fontsize=6)
+        axes[0, i].axis("off")
+
+        axes[1, i].imshow(s["mask_np"], cmap="gray")
+        axes[1, i].set_title(f"Mask ({s['mask_np'].mean() * 100:.1f}%)", fontsize=7)
+        axes[1, i].axis("off")
+
+        axes[2, i].imshow(s["ref_np"])
+        axes[2, i].set_title(f"Correct ref ({ref_label})", fontsize=7)
+        axes[2, i].axis("off")
+
+        axes[3, i].imshow(_to_np(s["gen_visual"]))
+        axes[3, i].set_title("Correct (CFG=visual)", fontsize=7)
+        axes[3, i].axis("off")
+
+        axes[4, i].imshow(_to_np(s["gen_no_cfg"]))
+        axes[4, i].set_title("Correct (CFG=1)", fontsize=7)
+        axes[4, i].axis("off")
+
+        axes[5, i].imshow(swapped_ref_np)
+        axes[5, i].set_title(f"Swapped ref ({all_samples[j]['atype']})", fontsize=7)
+        axes[5, i].axis("off")
+
+        axes[6, i].imshow(_to_np(s["gen_swap_visual"]))
+        axes[6, i].set_title("Swapped (CFG=visual)", fontsize=7)
+        axes[6, i].axis("off")
+
+        axes[7, i].imshow(_to_np(s["gen_swap_nocfg"]))
+        axes[7, i].set_title("Swapped (CFG=1)", fontsize=7)
+        axes[7, i].axis("off")
+
+    plt.suptitle("Token-Swap: Does Changing the Reference Change the Output?", fontsize=11)
+    plt.tight_layout()
+    plt.savefig(swap_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # --- Phase 7: OOD (VisA cashew) generation ---
+    _generate_ood_grid(
+        pipeline, ip_adapter, save_path, device,
+        band_mode=band_mode, t2i_adapter=t2i_adapter,
+    )
+
+
+def _generate_ood_grid(
+    pipeline, ip_adapter, save_path: Path, device: str,
+    band_mode: int = 2, t2i_adapter=None,
+):
+    """Generate OOD grid using VisA cashew data (canvas normals + placed masks).
+
+    Shows whether the model generalises to out-of-distribution objects it was
+    never trained on.  Produces a 4-row grid:
+        Row 0: Canvas normal
+        Row 1: Placed mask
+        Row 2: Reference CLIP crop (from the anomaly donor image)
+        Row 3: Generated (CFG=both)
+
+    Silently skips if VisA experiment data is not available (e.g. on a server
+    without the validation dataset).
+    """
+    # --- Resolve paths ---
+    project_root = Path(__file__).parent.parent
+    exp_dir = (
+        project_root / "anomverse_extension" / "datasets" / "validation"
+        / "VisA" / "datasets" / "easy_test" / "cashew" / "experiment_UniNet"
+    )
+    cashew_root = exp_dir.parent
+    canvas_imgs_dir = exp_dir / "source" / "normals" / "canvas" / "imgs"
+    extra_normals_dir = cashew_root / "Data" / "Images" / "Normal"
+    image_anno_csv = cashew_root / "image_anno.csv"
+
+    # Check if experiment data exists
+    if not exp_dir.exists():
+        return
+    easy_manifest = exp_dir / "synthetic" / "placed_masks" / "easy" / "manifest.json"
+    hard_manifest = exp_dir / "synthetic" / "placed_masks" / "hard" / "manifest.json"
+    if not easy_manifest.exists() and not hard_manifest.exists():
+        return
+
+    # --- Load manifests ---
+    easy_entries = []
+    hard_entries = []
+    if easy_manifest.exists():
+        with open(easy_manifest) as f:
+            easy_entries = json.load(f)
+    if hard_manifest.exists():
+        with open(hard_manifest) as f:
+            hard_entries = json.load(f)
+
+    # Pick fixed subset: up to 4 easy + up to 2 hard
+    ood_rng = random.Random(123)
+    selected = []
+    if easy_entries:
+        selected += ood_rng.sample(easy_entries, min(4, len(easy_entries)))
+    if hard_entries:
+        selected += ood_rng.sample(hard_entries, min(2, len(hard_entries)))
+    if not selected:
+        return
+
+    # --- Parse defect types from image_anno.csv ---
+    defect_map: dict[str, str] = {}
+    if image_anno_csv.exists():
+        with open(image_anno_csv, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader)  # skip header
+            for row in reader:
+                label = row[1] if len(row) > 1 else ""
+                if label == "normal":
+                    continue
+                stem = Path(row[0]).stem
+                defect_map[stem] = label
+
+    # --- Helper to find canvas image ---
+    def _find_canvas(canvas_id: str) -> Path | None:
+        for d in (canvas_imgs_dir, extra_normals_dir):
+            p = d / f"{canvas_id}.JPG"
+            if p.exists():
+                return p
+        return None
+
+    # --- Collect OOD sample data ---
+    ood_samples = []
+    for entry in selected:
+        canvas_id = entry["canvas_id"]
+        ref_id = entry["ref_id"]
+        difficulty = entry["difficulty"]
+
+        canvas_path = _find_canvas(canvas_id)
+        if canvas_path is None:
+            continue
+
+        placed_mask_path = (
+            exp_dir / "synthetic" / "placed_masks" / difficulty / f"{canvas_id}.png"
+        )
+        ref_img_path = exp_dir / "source" / "anomalies" / difficulty / "imgs" / f"{ref_id}.JPG"
+        ref_mask_path = exp_dir / "source" / "anomalies" / difficulty / "masks" / f"{ref_id}.png"
+
+        if not all(p.exists() for p in (placed_mask_path, ref_img_path, ref_mask_path)):
+            continue
+
+        # Load canvas → [1, 3, 512, 512] in [-1, 1]
+        canvas_pil = Image.open(canvas_path).convert("RGB").resize((512, 512), Image.LANCZOS)
+        canvas_t = torch.from_numpy(
+            np.array(canvas_pil).astype(np.float32) / 127.5 - 1.0
+        ).permute(2, 0, 1).unsqueeze(0).to(device)
+
+        # Load placed mask → [1, 1, 512, 512]
+        placed_pil = Image.open(placed_mask_path).convert("L").resize((512, 512), Image.NEAREST)
+        mask_np = (np.array(placed_pil).astype(np.float32) / 255.0 > 0.5).astype(np.float32)
+        mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).float().to(device)
+
+        # Load reference anomaly → CLIP multi-crop
+        ref_pil = Image.open(ref_img_path).convert("RGB")
+        ref_mask_np = (
+            np.array(Image.open(ref_mask_path).convert("L")).astype(np.float32) / 255.0 > 0.5
+        ).astype(np.float32)
+        ref_tensor = torch.from_numpy(
+            np.array(ref_pil).astype(np.float32) / 255.0
+        ).permute(2, 0, 1)  # [3, H, W] in [0, 1]
+        ref_mask_tensor = torch.from_numpy(ref_mask_np).unsqueeze(0).float()  # [1, H, W]
+
+        random.seed(42)
+        crops, crop_masks, valid = clip_crop_multi(ref_tensor, ref_mask_tensor, n_groups=2)
+        clip_ref = (crops[0] * 2.0 - 1.0).unsqueeze(0).to(device)  # [1, 3, 224, 224]
+        clip_mask_1 = crop_masks[0].unsqueeze(0).to(device)
+        clip_ref_2 = (crops[1] * 2.0 - 1.0).unsqueeze(0).to(device)
+        clip_mask_2 = crop_masks[1].unsqueeze(0).to(device)
+        group_valid = torch.tensor(
+            [[float(valid[0]), float(valid[1])]], device=device,
+        )
+
+        defect_type = defect_map.get(ref_id, "defect")
+        caption = f"a photo of a {defect_type} defect on a cashew"
+
+        # Numpy for visualization
+        canvas_np = ((canvas_t[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
+        crop_np = (crops[0].permute(1, 2, 0).numpy()).clip(0, 1)
+        crop_mask_np = crop_masks[0][0].numpy()  # [H, W] binary
+
+        ood_samples.append({
+            "canvas_t": canvas_t, "mask_t": mask_t,
+            "clip_ref": clip_ref, "clip_mask_1": clip_mask_1,
+            "clip_ref_2": clip_ref_2, "clip_mask_2": clip_mask_2,
+            "group_valid": group_valid,
+            "defect_type": defect_type, "caption": caption,
+            "difficulty": difficulty,
+            "canvas_np": canvas_np, "mask_np": mask_np,
+            "crop_np": crop_np, "crop_mask_np": crop_mask_np,
+            "canvas_id": canvas_id, "ref_id": ref_id,
+        })
+
+    if not ood_samples:
+        return
+
+    # --- Generate (CFG=visual + CFG=1) ---
+    dilate_hard = True
+    for i, s in enumerate(ood_samples):
+        dilate = (s["difficulty"] == "hard") and dilate_hard
+        ood_gen_kwargs = dict(
+            num_steps=30,
+            noise_strength=0.7 if s["difficulty"] == "easy" else 1.0,
+            reference_mode="crop", band_mode=band_mode,
+            t2i_adapter=t2i_adapter, seed=42 + i,
+            clip_mask=s["clip_mask_1"],
+            reference_2=s["clip_ref_2"],
+            clip_mask_2=s["clip_mask_2"],
+            group_valid=s["group_valid"],
+            dilate_clip_mask=dilate,
+        )
+        with torch.no_grad():
+            s["gen_visual"] = generate_anomagic_single(
+                pipeline, ip_adapter,
+                s["canvas_t"], s["mask_t"], s["clip_ref"],
+                s["defect_type"], s["caption"],
+                guidance_scale=7.5, cfg_mode="visual",
+                **ood_gen_kwargs,
+            )
+            s["gen_nocfg"] = generate_anomagic_single(
+                pipeline, ip_adapter,
+                s["canvas_t"], s["mask_t"], s["clip_ref"],
+                s["defect_type"], s["caption"],
+                guidance_scale=1.0, cfg_mode="visual",
+                **ood_gen_kwargs,
+            )
+
+    # --- Plot OOD grid (5 rows) ---
+    def _to_np(t: torch.Tensor):
+        return ((t[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
+
+    n_ood = len(ood_samples)
+    ood_path = save_path.parent / (save_path.stem + "_ood" + save_path.suffix)
+    fig, axes = plt.subplots(5, n_ood, figsize=(3.5 * n_ood, 15), squeeze=False)
+
+    for i, s in enumerate(ood_samples):
+        axes[0, i].imshow(s["canvas_np"])
+        axes[0, i].set_title(
+            f"Canvas ({s['canvas_id']})\n[{s['difficulty']}]", fontsize=7,
+        )
+        axes[0, i].axis("off")
+
+        axes[1, i].imshow(s["mask_np"], cmap="gray")
+        axes[1, i].set_title(
+            f"Placed mask ({s['mask_np'].mean() * 100:.1f}%)", fontsize=7,
+        )
+        axes[1, i].axis("off")
+
+        # Overlay mask with slight red tint so anomaly region is visible
+        crop_overlay = s["crop_np"].copy()
+        m = s["crop_mask_np"][..., None]  # [H, W, 1]
+        tint = np.array([1.0, 0.2, 0.2])  # red
+        crop_overlay = (crop_overlay * (1 - 0.3 * m) + tint * 0.3 * m).clip(0, 1)
+        axes[2, i].imshow(crop_overlay)
+        axes[2, i].set_title(
+            f"Ref crop ({s['ref_id']})\n{s['defect_type'][:25]}", fontsize=6,
+        )
+        axes[2, i].axis("off")
+
+        axes[3, i].imshow(_to_np(s["gen_visual"]))
+        axes[3, i].set_title("Gen (CFG=visual)", fontsize=8)
+        axes[3, i].axis("off")
+
+        axes[4, i].imshow(_to_np(s["gen_nocfg"]))
+        axes[4, i].set_title("Gen (CFG=1)", fontsize=8)
+        axes[4, i].axis("off")
+
+    plt.suptitle("OOD Diagnostic: VisA Cashew (unseen during training)", fontsize=11)
+    plt.tight_layout()
+    plt.savefig(ood_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
@@ -1527,6 +1925,9 @@ if __name__ == "__main__":
     parser.add_argument("--x0-warmup-frac", type=float, default=0.2,
                         help="Fraction of total steps to hold x0_ratio at start value before annealing "
                              "(default 0.2 = first 1/5 of training)")
+    parser.add_argument("--x0-hold-frac", type=float, default=0.1,
+                        help="Fraction of total steps at the END to hold x0_ratio at end value "
+                             "(default 0.1 = last 10%% of training holds at end value)")
 
     args = parser.parse_args()
 
@@ -1595,4 +1996,5 @@ if __name__ == "__main__":
         x0_end_ratio=args.x0_end_ratio,
         x0_no_context=args.x0_no_context,
         x0_warmup_frac=args.x0_warmup_frac,
+        x0_hold_frac=args.x0_hold_frac,
     )
