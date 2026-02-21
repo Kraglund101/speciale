@@ -532,7 +532,7 @@ def train_anomagic(
     stats_file = save_dir / "stats.csv"
     stats_fh = open(stats_file, "a")
     if stats_fh.tell() == 0:
-        stats_fh.write("step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,x0_ratio\n")
+        stats_fh.write("step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,x0_ratio,x0_loss,eps_loss\n")
 
     pbar = tqdm(range(start_step, n_steps), desc="Training", initial=start_step, total=n_steps)
     skipped_nan = 0
@@ -623,25 +623,26 @@ def train_anomagic(
         loss_fh.write(f"{loss_val}\n")
         loss_fh.flush()
 
-        # Log stats every 10 steps (gates require .item() CUDA sync)
-        if step % 10 == 0:
-            attn_gate = ff_gate = 0.0
-            if hasattr(ip_adapter, 'masked_self_attn'):
-                sa = ip_adapter.masked_self_attn
-                if sa.learnable_gates:
-                    for layer in sa.layers:
-                        attn_gate = layer["attn_gate"].gate.item()
-                        if "ff_gate" in layer:
-                            ff_gate = layer["ff_gate"].gate.item()
-                        break  # first layer only
-                else:
-                    attn_gate = ff_gate = 1.0  # fixed gates
-            lr_pre = optimizer.param_groups[0]["lr"]
-            lr_scr = optimizer.param_groups[2]["lr"]  # B_decay group
-            core_l = loss_extras.get("core_loss", 0.0)
-            band_l = loss_extras.get("band_loss", 0.0)
-            stats_fh.write(f"{step},{loss_val},{lr_pre},{lr_scr},{attn_gate},{ff_gate},{l2sp_val},{core_l},{band_l},{x0_ratio}\n")
-            stats_fh.flush()
+        # Log stats every step
+        attn_gate = ff_gate = 0.0
+        if hasattr(ip_adapter, 'masked_self_attn'):
+            sa = ip_adapter.masked_self_attn
+            if sa.learnable_gates:
+                for layer in sa.layers:
+                    attn_gate = layer["attn_gate"].gate.item()
+                    if "ff_gate" in layer:
+                        ff_gate = layer["ff_gate"].gate.item()
+                    break  # first layer only
+            else:
+                attn_gate = ff_gate = 1.0  # fixed gates
+        lr_pre = optimizer.param_groups[0]["lr"]
+        lr_scr = optimizer.param_groups[2]["lr"]  # B_decay group
+        core_l = loss_extras.get("core_loss", 0.0)
+        band_l = loss_extras.get("band_loss", 0.0)
+        x0_l = loss_extras.get("x0_loss", 0.0)
+        eps_l = loss_extras.get("eps_loss", 0.0)
+        stats_fh.write(f"{step},{loss_val},{lr_pre},{lr_scr},{attn_gate},{ff_gate},{l2sp_val},{core_l},{band_l},{x0_ratio},{x0_l},{eps_l}\n")
+        stats_fh.flush()
 
         for t in batch_types:
             type_losses[t].append(loss_val)
@@ -961,9 +962,26 @@ def compute_anomagic_loss(
         core_loss_val = (diff * core_expanded).sum() / core_n
         band_loss_val = (diff * band_expanded).sum() / band_n
 
+        # x0 vs eps per-objective loss (only when mixed batch)
+        x0_loss_val = 0.0
+        eps_loss_val = 0.0
+        if x0_samples is not None and x0_samples.any():
+            x0_sel_4d = x0_samples[:, None, None, None].expand_as(noise_pred)
+            eps_sel_4d = ~x0_sel_4d
+            x0_w = (weight_expanded * x0_sel_4d.float())
+            eps_w = (weight_expanded * eps_sel_4d.float())
+            x0_w_sum = x0_w.sum().clamp(min=1e-8)
+            eps_w_sum = eps_w.sum().clamp(min=1e-8)
+            x0_loss_val = (x0_diff * x0_w).sum() / x0_w_sum
+            eps_loss_val = (eps_diff * eps_w).sum() / eps_w_sum
+            x0_loss_val = x0_loss_val.item()
+            eps_loss_val = eps_loss_val.item()
+
     return loss, {
         "core_loss": core_loss_val.item(),
         "band_loss": band_loss_val.item(),
+        "x0_loss": x0_loss_val,
+        "eps_loss": eps_loss_val,
     }
 
 
@@ -986,6 +1004,7 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     stats_steps, diff_losses = [], []
     attn_gates, ff_gates, l2sp_vals = [], [], []
     core_losses, band_losses = [], []
+    x0_losses, eps_losses = [], []
     try:
         with open(stats_file, "r", encoding="utf-8") as f:
             header = f.readline().strip()
@@ -1000,6 +1019,13 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
                     l2sp_vals.append(float(parts[6]))
                     core_losses.append(float(parts[7]))
                     band_losses.append(float(parts[8]))
+                    # x0/eps columns (12-col format)
+                    if len(parts) >= 12:
+                        x0_losses.append(float(parts[10]))
+                        eps_losses.append(float(parts[11]))
+                    else:
+                        x0_losses.append(0.0)
+                        eps_losses.append(0.0)
                 elif n_cols >= 7 and len(parts) >= 7:
                     stats_steps.append(int(parts[0]))
                     diff_losses.append(float(parts[1]))
@@ -1008,6 +1034,8 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
                     l2sp_vals.append(float(parts[6]))
                     core_losses.append(0.0)
                     band_losses.append(0.0)
+                    x0_losses.append(0.0)
+                    eps_losses.append(0.0)
     except FileNotFoundError:
         pass
     s_steps = np.array(stats_steps)
@@ -1017,9 +1045,11 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     s_core = np.array(core_losses)
     s_band = np.array(band_losses)
     s_diff = np.array(diff_losses)
+    s_x0 = np.array(x0_losses)
+    s_eps = np.array(eps_losses)
 
     SM = 0.99     # per-step data (losses.txt)
-    SS = 0.904    # 0.99^10 — stats logged every 10 steps (bottom row only)
+    SS = 0.99     # stats now logged every step (same as SM)
     SF = 0.6
 
     fig, axes = plt.subplots(2, 3, figsize=(21, 10))
@@ -1099,25 +1129,34 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     ax_gates_ax.set_ylabel("Gate value")
     ax_gates_ax.grid(True, alpha=0.3)
 
-    # [1,1] L2-SP Loss — or Core EMA when L2-SP inactive
+    # [1,1] L2-SP Loss — or x0 Loss EMA when L2-SP inactive
     has_l2sp = len(s_steps) > 0 and s_l2sp.any()
+    has_x0eps = len(s_steps) > 0 and s_x0.any()
     if has_l2sp:
         ax_l2sp_ax.plot(s_steps, s_l2sp, color="darkorange", linewidth=1.5)
         ax_l2sp_ax.set_title(f"L2-SP Loss \u2014 current: {s_l2sp[-1]:.2e}")
         ax_l2sp_ax.set_ylabel("L2-SP")
-    elif has_cb:
-        core_ema_s = _ema_smooth(s_core, SS)
-        ax_l2sp_ax.plot(s_steps, s_core, color="#90CAF9", linewidth=0.5, alpha=0.4, label="Raw")
-        ax_l2sp_ax.plot(s_steps, core_ema_s, color="#1565C0", linewidth=2, label=f"EMA ({SS})")
-        ax_l2sp_ax.set_title(f"Core Loss (per-pixel) \u2014 {core_ema_s[-1]:.4f}")
-        ax_l2sp_ax.legend(loc="upper right", fontsize=8)
-        ax_l2sp_ax.set_ylabel("Core MSE")
+    elif has_x0eps:
+        # Filter to steps where x0 path had samples (non-zero loss)
+        x0_mask = s_x0 > 0
+        x0_steps_f = s_steps[x0_mask]
+        x0_vals_f = s_x0[x0_mask]
+        if len(x0_vals_f) > 1:
+            x0_ema_slow = _ema_smooth(x0_vals_f, SM)
+            x0_ema_fast = _ema_smooth(x0_vals_f, SF)
+            ax_l2sp_ax.plot(x0_steps_f, x0_ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
+            ax_l2sp_ax.plot(x0_steps_f, x0_ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
+            ax_l2sp_ax.set_title(f"x0-space Loss \u2014 trend: {x0_ema_slow[-1]:.4f}")
+            ax_l2sp_ax.legend(loc="upper right", fontsize=8)
+        else:
+            ax_l2sp_ax.set_title("x0-space Loss (insufficient data)")
+        ax_l2sp_ax.set_ylabel("Loss")
     else:
-        ax_l2sp_ax.set_title("L2-SP / Core Loss (no data yet)")
+        ax_l2sp_ax.set_title("L2-SP / x0 Loss (no data yet)")
     ax_l2sp_ax.set_xlabel("Step")
     ax_l2sp_ax.grid(True, alpha=0.3)
 
-    # [1,2] L2-SP / Diffusion — or Band EMA when L2-SP inactive
+    # [1,2] L2-SP / Diffusion — or eps Loss EMA when L2-SP inactive
     if has_l2sp and len(s_diff) > 0:
         safe_d = np.maximum(s_diff, 1e-10)
         rat = s_l2sp / safe_d
@@ -1129,15 +1168,23 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
         ax_l2sp_div.yaxis.set_major_formatter(
             plt.FuncFormatter(lambda x, _: f"{x:.1%}"))
         ax_l2sp_div.set_ylabel("Ratio")
-    elif has_cb:
-        band_ema_s = _ema_smooth(s_band, SS)
-        ax_l2sp_div.plot(s_steps, s_band, color="#FFCC80", linewidth=0.5, alpha=0.4, label="Raw")
-        ax_l2sp_div.plot(s_steps, band_ema_s, color="#E65100", linewidth=2, label=f"EMA ({SS})")
-        ax_l2sp_div.set_title(f"Band Loss (per-pixel) \u2014 {band_ema_s[-1]:.4f}")
-        ax_l2sp_div.legend(loc="upper right", fontsize=8)
-        ax_l2sp_div.set_ylabel("Band MSE")
+    elif has_x0eps:
+        # Filter to steps where eps path had samples (non-zero loss)
+        eps_mask = s_eps > 0
+        eps_steps_f = s_steps[eps_mask]
+        eps_vals_f = s_eps[eps_mask]
+        if len(eps_vals_f) > 1:
+            eps_ema_slow = _ema_smooth(eps_vals_f, SM)
+            eps_ema_fast = _ema_smooth(eps_vals_f, SF)
+            ax_l2sp_div.plot(eps_steps_f, eps_ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
+            ax_l2sp_div.plot(eps_steps_f, eps_ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
+            ax_l2sp_div.set_title(f"\u03b5-space Loss \u2014 trend: {eps_ema_slow[-1]:.4f}")
+            ax_l2sp_div.legend(loc="upper right", fontsize=8)
+        else:
+            ax_l2sp_div.set_title("\u03b5-space Loss (insufficient data)")
+        ax_l2sp_div.set_ylabel("Loss")
     else:
-        ax_l2sp_div.set_title("L2-SP / Band Loss (no data yet)")
+        ax_l2sp_div.set_title("L2-SP / \u03b5 Loss (no data yet)")
     ax_l2sp_div.set_xlabel("Step")
     ax_l2sp_div.grid(True, alpha=0.3)
 
