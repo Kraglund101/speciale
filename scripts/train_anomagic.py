@@ -532,7 +532,7 @@ def train_anomagic(
     stats_file = save_dir / "stats.csv"
     stats_fh = open(stats_file, "a")
     if stats_fh.tell() == 0:
-        stats_fh.write("step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,x0_ratio,x0_loss,eps_loss\n")
+        stats_fh.write("step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,x0_ratio,x0_loss,eps_loss,grad_norm\n")
 
     pbar = tqdm(range(start_step, n_steps), desc="Training", initial=start_step, total=n_steps)
     skipped_nan = 0
@@ -608,12 +608,12 @@ def train_anomagic(
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
             optimizer.step()
 
         loss_val = loss_diff.item()
@@ -641,7 +641,7 @@ def train_anomagic(
         band_l = loss_extras.get("band_loss", 0.0)
         x0_l = loss_extras.get("x0_loss", 0.0)
         eps_l = loss_extras.get("eps_loss", 0.0)
-        stats_fh.write(f"{step},{loss_val},{lr_pre},{lr_scr},{attn_gate},{ff_gate},{l2sp_val},{core_l},{band_l},{x0_ratio},{x0_l},{eps_l}\n")
+        stats_fh.write(f"{step},{loss_val},{lr_pre},{lr_scr},{attn_gate},{ff_gate},{l2sp_val},{core_l},{band_l},{x0_ratio},{x0_l},{eps_l},{grad_norm}\n")
         stats_fh.flush()
 
         for t in batch_types:
@@ -996,83 +996,65 @@ def _ema_smooth(values, smoothing: float = 0.99):
 
 
 def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
-    """Render the 2x3 training diagnostics plot and save to disk."""
+    """Render 2x3 training diagnostics plot. Two layouts:
+    - Default: trend, core/band, band/core ratio, gates, grad norm, (empty)
+    - x0 ablation: trend, core/band, x0 vs eps + annealing, gates, grad norm, band/core ratio
+    """
     if len(losses) < 2:
         return
 
-    # Parse stats.csv
+    # --- Parse stats.csv ---
     stats_steps, diff_losses = [], []
     attn_gates, ff_gates, l2sp_vals = [], [], []
     core_losses, band_losses = [], []
-    x0_losses, eps_losses = [], []
+    x0_losses, eps_losses, x0_ratios, grad_norms = [], [], [], []
     try:
         with open(stats_file, "r", encoding="utf-8") as f:
             header = f.readline().strip()
-            n_cols = len(header.split(","))
+            cols = header.split(",")
+            n_cols = len(cols)
             for line in f:
                 parts = line.strip().split(",")
-                if n_cols >= 9 and len(parts) >= 9:
-                    stats_steps.append(int(parts[0]))
-                    diff_losses.append(float(parts[1]))
-                    attn_gates.append(float(parts[4]))
-                    ff_gates.append(float(parts[5]))
-                    l2sp_vals.append(float(parts[6]))
-                    core_losses.append(float(parts[7]))
-                    band_losses.append(float(parts[8]))
-                    # x0/eps columns (12-col format)
-                    if len(parts) >= 12:
-                        x0_losses.append(float(parts[10]))
-                        eps_losses.append(float(parts[11]))
-                    else:
-                        x0_losses.append(0.0)
-                        eps_losses.append(0.0)
-                elif n_cols >= 7 and len(parts) >= 7:
-                    stats_steps.append(int(parts[0]))
-                    diff_losses.append(float(parts[1]))
-                    attn_gates.append(float(parts[4]))
-                    ff_gates.append(float(parts[5]))
-                    l2sp_vals.append(float(parts[6]))
-                    core_losses.append(0.0)
-                    band_losses.append(0.0)
-                    x0_losses.append(0.0)
-                    eps_losses.append(0.0)
+                if len(parts) < 7:
+                    continue
+                stats_steps.append(int(parts[0]))
+                diff_losses.append(float(parts[1]))
+                attn_gates.append(float(parts[4]))
+                ff_gates.append(float(parts[5]))
+                l2sp_vals.append(float(parts[6]))
+                core_losses.append(float(parts[7]) if len(parts) > 8 else 0.0)
+                band_losses.append(float(parts[8]) if len(parts) > 8 else 0.0)
+                x0_ratios.append(float(parts[9]) if len(parts) > 9 else 0.0)
+                x0_losses.append(float(parts[10]) if len(parts) > 10 else 0.0)
+                eps_losses.append(float(parts[11]) if len(parts) > 11 else 0.0)
+                grad_norms.append(float(parts[12]) if len(parts) > 12 else 0.0)
     except FileNotFoundError:
         pass
+
     s_steps = np.array(stats_steps)
     s_attn = np.array(attn_gates)
     s_ff = np.array(ff_gates)
-    s_l2sp = np.array(l2sp_vals)
     s_core = np.array(core_losses)
     s_band = np.array(band_losses)
-    s_diff = np.array(diff_losses)
     s_x0 = np.array(x0_losses)
     s_eps = np.array(eps_losses)
+    s_x0r = np.array(x0_ratios)
+    s_gn = np.array(grad_norms)
 
-    SM = 0.99     # per-step data (losses.txt)
-    SS = 0.99     # stats now logged every step (same as SM)
+    SM = 0.99
     SF = 0.6
-
-    fig, axes = plt.subplots(2, 3, figsize=(21, 10))
-    ax_trend, ax_cb, ax_ratio = axes[0]
-    ax_gates_ax, ax_l2sp_ax, ax_l2sp_div = axes[1]
 
     steps = np.arange(len(losses))
     arr = np.array(losses)
     ema_fast = _ema_smooth(arr, SF)
     ema_slow = _ema_smooth(arr, SM)
 
-    # [0,0] Smooth Trend
-    ax_trend.plot(steps, ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
-    ax_trend.plot(steps, ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
-    ax_trend.set_xlabel("Step")
-    ax_trend.set_ylabel("Loss")
-    ax_trend.set_title(f"Smooth Trend \u2014 step {len(losses)}, trend: {ema_slow[-1]:.4f}")
-    ax_trend.legend(loc="upper right", fontsize=8)
-    ax_trend.grid(True, alpha=0.3)
-
     has_cb = len(s_steps) > 0 and len(s_core) > 0 and s_core.any()
+    has_x0 = len(s_steps) > 0 and s_x0.any()
+    has_gn = len(s_steps) > 0 and s_gn.any()
 
-    # [0,1] Core vs Band — disentangled from per-step total
+    # --- Precompute core/band decomposition (shared by both layouts) ---
+    ce = be = core_ps = band_ps = None
     if has_cb:
         w_core_s = 0.8 * s_core
         w_band_s = 0.2 * s_band
@@ -1083,6 +1065,44 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
         band_ps = arr * (1.0 - core_share_ps) / 0.2
         ce = _ema_smooth(core_ps, SM)
         be = _ema_smooth(band_ps, SM)
+
+    # =====================================================
+    # Choose layout based on x0 data presence
+    # =====================================================
+    fig, axes = plt.subplots(2, 3, figsize=(21, 10))
+
+    if has_x0:
+        # x0 ABLATION LAYOUT:
+        # [0,0] Smooth Trend    [0,1] Core vs Band    [0,2] x0 vs eps + annealing
+        # [1,0] Gates           [1,1] Band/Core Ratio  [1,2] Grad Norm
+        ax_trend  = axes[0, 0]
+        ax_cb     = axes[0, 1]
+        ax_x0eps  = axes[0, 2]
+        ax_gates  = axes[1, 0]
+        ax_ratio  = axes[1, 1]
+        ax_gn     = axes[1, 2]
+    else:
+        # DEFAULT LAYOUT:
+        # [0,0] Smooth Trend    [0,1] Core vs Band    [0,2] Band/Core Ratio
+        # [1,0] Gates           [1,1] Grad Norm        [1,2] (empty)
+        ax_trend  = axes[0, 0]
+        ax_cb     = axes[0, 1]
+        ax_ratio  = axes[0, 2]
+        ax_gates  = axes[1, 0]
+        ax_gn     = axes[1, 1]
+        ax_x0eps  = None
+        axes[1, 2].set_visible(False)
+
+    # --- Smooth Trend ---
+    ax_trend.plot(steps, ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
+    ax_trend.plot(steps, ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
+    ax_trend.set_xlabel("Step"); ax_trend.set_ylabel("Loss")
+    ax_trend.set_title(f"Smooth Trend — step {len(losses)}, trend: {ema_slow[-1]:.4f}")
+    ax_trend.legend(loc="upper right", fontsize=8)
+    ax_trend.grid(True, alpha=0.3)
+
+    # --- Core vs Band (stacked area) ---
+    if has_cb:
         ax_cb.fill_between(steps, 0, ce, color="#2196F3", alpha=0.4)
         ax_cb.fill_between(steps, ce, ce + be, color="#FF9800", alpha=0.4)
         ax_cb.plot(steps, ce, color="#1565C0", linewidth=1.5, label="Core")
@@ -1094,14 +1114,13 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
         ax_cb.annotate(f"{be[-1]:.3f}", xy=(steps[-1], ce[-1] + be[-1] / 2),
                        fontsize=9, fontweight="bold", color="#E65100", ha="right")
         ax_cb.legend(loc="upper right", fontsize=8)
-        ax_cb.set_title(f"Core vs Band, EMA({SM}) \u2014 weighted: {ema_slow[-1]:.4f}")
+        ax_cb.set_title(f"Core vs Band, EMA({SM}) — weighted: {ema_slow[-1]:.4f}")
     else:
         ax_cb.set_title("Core vs Band (no data yet)")
-    ax_cb.set_xlabel("Step")
-    ax_cb.set_ylabel("Per-pixel MSE")
+    ax_cb.set_xlabel("Step"); ax_cb.set_ylabel("Per-pixel MSE")
     ax_cb.grid(True, alpha=0.3)
 
-    # [0,2] Band/Core ratio — disentangled from per-step total
+    # --- Band/Core Ratio ---
     if has_cb:
         safe_c_ps = np.maximum(core_ps, 1e-10)
         cbr = band_ps / safe_c_ps
@@ -1109,84 +1128,77 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
         ax_ratio.plot(steps, cbr, color="gray", linewidth=0.5, alpha=0.3, label="Raw")
         ax_ratio.plot(steps, cbre, color="purple", linewidth=2, label=f"EMA ({SM})")
         ax_ratio.axhline(y=1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-        ax_ratio.set_title(f"Band/Core Ratio, EMA({SM}) \u2014 {cbre[-1]:.2f}x")
+        ax_ratio.set_title(f"Band/Core Ratio, EMA({SM}) — {cbre[-1]:.2f}x")
         ax_ratio.legend(loc="upper left", fontsize=8)
     else:
         ax_ratio.set_title("Band/Core Ratio (no data yet)")
-    ax_ratio.set_xlabel("Step")
-    ax_ratio.set_ylabel("Band / Core")
+    ax_ratio.set_xlabel("Step"); ax_ratio.set_ylabel("Band / Core")
     ax_ratio.grid(True, alpha=0.3)
 
-    # [1,0] Gates
+    # --- Gates ---
     if len(s_steps) > 0:
-        ax_gates_ax.plot(s_steps, s_attn, color="blue", linewidth=1.5, label="Attn gate")
-        ax_gates_ax.plot(s_steps, s_ff, color="green", linewidth=1.5, label="FF gate")
-        ax_gates_ax.set_title(f"Gates \u2014 attn={s_attn[-1]:.4f}, ff={s_ff[-1]:.4f}")
-        ax_gates_ax.legend(loc="upper left", fontsize=8)
+        ax_gates.plot(s_steps, s_attn, color="blue", linewidth=1.5, label="Attn gate")
+        ax_gates.plot(s_steps, s_ff, color="green", linewidth=1.5, label="FF gate")
+        ax_gates.set_title(f"Gates — attn={s_attn[-1]:.4f}, ff={s_ff[-1]:.4f}")
+        ax_gates.legend(loc="upper left", fontsize=8)
     else:
-        ax_gates_ax.set_title("Gates (no data yet)")
-    ax_gates_ax.set_xlabel("Step")
-    ax_gates_ax.set_ylabel("Gate value")
-    ax_gates_ax.grid(True, alpha=0.3)
+        ax_gates.set_title("Gates (no data yet)")
+    ax_gates.set_xlabel("Step"); ax_gates.set_ylabel("Gate value")
+    ax_gates.grid(True, alpha=0.3)
 
-    # [1,1] L2-SP Loss — or x0 Loss EMA when L2-SP inactive
-    has_l2sp = len(s_steps) > 0 and s_l2sp.any()
-    has_x0eps = len(s_steps) > 0 and s_x0.any()
-    if has_l2sp:
-        ax_l2sp_ax.plot(s_steps, s_l2sp, color="darkorange", linewidth=1.5)
-        ax_l2sp_ax.set_title(f"L2-SP Loss \u2014 current: {s_l2sp[-1]:.2e}")
-        ax_l2sp_ax.set_ylabel("L2-SP")
-    elif has_x0eps:
-        # Filter to steps where x0 path had samples (non-zero loss)
+    # --- Grad Norm ---
+    if has_gn:
+        gn_ema_fast = _ema_smooth(s_gn, SF)
+        gn_ema_slow = _ema_smooth(s_gn, SM)
+        ax_gn.plot(s_steps, gn_ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
+        ax_gn.plot(s_steps, gn_ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
+        ax_gn.axhline(y=1.0, color="black", linewidth=1, linestyle="--", alpha=0.5, label="clip=1.0")
+        ax_gn.set_title(f"Grad Norm — trend: {gn_ema_slow[-1]:.4f}")
+        ax_gn.legend(loc="upper right", fontsize=8)
+    else:
+        ax_gn.set_title("Grad Norm (no data yet)")
+    ax_gn.set_xlabel("Step"); ax_gn.set_ylabel("Norm")
+    ax_gn.grid(True, alpha=0.3)
+
+    # --- x0 vs eps + annealing (x0 layout only) ---
+    if ax_x0eps is not None and has_x0:
         x0_mask = s_x0 > 0
-        x0_steps_f = s_steps[x0_mask]
-        x0_vals_f = s_x0[x0_mask]
-        if len(x0_vals_f) > 1:
-            x0_ema_slow = _ema_smooth(x0_vals_f, SM)
-            x0_ema_fast = _ema_smooth(x0_vals_f, SF)
-            ax_l2sp_ax.plot(x0_steps_f, x0_ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
-            ax_l2sp_ax.plot(x0_steps_f, x0_ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
-            ax_l2sp_ax.set_title(f"x0-space Loss \u2014 trend: {x0_ema_slow[-1]:.4f}")
-            ax_l2sp_ax.legend(loc="upper right", fontsize=8)
-        else:
-            ax_l2sp_ax.set_title("x0-space Loss (insufficient data)")
-        ax_l2sp_ax.set_ylabel("Loss")
-    else:
-        ax_l2sp_ax.set_title("L2-SP / x0 Loss (no data yet)")
-    ax_l2sp_ax.set_xlabel("Step")
-    ax_l2sp_ax.grid(True, alpha=0.3)
-
-    # [1,2] L2-SP / Diffusion — or eps Loss EMA when L2-SP inactive
-    if has_l2sp and len(s_diff) > 0:
-        safe_d = np.maximum(s_diff, 1e-10)
-        rat = s_l2sp / safe_d
-        rate = _ema_smooth(rat, SS)
-        ax_l2sp_div.plot(s_steps, rat, color="gray", linewidth=0.8, alpha=0.5, label="Raw ratio")
-        ax_l2sp_div.plot(s_steps, rate, color="crimson", linewidth=2, label=f"EMA ({SS})")
-        ax_l2sp_div.set_title(f"L2-SP / Diffusion \u2014 current: {rat[-1]:.1%}")
-        ax_l2sp_div.legend(loc="upper left", fontsize=8)
-        ax_l2sp_div.yaxis.set_major_formatter(
-            plt.FuncFormatter(lambda x, _: f"{x:.1%}"))
-        ax_l2sp_div.set_ylabel("Ratio")
-    elif has_x0eps:
-        # Filter to steps where eps path had samples (non-zero loss)
+        x0_steps_f, x0_vals_f = s_steps[x0_mask], s_x0[x0_mask]
         eps_mask = s_eps > 0
-        eps_steps_f = s_steps[eps_mask]
-        eps_vals_f = s_eps[eps_mask]
+        eps_steps_f, eps_vals_f = s_steps[eps_mask], s_eps[eps_mask]
+
+        lines = []
+        if len(x0_vals_f) > 1:
+            ax_x0eps.plot(x0_steps_f, _ema_smooth(x0_vals_f, SF), color="#CE93D8", linewidth=0.8, alpha=0.3)
+            x0_slow = _ema_smooth(x0_vals_f, SM)
+            l1, = ax_x0eps.plot(x0_steps_f, x0_slow, color="#6A1B9A", linewidth=2.5,
+                                label=f"x0 = {x0_slow[-1]:.4f}")
+            lines.append(l1)
         if len(eps_vals_f) > 1:
-            eps_ema_slow = _ema_smooth(eps_vals_f, SM)
-            eps_ema_fast = _ema_smooth(eps_vals_f, SF)
-            ax_l2sp_div.plot(eps_steps_f, eps_ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
-            ax_l2sp_div.plot(eps_steps_f, eps_ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
-            ax_l2sp_div.set_title(f"\u03b5-space Loss \u2014 trend: {eps_ema_slow[-1]:.4f}")
-            ax_l2sp_div.legend(loc="upper right", fontsize=8)
-        else:
-            ax_l2sp_div.set_title("\u03b5-space Loss (insufficient data)")
-        ax_l2sp_div.set_ylabel("Loss")
-    else:
-        ax_l2sp_div.set_title("L2-SP / \u03b5 Loss (no data yet)")
-    ax_l2sp_div.set_xlabel("Step")
-    ax_l2sp_div.grid(True, alpha=0.3)
+            ax_x0eps.plot(eps_steps_f, _ema_smooth(eps_vals_f, SF), color="#80CBC4", linewidth=0.8, alpha=0.3)
+            eps_slow = _ema_smooth(eps_vals_f, SM)
+            l2, = ax_x0eps.plot(eps_steps_f, eps_slow, color="#00695C", linewidth=2.5,
+                                label=f"\u03b5 = {eps_slow[-1]:.4f}")
+            lines.append(l2)
+
+        # Annealing ratio on second y-axis
+        ax_r2 = ax_x0eps.twinx()
+        l3, = ax_r2.plot(s_steps, s_x0r, color="gray", linewidth=1.5, linestyle="--",
+                         alpha=0.6, label="x0 ratio")
+        ax_r2.set_ylim(-0.05, 1.1)
+        ax_r2.set_ylabel("x0 ratio", color="gray")
+        ax_r2.tick_params(axis="y", labelcolor="gray")
+        lines.append(l3)
+
+        ax_x0eps.legend(handles=lines, loc="upper right", fontsize=7)
+        title_parts = []
+        if len(x0_vals_f) > 1:
+            title_parts.append(f"x0={x0_slow[-1]:.4f}")
+        if len(eps_vals_f) > 1:
+            title_parts.append(f"\u03b5={eps_slow[-1]:.4f}")
+        ax_x0eps.set_title(f"x0 vs \u03b5 Loss, EMA({SM}) — {', '.join(title_parts)}")
+        ax_x0eps.set_xlabel("Step"); ax_x0eps.set_ylabel("Loss")
+        ax_x0eps.grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
