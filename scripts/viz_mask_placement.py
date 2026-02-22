@@ -27,7 +27,7 @@ torch.manual_seed(SEED)
 # ── Paths ─────────────────────────────────────────────────────────────────
 EXP = Path(
     r"C:\Users\frede\Desktop\kandidat\speciale\anomverse_extension"
-    r"\datasets\validation\VisA\datasets\easy_test\cashew\experiment_UniNet"
+    r"\datasets\VisA_validation_dataset\datasets\easy_test\cashew\experiment_UniNet"
 )
 CANVAS_IMGS = EXP / "source" / "normals" / "canvas" / "imgs"
 CANVAS_MASKS = EXP / "source" / "normals" / "canvas" / "fg_masks"

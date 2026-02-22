@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 CANVAS_DIR = Path(
     r"C:\Users\frede\Desktop\kandidat\speciale\anomverse_extension"
-    r"\datasets\validation\VisA\datasets\easy_test\cashew\experiment"
+    r"\datasets\VisA_validation_dataset\datasets\easy_test\cashew\experiment"
     r"\dataset_synthetic\source\canvas_normals"
 )
 IMAGE_DIR = CANVAS_DIR / "imgs"

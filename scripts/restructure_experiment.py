@@ -12,7 +12,7 @@ from pathlib import Path
 
 EXP = Path(
     r"C:\Users\frede\Desktop\kandidat\speciale\anomverse_extension"
-    r"\datasets\validation\VisA\datasets\easy_test\cashew\experiment"
+    r"\datasets\VisA_validation_dataset\datasets\easy_test\cashew\experiment"
 )
 
 # ── Dataset Real ──────────────────────────────────────────────────────────

@@ -52,7 +52,7 @@ random.seed(SEED)
 # ── Paths ─────────────────────────────────────────────────────────────────
 CASHEW = Path(
     r"C:\Users\frede\desktop\kandidat\speciale\anomverse_extension"
-    r"\datasets\validation\VisA\datasets\easy_test\cashew"
+    r"\datasets\VisA_validation_dataset\datasets\easy_test\cashew"
 )
 NORMAL_DIR = CASHEW / "Data" / "Images" / "Normal"
 ANOMALY_DIR = CASHEW / "Data" / "Images" / "Anomaly"

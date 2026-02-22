@@ -26,7 +26,7 @@ torch.manual_seed(SEED)
 # ── Paths ─────────────────────────────────────────────────────────────────
 EXP = Path(
     r"C:\Users\frede\Desktop\kandidat\speciale\anomverse_extension"
-    r"\datasets\validation\VisA\datasets\easy_test\cashew\experiment_ResNet"
+    r"\datasets\VisA_validation_dataset\datasets\easy_test\cashew\experiment_ResNet"
 )
 CASHEW_BASE = EXP.parent  # .../cashew/
 

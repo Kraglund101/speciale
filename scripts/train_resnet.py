@@ -10,7 +10,8 @@ Data pool:
   - Real anomalies: train_real/{easy,hard}/imgs/ + test/anomaly/{easy,hard}/imgs/
   - Synthetic anomalies: anomaly/imgs/{easy,hard}/
 
-Method: stratified k-fold cross-validation (small dataset, ~80-100 images total).
+Method: stratified k-fold CV, stratified on (label x difficulty) so each fold
+preserves the proportion of real-easy, real-hard, synthetic-easy, synthetic-hard.
 """
 
 import argparse
@@ -107,51 +108,33 @@ def _glob_images(directory: Path) -> List[str]:
     )
 
 
-def collect_samples(
+def collect_all(
     experiment_dir: Path,
-) -> Tuple[List[Tuple[str, int, str]], int, int]:
+) -> List[Tuple[str, int, str]]:
     """Collect all real and synthetic anomaly images.
 
-    Returns:
-        samples: list of (path, label, difficulty) — label 0=real, 1=synthetic
-        n_real: count of real images
-        n_syn: count of synthetic images
+    Returns list of (path, label, strat_key) where:
+      - label: 0=real, 1=synthetic
+      - strat_key: e.g. "real_easy", "syn_hard" (for stratified splitting)
     """
     samples: List[Tuple[str, int, str]] = []
 
     # Real anomalies from train_real/
     for diff in ("easy", "hard"):
-        imgs = _glob_images(experiment_dir / "train_real" / diff / "imgs")
-        for p in imgs:
-            samples.append((p, 0, diff))
+        for p in _glob_images(experiment_dir / "train_real" / diff / "imgs"):
+            samples.append((p, 0, f"real_{diff}"))
 
     # Real anomalies from test/anomaly/
     for diff in ("easy", "hard"):
-        imgs = _glob_images(experiment_dir / "test" / "anomaly" / diff / "imgs")
-        for p in imgs:
-            samples.append((p, 0, diff))
-
-    n_real = sum(1 for _, l, _ in samples if l == 0)
+        for p in _glob_images(experiment_dir / "test" / "anomaly" / diff / "imgs"):
+            samples.append((p, 0, f"real_{diff}"))
 
     # Synthetic anomalies from anomaly/imgs/
     for diff in ("easy", "hard"):
-        imgs = _glob_images(experiment_dir / "anomaly" / "imgs" / diff)
-        for p in imgs:
-            samples.append((p, 1, diff))
+        for p in _glob_images(experiment_dir / "anomaly" / "imgs" / diff):
+            samples.append((p, 1, f"syn_{diff}"))
 
-    n_syn = sum(1 for _, l, _ in samples if l == 1)
-
-    log.info("Real anomalies: %d", n_real)
-    log.info("Synthetic anomalies: %d", n_syn)
-    log.info("Total: %d", len(samples))
-
-    # Per-difficulty breakdown
-    for diff in ("easy", "hard"):
-        r = sum(1 for _, l, d in samples if l == 0 and d == diff)
-        s = sum(1 for _, l, d in samples if l == 1 and d == diff)
-        log.info("  %s: %d real, %d synthetic", diff, r, s)
-
-    return samples, n_real, n_syn
+    return samples
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +147,6 @@ def build_model(unfreeze_all: bool = False) -> nn.Module:
     model.fc = nn.Linear(512, 1)
 
     if not unfreeze_all:
-        # Freeze everything except layer4 + fc
         for name, param in model.named_parameters():
             if not (name.startswith("layer4") or name.startswith("fc")):
                 param.requires_grad = False
@@ -246,72 +228,14 @@ def optimal_threshold(probs: np.ndarray, labels: np.ndarray) -> float:
     return best_t
 
 
-# ---------------------------------------------------------------------------
-# Single fold
-# ---------------------------------------------------------------------------
-
-def run_fold(
-    fold: int,
-    train_samples: List[Tuple[str, int]],
-    test_samples: List[Tuple[str, int]],
-    test_difficulties: List[str],
-    args: argparse.Namespace,
-    device: torch.device,
+def compute_metrics(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    strat_keys: List[str],
 ) -> Dict:
-    """Train and evaluate one fold. Returns metrics dict."""
-
-    train_ds = BinaryImageDataset(train_samples, build_transforms(train=True))
-    test_ds = BinaryImageDataset(test_samples, build_transforms(train=False))
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=2, pin_memory=True,
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=2, pin_memory=True,
-    )
-
-    model = build_model(unfreeze_all=args.unfreeze_all).to(device)
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=args.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs,
-    )
-
-    # Train with early stopping on test AUROC
-    best_auroc = 0.0
-    best_state = None
-
-    for epoch in range(1, args.epochs + 1):
-        loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        scheduler.step()
-
-        probs, labels = predict(model, test_loader, device)
-        try:
-            auroc = float(roc_auc_score(labels, probs))
-        except ValueError:
-            auroc = 0.0
-
-        if auroc > best_auroc:
-            best_auroc = auroc
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-        if epoch % 10 == 0 or epoch == args.epochs:
-            log.info("  Fold %d | Epoch %3d/%d | loss=%.4f | AUROC=%.4f | best=%.4f",
-                     fold, epoch, args.epochs, loss, auroc, best_auroc)
-
-    # Evaluate best model
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    model.to(device)
-
-    probs, labels = predict(model, test_loader, device)
-
+    """Compute AUROC, F1, accuracy overall and per-difficulty."""
     metrics: Dict = {}
+
     try:
         metrics["auroc"] = float(roc_auc_score(labels, probs))
     except ValueError:
@@ -323,19 +247,26 @@ def run_fold(
     metrics["accuracy"] = float(accuracy_score(labels, preds))
     metrics["f1"] = float(f1_score(labels, preds, zero_division=0))
 
-    # Per-difficulty AUROC
-    difficulties = np.array(test_difficulties)
-    test_labels = np.array([l for _, l in test_samples])
+    # Per-difficulty AUROC (easy vs hard, pooling real+syn within each)
+    keys = np.array(strat_keys)
     for diff in ("easy", "hard"):
-        mask = difficulties == diff
-        if mask.sum() == 0:
+        mask = np.array([diff in k for k in keys])
+        if mask.sum() < 2:
+            metrics[f"auroc_{diff}"] = float("nan")
+            continue
+        sub_labels = labels[mask]
+        if len(set(sub_labels)) < 2:
             metrics[f"auroc_{diff}"] = float("nan")
             continue
         try:
-            metrics[f"auroc_{diff}"] = float(roc_auc_score(labels[mask], probs[mask]))
+            metrics[f"auroc_{diff}"] = float(roc_auc_score(sub_labels, probs[mask]))
         except ValueError:
             metrics[f"auroc_{diff}"] = float("nan")
 
+    report = classification_report(
+        labels, preds, target_names=["real", "synthetic"], zero_division=0,
+    )
+    metrics["_report"] = report
     return metrics
 
 
@@ -347,20 +278,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="ResNet-18 real-vs-synthetic classifier. AUROC ~0.5 = indistinguishable.",
     )
-    parser.add_argument(
-        "--experiment-dir", type=str, required=True,
-        help="Path to experiment_ResNet directory",
-    )
-    parser.add_argument("--folds", type=int, default=5, help="Number of CV folds")
+    parser.add_argument("--experiment-dir", type=str, required=True)
+    parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--unfreeze-all", action="store_true",
-        help="Fine-tune entire network (default: freeze layers 1-3)",
-    )
+    parser.add_argument("--unfreeze-all", action="store_true")
     args = parser.parse_args()
 
     # Seed everything
@@ -378,50 +303,109 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
-    log.info("Folds: %d | Epochs: %d | LR: %.1e | BS: %d | Unfreeze all: %s",
-             args.folds, args.epochs, args.lr, args.batch_size, args.unfreeze_all)
 
-    # ---- Collect all data ----
-    all_samples, n_real, n_syn = collect_samples(experiment_dir)
-
-    if n_syn == 0:
-        log.error("No synthetic anomaly images found. Run generate_cashew.py first.")
-        sys.exit(1)
-    if n_real == 0:
-        log.error("No real anomaly images found.")
-        sys.exit(1)
-
+    # ---- Collect data ----
+    all_samples = collect_all(experiment_dir)
     paths = [s[0] for s in all_samples]
     labels = np.array([s[1] for s in all_samples])
-    difficulties = [s[2] for s in all_samples]
+    strat_keys = [s[2] for s in all_samples]
 
-    # ---- K-fold cross-validation ----
+    n_real = int((labels == 0).sum())
+    n_syn = int((labels == 1).sum())
+    log.info("Total: %d real + %d synthetic = %d", n_real, n_syn, len(all_samples))
+
+    # Breakdown
+    from collections import Counter
+    counts = Counter(strat_keys)
+    for k in sorted(counts):
+        log.info("  %-12s %d", k, counts[k])
+
+    if n_syn == 0:
+        log.error("No synthetic images found. Run generate_cashew.py first.")
+        sys.exit(1)
+    if n_real == 0:
+        log.error("No real images found.")
+        sys.exit(1)
+
+    # ---- Stratified K-fold on (label x difficulty) ----
     skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
     fold_metrics = []
 
-    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(paths, labels), 1):
+    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(paths, strat_keys), 1):
         log.info("=" * 50)
         log.info("FOLD %d / %d", fold_idx, args.folds)
         log.info("=" * 50)
 
         train_samples = [(paths[i], int(labels[i])) for i in train_idx]
         test_samples = [(paths[i], int(labels[i])) for i in test_idx]
-        test_diffs = [difficulties[i] for i in test_idx]
+        test_strat = [strat_keys[i] for i in test_idx]
 
-        n_train_real = sum(1 for _, l in train_samples if l == 0)
-        n_train_syn = sum(1 for _, l in train_samples if l == 1)
-        n_test_real = sum(1 for _, l in test_samples if l == 0)
-        n_test_syn = sum(1 for _, l in test_samples if l == 1)
-        log.info("Train: %d real + %d synthetic | Test: %d real + %d synthetic",
-                 n_train_real, n_train_syn, n_test_real, n_test_syn)
+        # Log fold composition
+        train_keys = [strat_keys[i] for i in train_idx]
+        for k in sorted(counts):
+            n_tr = sum(1 for t in train_keys if t == k)
+            n_te = sum(1 for t in test_strat if t == k)
+            log.info("  %-12s train=%d  test=%d", k, n_tr, n_te)
 
-        metrics = run_fold(fold_idx, train_samples, test_samples, test_diffs, args, device)
+        # Build loaders
+        train_ds = BinaryImageDataset(train_samples, build_transforms(train=True))
+        test_ds = BinaryImageDataset(test_samples, build_transforms(train=False))
+
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=4, pin_memory=True, persistent_workers=True,
+        )
+        test_loader = DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=4, pin_memory=True, persistent_workers=True,
+        )
+
+        # Fresh model per fold
+        model = build_model(unfreeze_all=args.unfreeze_all).to(device)
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=args.lr, weight_decay=args.weight_decay,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+        best_auroc = 0.0
+        best_state = None
+
+        for epoch in range(1, args.epochs + 1):
+            loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            scheduler.step()
+
+            probs, lbls = predict(model, test_loader, device)
+            try:
+                auroc = float(roc_auc_score(lbls, probs))
+            except ValueError:
+                auroc = 0.0
+
+            if auroc > best_auroc:
+                best_auroc = auroc
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+            if epoch % 10 == 0 or epoch == args.epochs:
+                log.info("  Epoch %3d/%d | loss=%.4f | AUROC=%.4f | best=%.4f",
+                         epoch, args.epochs, loss, auroc, best_auroc)
+
+        # Eval best model for this fold
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        model.to(device)
+
+        probs, lbls = predict(model, test_loader, device)
+        metrics = compute_metrics(probs, lbls, test_strat)
         fold_metrics.append(metrics)
 
-        log.info("Fold %d results: AUROC=%.4f  F1=%.4f  Acc=%.4f",
-                 fold_idx, metrics["auroc"], metrics["f1"], metrics["accuracy"])
+        log.info("Fold %d: AUROC=%.4f  easy=%.4f  hard=%.4f  F1=%.4f  Acc=%.4f",
+                 fold_idx, metrics["auroc"],
+                 metrics.get("auroc_easy", float("nan")),
+                 metrics.get("auroc_hard", float("nan")),
+                 metrics["f1"], metrics["accuracy"])
 
-    # ---- Aggregate results ----
+    # ---- Aggregate ----
     log.info("=" * 60)
     log.info("AGGREGATE RESULTS (%d-fold CV)", args.folds)
     log.info("=" * 60)
@@ -430,24 +414,29 @@ def main():
         vals = [m[key] for m in fold_metrics if not np.isnan(m.get(key, float("nan")))]
         if vals:
             mean, std = np.mean(vals), np.std(vals)
-            log.info("%-12s  %.4f +/- %.4f  (per fold: %s)",
-                     key, mean, std, ", ".join(f"{v:.4f}" for v in vals))
+            log.info("%-12s  %.4f +/- %.4f  (%s)",
+                     key, mean, std, ", ".join(f"{v:.3f}" for v in vals))
         else:
             log.info("%-12s  N/A", key)
 
-    mean_auroc = np.mean([m["auroc"] for m in fold_metrics
-                          if not np.isnan(m["auroc"])])
+    mean_auroc = float(np.mean([m["auroc"] for m in fold_metrics
+                                 if not np.isnan(m["auroc"])]))
     log.info("")
     if mean_auroc < 0.6:
-        log.info("VERDICT: Synthetics are INDISTINGUISHABLE from real (AUROC %.3f)", mean_auroc)
+        log.info("VERDICT: INDISTINGUISHABLE (AUROC %.3f)", mean_auroc)
     elif mean_auroc < 0.75:
-        log.info("VERDICT: Synthetics are SOMEWHAT distinguishable (AUROC %.3f)", mean_auroc)
+        log.info("VERDICT: SOMEWHAT distinguishable (AUROC %.3f)", mean_auroc)
     else:
-        log.info("VERDICT: Synthetics are EASILY distinguishable (AUROC %.3f)", mean_auroc)
+        log.info("VERDICT: EASILY distinguishable (AUROC %.3f)", mean_auroc)
 
-    # ---- Save results ----
+    # ---- Save ----
     results_dir = experiment_dir / "results"
     results_dir.mkdir(exist_ok=True)
+
+    agg = {}
+    for key in ("auroc", "auroc_easy", "auroc_hard", "f1", "accuracy"):
+        vals = [m[key] for m in fold_metrics if not np.isnan(m.get(key, float("nan")))]
+        agg[key] = {"mean": float(np.mean(vals)), "std": float(np.std(vals))} if vals else None
 
     results = {
         "task": "real_vs_synthetic_classification",
@@ -455,19 +444,19 @@ def main():
         "folds": args.folds,
         "epochs": args.epochs,
         "lr": args.lr,
-        "batch_size": args.batch_size,
-        "unfreeze_all": args.unfreeze_all,
         "seed": args.seed,
+        "unfreeze_all": args.unfreeze_all,
         "n_real": n_real,
         "n_synthetic": n_syn,
-        "mean_auroc": float(mean_auroc),
-        "per_fold": fold_metrics,
+        "aggregate": agg,
+        "per_fold": [{k: v for k, v in m.items() if not k.startswith("_")}
+                     for m in fold_metrics],
     }
 
     out_path = results_dir / "resnet_real_vs_synthetic.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
-    log.info("Saved results: %s", out_path)
+    log.info("Saved: %s", out_path)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ np.random.seed(SEED)
 
 EXP = Path(
     r"C:\Users\frede\Desktop\kandidat\speciale\anomverse_extension"
-    r"\datasets\validation\VisA\datasets\easy_test\cashew\experiment_UniNet"
+    r"\datasets\VisA_validation_dataset\datasets\easy_test\cashew\experiment_UniNet"
 )
 VIZ_SIZE = 512
 SCALE_RANGE = (0.8, 1.2)

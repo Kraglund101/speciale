@@ -50,17 +50,17 @@ def train_anomagic(
     save_dir: Path,
     captions_file: Path,
     n_steps: int = 10000,
-    batch_size: int = 16,
+    batch_size: int = 12,
     lr: float = 1e-4,
     lr_pretrained: float = 5e-5,
-    lambda_sp: float = 1e-4,
+    lambda_sp: float = 0.0,
     device: str = "cuda",
     save_every: int = 5000,
     anomaly_types: list = None,
     exclude_sources: list = None,
     data_root: Path = None,
     ip_adapter_type: str = "plus",
-    ip_adapter_k: int = 4,
+    ip_adapter_k: int = 16,
     ip_adapter_scale: float = 1.0,
     reference_mode: str = "full",
     mask_visual: bool = True,
@@ -68,7 +68,7 @@ def train_anomagic(
     clip_dilation_min_r: int = 2,
     clip_dilation_max_r: int = 10,
     # Latent-space band dilation
-    band_mode: int = 1,
+    band_mode: int = 2,
     # Loss weighting
     loss_core_ratio: float = 0.8,
     # Cross-attention mask type
@@ -80,6 +80,10 @@ def train_anomagic(
     lora_alpha: int = 16,
     lora_lr: float = 5e-5,
     lora_mode: str = "all",  # "all" = self+cross, "cross" = cross-attention only
+    # Unfreeze W_Q and W_O: "" = off, "mid_up" = mid+up cross-attn,
+    # "all_cross" = all cross-attn, "all" = all cross + self attn
+    unfreeze_qo: str = "",
+    unfreeze_qo_lr: float = 1e-5,
     # Conditioning dropout for CFG (mutually exclusive per-sample)
     drop_image_prob: float = 0.10,
     drop_text_prob: float = 0.10,
@@ -89,19 +93,19 @@ def train_anomagic(
     # Resume from checkpoint
     resume_dir: Path = None,
     # Visual token processing mode
-    visual_mode: int = 0,
+    visual_mode: int = 3,
     # Gate mode for masked self-attention
     learnable_gates: bool = True,
     # Force gates to 1.0 with normal projection init (block active from step 0)
     force_gates: bool = False,
     # Number of self-attention transformer layers
-    sa_num_layers: int = 1,
+    sa_num_layers: int = 3,
     # Number of attention heads
     sa_num_heads: int = 12,
     # Multi-crop (2-group CLIP cropping)
-    multi_crop: bool = False,
+    multi_crop: bool = True,
     # CFG direction for sample generation
-    cfg_mode: str = "text",
+    cfg_mode: str = "visual",
     # Headless mode (no live viewer)
     no_live_viewer: bool = False,
     # Noise offset (helps with global brightness/darkness)
@@ -152,6 +156,7 @@ def train_anomagic(
     print(f"Cross-attn mask: {'binary' if binary_cross_attn_mask else 'soft alpha'}")
     print(f"T2I-Adapter: {t2i_adapter_mode}")
     print(f"LoRA: {'off' if lora_rank == 0 else f'rank={lora_rank}, alpha={lora_alpha}, mode={lora_mode}, lr={lora_lr}'}")
+    print(f"Unfreeze W_Q/W_O: {unfreeze_qo + ', lr=' + str(unfreeze_qo_lr) if unfreeze_qo else 'off'}")
     print(f"Conditioning dropout: image={drop_image_prob:.0%}, text={drop_text_prob:.0%}, both={drop_both_prob:.0%}")
     print(f"Data augmentation: {augment}")
     print(f"Visual mode: {visual_mode}")
@@ -277,6 +282,42 @@ def train_anomagic(
     else:
         lora_params = []
 
+    # =========================================
+    # Unfreeze W_Q and W_O in UNet attention layers
+    # Modes: mid_up = mid+up cross-attn, all_cross = all cross-attn,
+    #        all = all cross + self attn
+    # =========================================
+    qo_params = []
+    qo_params_named = []  # (name, param) pairs for checkpoint save/load
+    if unfreeze_qo:
+        for name, param in pipeline.unet.named_parameters():
+            # Block filter: mid_up restricts to mid+up, others allow all blocks
+            if unfreeze_qo == "mid_up":
+                if not (name.startswith("mid_block") or name.startswith("up_blocks")):
+                    continue
+
+            # Attention type filter
+            if unfreeze_qo in ("mid_up", "all_cross"):
+                # Cross-attention only (attn2)
+                if "attn2" not in name:
+                    continue
+            else:  # "all": cross + self attention
+                if "attn1" not in name and "attn2" not in name:
+                    continue
+
+            # Only W_Q and W_O
+            if not (name.endswith("to_q.weight") or name.endswith("to_q.bias")
+                    or "to_out.0.weight" in name or "to_out.0.bias" in name):
+                continue
+            param.requires_grad_(True)
+            param.data = param.data.float()
+            qo_params.append(param)
+            qo_params_named.append((name, param))
+        n_qo = sum(p.numel() for p in qo_params)
+        mode_desc = {"mid_up": "mid+up cross-attn", "all_cross": "all cross-attn",
+                     "all": "all cross+self attn"}[unfreeze_qo]
+        print(f"\nUnfrozen W_Q + W_O ({mode_desc}, lr={unfreeze_qo_lr}): {n_qo:,} params")
+
     # Ensure all trainable modules are fp32 (pretrained weights may load as fp16)
     ip_adapter.masked_self_attn.float()
     ip_adapter.image_projection.float()
@@ -323,15 +364,23 @@ def train_anomagic(
     param_groups = [
         {"params": a_decay,     "lr": lr_pretrained, "weight_decay": 0.0, "label": "A_decay"},
         {"params": a_no_decay,  "lr": lr_pretrained, "weight_decay": 0.0, "label": "A_no_decay"},
-        {"params": b_decay,     "lr": lr,            "weight_decay": 1e-3, "label": "B_decay"},
+        {"params": b_decay,     "lr": lr,            "weight_decay": 1e-4, "label": "B_decay"},
         {"params": b_no_decay,  "lr": lr,            "weight_decay": 0.0, "label": "B_no_decay"},
         {"params": group_c_params, "lr": lr,         "weight_decay": 0.0, "label": "C_gates"},
     ]
 
-    # Optional Group D: LoRA
+    # Optional Group D: LoRA (exclude qo_params to avoid duplicates)
     if lora_params:
+        qo_ids = {id(p) for p in qo_params}
+        lora_params_clean = [p for p in lora_params if id(p) not in qo_ids]
         param_groups.append(
-            {"params": lora_params, "lr": lora_lr, "weight_decay": 1e-3, "label": "D_lora"}
+            {"params": lora_params_clean, "lr": lora_lr, "weight_decay": 1e-3, "label": "D_lora"}
+        )
+
+    # Optional Group E: Unfrozen W_Q + W_O
+    if qo_params:
+        param_groups.append(
+            {"params": qo_params, "lr": unfreeze_qo_lr, "weight_decay": 0.0, "label": "E_qo"}
         )
 
     # --- Verify: no duplicate params across groups ---
@@ -351,6 +400,7 @@ def train_anomagic(
         expected_params = ip_adapter.get_trainable_parameters()
         if t2i_adapter is not None:
             expected_params.extend(list(t2i_adapter.parameters()))
+        expected_params.extend(qo_params)
         expected_numel = sum(p.numel() for p in expected_params)
         assert group_numel == expected_numel, (
             f"Param count mismatch: groups={group_numel:,} vs expected={expected_numel:,}"
@@ -462,6 +512,16 @@ def train_anomagic(
                         p.data = p.data.float()
                 print(f"  Loaded LoRA weights")
 
+            # Unfrozen W_Q/W_O
+            if unfreeze_qo and "qo_weights" in state:
+                unet_params = dict(pipeline.unet.named_parameters())
+                loaded = 0
+                for name, saved_tensor in state["qo_weights"].items():
+                    if name in unet_params:
+                        unet_params[name].data = saved_tensor.float().to(device)
+                        loaded += 1
+                print(f"  Loaded {loaded} unfrozen W_Q/W_O tensors")
+
             del state
             torch.cuda.empty_cache()
         else:
@@ -505,6 +565,8 @@ def train_anomagic(
         "lora_alpha": lora_alpha,
         "lora_lr": lora_lr,
         "lora_mode": lora_mode,
+        "unfreeze_qo": unfreeze_qo,
+        "unfreeze_qo_lr": unfreeze_qo_lr,
         "batch_size": batch_size,
         "lr_pretrained": lr_pretrained,
         "lr": lr,
@@ -725,6 +787,7 @@ def train_anomagic(
                 unet=pipeline.unet if lora_rank > 0 else None,
                 step=step + 1,
                 losses=losses,
+                qo_params_named=qo_params_named if qo_params_named else None,
             )
             # Delete previous checkpoint (keep only latest + final)
             if prev_ckpt_dir is not None and prev_ckpt_dir.exists():
@@ -768,6 +831,7 @@ def train_anomagic(
         unet=pipeline.unet if lora_rank > 0 else None,
         step=n_steps,
         losses=losses,
+        qo_params_named=qo_params_named if qo_params_named else None,
     )
 
     # Final sample grid
@@ -1291,6 +1355,31 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
         ax_ctx.legend(loc="upper right", fontsize=8)
         ax_ctx.grid(True, alpha=0.3)
 
+    # --- Run title from config ---
+    run_title = None
+    config_path = stats_file.parent / "run_config.json"
+    try:
+        with open(config_path) as _cf:
+            cfg = json.load(_cf)
+        parts = [
+            f"VM{cfg.get('visual_mode', '?')}",
+            f"LoRA={cfg['lora_rank']}" if cfg.get('lora_rank', 0) > 0 else "no-LoRA",
+            f"BS={cfg.get('batch_size', '?')}",
+            f"SA={cfg.get('sa_num_layers', '?')}L/{cfg.get('sa_num_heads', '?')}H",
+            f"drop={cfg.get('drop_image_prob', 0) + cfg.get('drop_text_prob', 0) + cfg.get('drop_both_prob', 0):.0%}",
+            f"gates={'yes' if cfg.get('learnable_gates', True) else 'no'}",
+            f"UNet={'QO-' + cfg['unfreeze_qo'] if cfg.get('unfreeze_qo') else 'frozen'}",
+            cfg.get('optimizer', 'adamw'),
+            f"ts={cfg.get('timestep_sampling', '?')}",
+            f"corrupt={cfg['corrupt_context']}" if cfg.get('corrupt_context', 0) > 0 else None,
+            f"x0={cfg['x0_start_ratio']}->{cfg['x0_end_ratio']} w={cfg.get('x0_warmup_frac', 0)} ctx={'no' if cfg.get('x0_no_context') else 'yes'}" if cfg.get('x0_objective') else None,
+        ]
+        run_title = " | ".join(p for p in parts if p is not None)
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+    if run_title:
+        fig.suptitle(run_title, fontsize=11, fontweight="bold", y=1.02)
+
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -1300,8 +1389,9 @@ def save_anomagic_checkpoint(
     ip_adapter, optimizer, save_dir,
     band_mode: int = 1, t2i_adapter=None, unet=None,
     step: int = 0, losses: list = None,
+    qo_params_named: list = None,
 ):
-    """Save IP-Adapter + T2I-Adapter + LoRA checkpoint."""
+    """Save IP-Adapter + T2I-Adapter + LoRA + unfrozen QO checkpoint."""
     save_dir = Path(save_dir)
     ip_adapter.save_ip_adapter(save_dir)
 
@@ -1316,6 +1406,8 @@ def save_anomagic_checkpoint(
     if unet is not None:
         from peft import get_peft_model_state_dict
         state["lora_weights"] = get_peft_model_state_dict(unet)
+    if qo_params_named:
+        state["qo_weights"] = {name: param.data for name, param in qo_params_named}
     torch.save(state, save_dir / "training_state.pt")
 
 
@@ -1581,8 +1673,8 @@ def _generate_ood_grid(
     # --- Resolve paths ---
     project_root = Path(__file__).parent.parent
     exp_dir = (
-        project_root / "anomverse_extension" / "datasets" / "validation"
-        / "VisA" / "datasets" / "easy_test" / "cashew" / "experiment_ResNet"
+        project_root / "anomverse_extension" / "datasets" / "VisA_validation_dataset"
+        / "datasets" / "easy_test" / "cashew" / "experiment_ResNet"
     )
     cashew_root = exp_dir.parent
     canvas_imgs_dir = exp_dir / "source" / "canvas_normals" / "imgs"
@@ -1831,7 +1923,7 @@ if __name__ == "__main__":
                         help="Save checkpoint + samples every N steps")
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate for IP-Adapter")
-    parser.add_argument("--batch-size", type=int, default=16,
+    parser.add_argument("--batch-size", type=int, default=12,
                         help="Batch size")
     parser.add_argument("--ip-adapter-type", type=str, default="plus",
                         choices=["standard", "plus"],
@@ -1853,7 +1945,7 @@ if __name__ == "__main__":
                              "(ablation — all positions receive visual conditioning. "
                              "Default: masked, only anomaly positions get visual signal)")
     # Visual token processing mode
-    parser.add_argument("--visual-mode", type=int, default=0, choices=[0, 1, 2, 3],
+    parser.add_argument("--visual-mode", type=int, default=3, choices=[0, 1, 2, 3],
                         help="Visual token processing: 0=all 256 tokens (default), "
                              "1=selective residual, 2=anomaly-only+attn-only, "
                              "3=anomaly-only+full transformer (padding dead everywhere)")
@@ -1863,18 +1955,17 @@ if __name__ == "__main__":
     parser.add_argument("--force-gates", action="store_true",
                         help="Fixed gate=1.0 with normal projection init. "
                              "Block contributes fully from step 0 — forces reliance.")
-    parser.add_argument("--sa-num-layers", type=int, default=1,
+    parser.add_argument("--sa-num-layers", type=int, default=3,
                         help="Number of transformer layers in masked self-attention (default 1)")
     parser.add_argument("--sa-num-heads", type=int, default=12,
                         help="Number of attention heads in masked self-attention (default 12, matching Resampler)")
-    parser.add_argument("--cfg-mode", type=str, default="text", choices=["text", "visual", "both"],
+    parser.add_argument("--cfg-mode", type=str, default="visual", choices=["text", "visual", "both"],
                         help="CFG direction for sample generation: 'text' (default) amplifies text "
                              "on visual baseline, 'visual' amplifies IP-Adapter on text baseline, "
                              "'both' amplifies both pathways on unconditional baseline")
     # Multi-crop (orthogonal to visual-mode)
-    parser.add_argument("--multi-crop", action="store_true",
-                        help="Enable 2-group CLIP cropping: encode 2 independent anomaly "
-                             "crops → 2K tokens in UNet cross-attention. Combinable with any --visual-mode")
+    parser.add_argument("--no-multi-crop", action="store_true",
+                        help="Disable 2-group CLIP cropping (enabled by default)")
     # CLIP dilation settings — currently unused (CLIP path uses cropping instead).
     # Kept for potential future use with reference_mode="full".
     # parser.add_argument("--clip-dilation-min-r", type=int, default=2,
@@ -1882,7 +1973,7 @@ if __name__ == "__main__":
     # parser.add_argument("--clip-dilation-max-r", type=int, default=10,
     #                     help="CLIP mask dilation max radius")
     # Latent-space band dilation
-    parser.add_argument("--band-mode", type=int, default=1, choices=[1, 2],
+    parser.add_argument("--band-mode", type=int, default=2, choices=[1, 2],
                         help="Band mode: 1=single 1px band (alpha=0.5), 2=inner+outer (alpha=2/3, 1/3)")
     # Loss settings
     parser.add_argument("--loss-core-ratio", type=float, default=0.8,
@@ -1903,8 +1994,8 @@ if __name__ == "__main__":
                         help="Probability of dropping both image and text per sample for CFG")
     # LoRA
     # Data augmentation
-    parser.add_argument("--augment", action="store_true",
-                        help="Enable data augmentation (UNet: color jitter only, CLIP: flip/continuous rotate/jitter/crop_utils)")
+    parser.add_argument("--augment", action="store_true", default=True,
+                        help="Enable data augmentation (default: on)")
     parser.add_argument("--no-augment", dest="augment", action="store_false")
     # LoRA
     parser.add_argument("--lora-rank", type=int, default=0,
@@ -1915,6 +2006,11 @@ if __name__ == "__main__":
                         help="Learning rate for LoRA params (default 5e-5)")
     parser.add_argument("--lora-mode", type=str, default="all", choices=["all", "cross"],
                         help="LoRA target: 'all' = self+cross attention, 'cross' = cross-attention only")
+    parser.add_argument("--unfreeze-qo", type=str, default="",
+                        choices=["", "mid_up", "all_cross", "all"],
+                        help="Unfreeze W_Q/W_O: mid_up=mid+up cross-attn, all_cross=all cross-attn, all=cross+self")
+    parser.add_argument("--unfreeze-qo-lr", type=float, default=1e-5,
+                        help="Learning rate for unfrozen W_Q/W_O params (default 1e-5)")
     parser.add_argument("--lr-pretrained", type=float, default=1e-4,
                         help="Learning rate for pretrained IP-Adapter params (Group A)")
     parser.add_argument("--lambda-sp", type=float, default=0.0,
@@ -1999,6 +2095,8 @@ if __name__ == "__main__":
         lora_alpha=args.lora_alpha,
         lora_lr=args.lora_lr,
         lora_mode=args.lora_mode,
+        unfreeze_qo=args.unfreeze_qo,
+        unfreeze_qo_lr=args.unfreeze_qo_lr,
         drop_image_prob=args.drop_image_prob,
         drop_text_prob=args.drop_text_prob,
         drop_both_prob=args.drop_both_prob,
@@ -2009,7 +2107,7 @@ if __name__ == "__main__":
         force_gates=args.force_gates,
         sa_num_layers=args.sa_num_layers,
         sa_num_heads=args.sa_num_heads,
-        multi_crop=args.multi_crop,
+        multi_crop=not args.no_multi_crop,
         cfg_mode=args.cfg_mode,
         no_live_viewer=args.no_live_viewer,
         noise_offset=args.noise_offset,

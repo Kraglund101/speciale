@@ -34,7 +34,7 @@ from src.inference.generate import generate_anomagic_single
 # ── Paths ─────────────────────────────────────────────────────────────────
 CASHEW_ROOT = Path(
     r"C:\Users\frede\Desktop\kandidat\speciale\anomverse_extension"
-    r"\datasets\validation\VisA\datasets\easy_test\cashew"
+    r"\datasets\VisA_validation_dataset\datasets\easy_test\cashew"
 )
 EXTRA_NORMALS = CASHEW_ROOT / "Data" / "Images" / "Normal"
 IMAGE_ANNO_CSV = CASHEW_ROOT / "image_anno.csv"
