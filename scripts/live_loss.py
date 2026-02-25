@@ -44,15 +44,16 @@ def parse_losses(filepath: str) -> list:
 def parse_stats(filepath: str) -> dict:
     """Parse stats.csv → dict of arrays.
 
-    Supports 14-col format:
+    Supports 14-col and 17-col formats:
     step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,
-    x0_ratio,x0_loss,eps_loss,grad_norm,ctx_drop
+    x0_ratio,x0_loss,eps_loss,grad_norm,ctx_drop[,emb_global_norm,emb_anomaly_norm,emb_normal_norm]
     """
     steps, diff_losses = [], []
     attn_gates, ff_gates, l2sp_vals = [], [], []
     core_losses, band_losses = [], []
     x0_ratios, x0_losses, eps_losses = [], [], []
     grad_norms, ctx_drops = [], []
+    emb_global, emb_anomaly, emb_normal = [], [], []
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             header = f.readline().strip()
@@ -74,6 +75,9 @@ def parse_stats(filepath: str) -> dict:
                 eps_losses.append(float(parts[11]) if len(parts) > 11 else 0.0)
                 grad_norms.append(float(parts[12]) if len(parts) > 12 else 0.0)
                 ctx_drops.append(float(parts[13]) if len(parts) > 13 else 0.0)
+                emb_global.append(float(parts[14]) if len(parts) > 14 else 0.0)
+                emb_anomaly.append(float(parts[15]) if len(parts) > 15 else 0.0)
+                emb_normal.append(float(parts[16]) if len(parts) > 16 else 0.0)
     except FileNotFoundError:
         pass
     return {
@@ -89,6 +93,9 @@ def parse_stats(filepath: str) -> dict:
         "eps_loss": np.array(eps_losses),
         "grad_norm": np.array(grad_norms),
         "ctx_drop": np.array(ctx_drops),
+        "emb_global": np.array(emb_global),
+        "emb_anomaly": np.array(emb_anomaly),
+        "emb_normal": np.array(emb_normal),
     }
 
 
@@ -177,6 +184,9 @@ def main():
         has_gn = len(s_steps) > 0 and s_gn.any()
         has_ctx = (len(s_steps) > 0 and s_ctx.any()
                    and (s_ctx.max() - s_ctx.min()) > 0.01)
+        has_emb = (len(s_steps) > 0
+                   and (stats["emb_global"].any() or stats["emb_anomaly"].any()
+                        or stats["emb_normal"].any()))
 
         # Precompute core/band decomposition
         core_ps = band_ps = ce = be = None
@@ -208,7 +218,10 @@ def main():
             # DEFAULT LAYOUT
             ax_trend, ax_cb, ax_ratio = axes[0, 0], axes[0, 1], axes[0, 2]
             ax_gates, ax_gn = axes[1, 0], axes[1, 1]
-            axes[1, 2].set_visible(False)
+            if has_emb:
+                axes[1, 2].set_visible(True)
+            else:
+                axes[1, 2].set_visible(False)
 
         # === [0,0] Smooth Trend ===
         ax_trend.plot(steps, ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
@@ -351,6 +364,37 @@ def main():
             ax_ctx.set_ylabel("Dropout rate")
             ax_ctx.legend(loc="upper right", fontsize=8)
             ax_ctx.grid(True, alpha=0.3)
+
+        # === Role Embedding Norms ===
+        if has_emb:
+            s_eg = stats["emb_global"]
+            s_ea = stats["emb_anomaly"]
+            s_en = stats["emb_normal"]
+            if has_x0 or has_ctx:
+                # x0/ctx layouts: all 6 slots used, add as twinx on gates
+                ax_emb = ax_gates.twinx()
+                ax_emb.plot(s_steps, s_eg, color="#4CAF50", linewidth=1.5,
+                            linestyle="--", alpha=0.7, label="Global")
+                ax_emb.plot(s_steps, s_ea, color="#F44336", linewidth=1.5,
+                            linestyle="--", alpha=0.7, label="Anomaly")
+                ax_emb.plot(s_steps, s_en, color="#2196F3", linewidth=1.5,
+                            linestyle="--", alpha=0.7, label="Band")
+                ax_emb.set_ylabel("Emb L2 norm", fontsize=8)
+                ax_emb.legend(loc="upper right", fontsize=7)
+            else:
+                # Default layout: dedicated subplot at [1,2]
+                ax_emb = axes[1, 2]
+                ax_emb.plot(s_steps, s_eg, color="#4CAF50", linewidth=2,
+                            label=f"Global ({s_eg[-1]:.4f})")
+                ax_emb.plot(s_steps, s_ea, color="#F44336", linewidth=2,
+                            label=f"Anomaly ({s_ea[-1]:.4f})")
+                ax_emb.plot(s_steps, s_en, color="#2196F3", linewidth=2,
+                            label=f"Band ({s_en[-1]:.4f})")
+                ax_emb.set_xlabel("Step")
+                ax_emb.set_ylabel("L2 Norm")
+                ax_emb.set_title("Role Embedding Norms")
+                ax_emb.legend(loc="upper left", fontsize=8)
+                ax_emb.grid(True, alpha=0.3)
 
         fig.tight_layout()
 

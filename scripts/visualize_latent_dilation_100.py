@@ -37,6 +37,8 @@ random.seed(123)
 np.random.seed(123)
 
 ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+from src.utils.mask_utils import downsample_mask_maxpool
 DATA_BASE = ROOT / "anomverse_extension" / "datasets" / "full_training_dataset"
 
 
@@ -137,11 +139,14 @@ def main():
         defect = s.get("defect_type", "?")
 
         img_pil = Image.open(str(DATA_BASE / s["image_path"])).convert("RGB").resize((512, 512), Image.BILINEAR)
-        mask_pil = Image.open(str(DATA_BASE / s["mask_path"])).convert("L").resize((512, 512), Image.NEAREST)
+        mask_pil = Image.open(str(DATA_BASE / s["mask_path"])).convert("L")
+        mask_raw = torch.from_numpy(np.array(mask_pil).astype(np.float32) / 255.0)
+        mask_raw = (mask_raw > 0.5).float().unsqueeze(0)  # [1, H, W]
+        mask_raw = downsample_mask_maxpool(mask_raw, 512)  # [1, 512, 512]
+        mask_np = mask_raw.squeeze(0).numpy()
+        mask_t = mask_raw.unsqueeze(0)  # [1, 1, 512, 512]
 
         img_np = np.array(img_pil).astype(np.float32) / 255.0
-        mask_np = (np.array(mask_pil) > 127).astype(np.float32)
-        mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # [1,1,512,512]
 
         coverage_pct = 100 * mask_np.sum() / (512 * 512)
         area_px = int(mask_np.sum())

@@ -241,6 +241,52 @@ def compute_ratio_loss_mask(
     return soft
 
 
+def unet_roundtrip_masks(
+    mask: torch.Tensor,
+    band_mode: int = 2,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute UNet-resolution masks roundtripped to original resolution.
+
+    Pipeline: mask → maxpool to 512 → maxpool to 64 → dilate → nearest to 512 → nearest to (H,W)
+
+    This ensures the CLIP masked self-attention sees the SAME region that the
+    UNet must reconstruct (core + band), eliminating the "blind zone" where
+    UNet needs to reconstruct pixels that CLIP never saw.
+
+    Args:
+        mask: Binary mask [1, H, W] in {0, 1}
+        band_mode: 1 = 1px Chebyshev dilation, 2 = 2px (default 2)
+
+    Returns:
+        (core_native, dilated_native) both [1, H, W] binary float tensors.
+        core_native: the core anomaly region after UNet quantization roundtrip.
+        dilated_native: core + band region after UNet quantization + dilation roundtrip.
+    """
+    _, H, W = mask.shape
+
+    # Down to 512 (SD 1.5 input resolution)
+    mask_512 = downsample_mask_maxpool(mask, 512)  # [1, 512, 512]
+
+    # Down to 64 (latent resolution) — this is where UNet operates
+    core_64 = downsample_mask_maxpool(mask_512.unsqueeze(0), 64)  # [1, 1, 64, 64]
+
+    # Chebyshev dilation at latent resolution (same as create_latent_band_mask)
+    dilated_64 = core_64
+    for _ in range(band_mode):
+        dilated_64 = F.max_pool2d(dilated_64, kernel_size=3, stride=1, padding=1)
+    dilated_64 = (dilated_64 > 0.5).float()
+    core_64 = (core_64 > 0.5).float()
+
+    # Nearest upsample back: 64 → 512 → (H, W)
+    core_512 = F.interpolate(core_64, size=(512, 512), mode='nearest')
+    dilated_512 = F.interpolate(dilated_64, size=(512, 512), mode='nearest')
+
+    core_native = F.interpolate(core_512, size=(H, W), mode='nearest').squeeze(0)  # [1, H, W]
+    dilated_native = F.interpolate(dilated_512, size=(H, W), mode='nearest').squeeze(0)  # [1, H, W]
+
+    return core_native, dilated_native
+
+
 def dilate_mask_latent(
     mask: torch.Tensor, radius: int, target_size: int = 64
 ) -> torch.Tensor:
@@ -271,10 +317,13 @@ def downsample_mask_maxpool(mask: torch.Tensor, target_size: int) -> torch.Tenso
     """Downsample mask to target resolution via max pooling.
 
     Preserves small anomalies — any anomaly pixel in a cell marks the whole cell.
+    Handles arbitrary input resolutions by nearest-upscaling to the next exact
+    multiple of target_size before maxpooling (nearest upscale of binary masks
+    is lossless pixel replication).
 
     Args:
         mask: Binary mask [B, 1, H, W] or [1, H, W]
-        target_size: Target spatial resolution (e.g., 64 for latent space)
+        target_size: Target spatial resolution (e.g., 64 for latent space, 512)
 
     Returns:
         Downsampled binary mask at [B, 1, target_size, target_size]
@@ -284,14 +333,17 @@ def downsample_mask_maxpool(mask: torch.Tensor, target_size: int) -> torch.Tenso
         mask = mask.unsqueeze(0)
 
     _, _, h, w = mask.shape
-    kernel_h = h // target_size
-    kernel_w = w // target_size
 
-    # Ensure exact multiple
-    target_h = target_size * kernel_h
-    target_w = target_size * kernel_w
-    if h != target_h or w != target_w:
-        mask = F.interpolate(mask, size=(target_h, target_w), mode="nearest")
+    # Use ceil so non-exact ratios (e.g. 800->512) upscale to the next exact
+    # multiple first, then maxpool.  Nearest upscale is lossless for binary masks.
+    kernel_h = max(1, -(-h // target_size))  # ceil division
+    kernel_w = max(1, -(-w // target_size))  # ceil division
+
+    # Resize to exact multiple of target_size (upscale if needed)
+    pool_h = target_size * kernel_h
+    pool_w = target_size * kernel_w
+    if h != pool_h or w != pool_w:
+        mask = F.interpolate(mask, size=(pool_h, pool_w), mode="nearest")
 
     pooled = F.max_pool2d(mask, kernel_size=(kernel_h, kernel_w))
     pooled = (pooled > 0.5).float()

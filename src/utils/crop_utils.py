@@ -13,7 +13,7 @@ Pipeline:
    - P > 224: crop P×P (the square padded bbox), resize to 224×224
 """
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -325,7 +325,9 @@ def clip_crop_from_groups(
     mask: torch.Tensor,
     groups: List[Dict],
     crop_size: int = 224,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    clip_masks: Optional[List[torch.Tensor]] = None,
+) -> Union[Tuple[torch.Tensor, torch.Tensor],
+           Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]]:
     """Pick a random group and produce a CLIP crop.
 
     Two modes:
@@ -337,10 +339,34 @@ def clip_crop_from_groups(
         mask: Full binary mask [1, H, W] in {0, 1}
         groups: Output of get_component_groups()
         crop_size: Target crop size (default: 224)
+        clip_masks: Optional list of extra [1, H, W] masks to crop through the
+            same window (e.g. roundtripped dilated/core masks for CLIP alignment).
 
     Returns:
-        (cropped_image [C, crop_size, crop_size], cropped_mask [1, crop_size, crop_size])
+        If clip_masks is None:
+            (cropped_image, cropped_mask)
+        If clip_masks is provided:
+            (cropped_image, cropped_mask, list_of_cropped_extra_masks)
     """
+    def _crop_extra_masks(extra_masks, top, left, size_h, size_w, out_size):
+        """Slice and resize extra masks through the same crop window."""
+        results = []
+        for em in extra_masks:
+            em_crop = em[:, top:top + size_h, left:left + size_w]
+            if size_h != out_size or size_w != out_size:
+                em_out = F.adaptive_max_pool2d(
+                    em_crop.unsqueeze(0).float(), (out_size, out_size),
+                ).squeeze(0)
+            else:
+                em_out = em_crop
+            results.append(em_out)
+        return results
+
+    def _pack(img_c, mask_c, extras):
+        if clip_masks is not None:
+            return img_c, mask_c, extras
+        return img_c, mask_c
+
     if not groups:
         # Fallback: center crop
         _, h, w = image.shape
@@ -348,12 +374,12 @@ def clip_crop_from_groups(
         left = max(0, (w - crop_size) // 2)
         img_crop = image[:, top:top + crop_size, left:left + crop_size]
         mask_crop = mask[:, top:top + crop_size, left:left + crop_size]
-        return (
-            F.interpolate(img_crop.unsqueeze(0), size=(crop_size, crop_size),
-                          mode='bilinear', align_corners=False).squeeze(0),
-            F.adaptive_max_pool2d(mask_crop.unsqueeze(0).float(),
-                                 (crop_size, crop_size)).squeeze(0),
-        )
+        img_out = F.interpolate(img_crop.unsqueeze(0), size=(crop_size, crop_size),
+                          mode='bilinear', align_corners=False).squeeze(0)
+        mask_out = F.adaptive_max_pool2d(mask_crop.unsqueeze(0).float(),
+                                 (crop_size, crop_size)).squeeze(0)
+        extras = _crop_extra_masks(clip_masks, top, left, crop_size, crop_size, crop_size) if clip_masks else []
+        return _pack(img_out, mask_out, extras)
 
     # Pick random group weighted by mask area (larger anomaly regions more likely)
     weights = [float(g['mask'].sum()) for g in groups]
@@ -383,9 +409,12 @@ def clip_crop_from_groups(
 
         img_crop = image[:, top:top + crop_size, left:left + crop_size]
         mask_crop = mask[:, top:top + crop_size, left:left + crop_size]
-        return img_crop, mask_crop
+        extras = _crop_extra_masks(clip_masks, top, left, crop_size, crop_size, crop_size) if clip_masks else []
+        return _pack(img_crop, mask_crop, extras)
     else:
         # Crop the square padded bbox, resize to crop_size
+        crop_h = y1 + 1 - y0
+        crop_w = x1 + 1 - x0
         img_crop = image[:, y0:y1 + 1, x0:x1 + 1]
         mask_crop = mask[:, y0:y1 + 1, x0:x1 + 1]
         img_out = F.interpolate(
@@ -395,7 +424,8 @@ def clip_crop_from_groups(
         mask_out = F.adaptive_max_pool2d(
             mask_crop.unsqueeze(0).float(), (crop_size, crop_size),
         ).squeeze(0)
-        return img_out, mask_out
+        extras = _crop_extra_masks(clip_masks, y0, x0, crop_h, crop_w, crop_size) if clip_masks else []
+        return _pack(img_out, mask_out, extras)
 
 
 def clip_crop(
@@ -403,7 +433,9 @@ def clip_crop(
     mask: torch.Tensor,
     crop_size: int = 224,
     pad_frac: float = 0.10,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    clip_masks: Optional[List[torch.Tensor]] = None,
+) -> Union[Tuple[torch.Tensor, torch.Tensor],
+           Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]]:
     """Full CLIP crop pipeline: group components and crop a random group.
 
     Convenience function combining get_component_groups + clip_crop_from_groups.
@@ -413,14 +445,18 @@ def clip_crop(
         mask: Binary mask tensor [1, H, W] in {0, 1}
         crop_size: Target size (default: 224)
         pad_frac: Bbox padding fraction (default: 0.10)
+        clip_masks: Optional list of extra [1, H, W] masks to crop.
 
     Returns:
-        (cropped_image [C, crop_size, crop_size], cropped_mask [1, crop_size, crop_size])
+        If clip_masks is None:
+            (cropped_image, cropped_mask)
+        If clip_masks is provided:
+            (cropped_image, cropped_mask, list_of_cropped_extra_masks)
     """
     _, img_h, img_w = image.shape
     mask_np = mask.squeeze(0).cpu().numpy()
     groups = get_component_groups(mask_np, img_h, img_w, max_crop=crop_size, pad_frac=pad_frac)
-    return clip_crop_from_groups(image, mask, groups, crop_size=crop_size)
+    return clip_crop_from_groups(image, mask, groups, crop_size=crop_size, clip_masks=clip_masks)
 
 
 def clip_crop_multi(
@@ -429,7 +465,11 @@ def clip_crop_multi(
     crop_size: int = 224,
     pad_frac: float = 0.10,
     n_groups: int = 2,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[bool]]:
+    clip_masks: Optional[List[torch.Tensor]] = None,
+) -> Union[
+    Tuple[List[torch.Tensor], List[torch.Tensor], List[bool]],
+    Tuple[List[torch.Tensor], List[torch.Tensor], List[bool], List[List[torch.Tensor]]],
+]:
     """Return n_groups CLIP crops from different connected-component groups.
 
     Uses component grouping to split disconnected anomaly regions into separate
@@ -441,11 +481,15 @@ def clip_crop_multi(
         crop_size: Target crop size (default: 224)
         pad_frac: Bbox padding fraction (default: 0.10)
         n_groups: Number of groups to return (default: 2)
+        clip_masks: Optional list of extra [1, H, W] masks to crop through the
+            same window as each group (e.g. roundtripped dilated/core masks).
 
     Returns:
-        crops: list of n_groups [C, crop_size, crop_size] tensors
-        crop_masks: list of n_groups [1, crop_size, crop_size] tensors
-        valid: list of n_groups bools (True if a real group was available)
+        If clip_masks is None:
+            (crops, crop_masks, valid)
+        If clip_masks is provided:
+            (crops, crop_masks, valid, extra_crops)
+            where extra_crops[i] is a list of cropped extra masks for group i.
     """
     _, img_h, img_w = image.shape
     mask_np = mask.squeeze(0).cpu().numpy()
@@ -468,12 +512,19 @@ def clip_crop_multi(
     crops: List[torch.Tensor] = []
     crop_masks: List[torch.Tensor] = []
     valid: List[bool] = []
+    all_extras: List[List[torch.Tensor]] = []
 
     for i in range(n_groups):
         if i < len(selected):
-            crop_img, crop_mask = clip_crop_from_groups(
+            result = clip_crop_from_groups(
                 image, mask, [selected[i]], crop_size=crop_size,
+                clip_masks=clip_masks,
             )
+            if clip_masks is not None:
+                crop_img, crop_mask, extras = result
+                all_extras.append(extras)
+            else:
+                crop_img, crop_mask = result
             crops.append(crop_img)
             crop_masks.append(crop_mask)
             valid.append(True)
@@ -488,5 +539,12 @@ def clip_crop_multi(
                 device=mask.device, dtype=mask.dtype,
             ))
             valid.append(False)
+            if clip_masks is not None:
+                all_extras.append([
+                    torch.zeros(1, crop_size, crop_size, device=mask.device, dtype=mask.dtype)
+                    for _ in clip_masks
+                ])
 
+    if clip_masks is not None:
+        return crops, crop_masks, valid, all_extras
     return crops, crop_masks, valid

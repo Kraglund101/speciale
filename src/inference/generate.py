@@ -45,8 +45,10 @@ def generate_anomagic_single(
     t2i_adapter=None,
     seed: int = None,
     clip_mask: torch.Tensor = None,
+    clip_core_mask: torch.Tensor = None,
     reference_2: torch.Tensor = None,
     clip_mask_2: torch.Tensor = None,
+    clip_core_mask_2: torch.Tensor = None,
     group_valid: torch.Tensor = None,
     dilate_clip_mask: bool = False,
     cfg_mode: str = "text",
@@ -60,12 +62,14 @@ def generate_anomagic_single(
     Args:
         noise_strength: Fraction of the diffusion schedule to noise through.
             0.0 = no noise (returns normal image), 1.0 = pure noise.
-        clip_mask: Optional [B, 1, H, W] mask for CLIP self-attention.
+        clip_mask: Optional [B, 1, H, W] dilated mask for CLIP self-attention.
             When provided, overrides the default mask logic (useful when
             reference is a crop with its own mask separate from the UNet mask).
+        clip_core_mask: Optional [B, 1, H, W] core mask for role embeddings.
         reference_2: Optional second CLIP crop [1, 3, 224, 224] in [-1, 1]
             for multi-crop mode (matches training with --multi-crop).
         clip_mask_2: Optional mask for second crop [1, 1, 224, 224].
+        clip_core_mask_2: Optional core mask for second crop [1, 1, 224, 224].
         group_valid: Optional [1, 2] validity flags per crop group.
         dilate_clip_mask: If True, expand CLIP mask by +1px at 16x16 grid
             before self-attention. Use for hard/deformation anomalies.
@@ -92,25 +96,29 @@ def generate_anomagic_single(
         if clip_mask is not None:
             # Explicit CLIP mask provided (e.g. cropped mask from clip_crop)
             _clip_mask = clip_mask
+            _clip_core = clip_core_mask
         elif reference_mode == "full":
             # Full reference: reuse the UNet inpainting mask for CLIP
             _clip_mask = mask
+            _clip_core = None
         else:
             _clip_mask = None
+            _clip_core = None
         # +1px dilation at 16x16 grid level (for hard/deformation mode)
         if dilate_clip_mask and _clip_mask is not None:
             _clip_mask = _dilate_clip_mask_16(_clip_mask)
 
-        ip_image_embeds = ip_adapter.encode_image(ref_01, mask=_clip_mask)  # [1, K, dim]
+        ip_image_embeds = ip_adapter.encode_image(ref_01, mask=_clip_mask, core_mask=_clip_core)  # [1, K, dim]
 
         # --- Multi-crop: encode second crop and concatenate (matches training) ---
         null_token_mask = None
         if reference_2 is not None:
             ref_2_01 = (reference_2 + 1.0) / 2.0
             _clip_mask_2 = clip_mask_2 if clip_mask_2 is not None else None
+            _clip_core_2 = clip_core_mask_2 if clip_core_mask_2 is not None else None
             if dilate_clip_mask and _clip_mask_2 is not None:
                 _clip_mask_2 = _dilate_clip_mask_16(_clip_mask_2)
-            ip_image_embeds_2 = ip_adapter.encode_image(ref_2_01, mask=_clip_mask_2)  # [1, K, dim]
+            ip_image_embeds_2 = ip_adapter.encode_image(ref_2_01, mask=_clip_mask_2, core_mask=_clip_core_2)  # [1, K, dim]
 
             # Concatenate: [1, K, dim] + [1, K, dim] -> [1, 2K, dim]
             K = ip_image_embeds.shape[1]

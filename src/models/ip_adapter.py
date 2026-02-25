@@ -361,6 +361,13 @@ class MaskedAnomalySelfAttention(nn.Module):
 
         self.scale = self.dim_head ** -0.5
 
+        # Role embeddings for CLIP-UNet alignment: distinguish core (anomaly),
+        # band (normal context), and global tokens. Zero-init = no-op at start.
+        # Old checkpoints load fine (missing keys default to zeros).
+        self.emb_anomaly = nn.Parameter(torch.zeros(1, 1, in_channels))  # [1, 1, 1280]
+        self.emb_normal = nn.Parameter(torch.zeros(1, 1, in_channels))   # [1, 1, 1280]
+        self.emb_global = nn.Parameter(torch.zeros(1, 1, in_channels))   # [1, 1, 1280]
+
     def forward(
         self,
         x: torch.Tensor,
@@ -957,15 +964,17 @@ class IPAdapter(nn.Module):
         self,
         image: Union[torch.Tensor, "PIL.Image.Image", List],
         mask: Optional[torch.Tensor] = None,
+        core_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Encode reference image(s) using masked self-attention over CLIP patch tokens.
 
         Pipeline:
         1. Extract patch tokens from penultimate CLIP layer (frozen, no grad)
-        2. Apply masked self-attention (Eq. 3) — trainable, with grad
+        2. Apply role embeddings (core=anomaly, band=normal context)
+        3. Apply masked self-attention (Eq. 3) — trainable, with grad
            All 256 tokens become anomaly-aware while preserving spatial structure
-        3. Plus: feed all 256 tokens → resampler → [B, K, 768]
+        4. Plus: feed all 256 tokens → resampler → [B, K, 768]
            Standard: mean pool → linear → [B, K, 768]
 
         Visual modes 2-3 extract only anomaly patch tokens before self-attention:
@@ -975,8 +984,11 @@ class IPAdapter(nn.Module):
 
         Args:
             image: Input image(s) - tensor [B, C, H, W] in [0,1], PIL image, or list
-            mask: Anomaly mask [B, 1, H, W] in {0, 1}. If provided, attention is
-                  biased toward anomaly patches. If None, unmasked self-attention.
+            mask: Dilated anomaly mask [B, 1, H, W] in {0, 1} (core+band region).
+                  Used for attention routing (background suppressed).
+            core_mask: Core anomaly mask [B, 1, H, W] in {0, 1}. Used for role
+                  embeddings (core vs band distinction). If None, all active
+                  patches get emb_anomaly (no band distinction).
 
         Returns:
             Image embeddings [B, K, cross_attention_dim]
@@ -1009,9 +1021,32 @@ class IPAdapter(nn.Module):
             patch_tokens = outputs.hidden_states[-2][:, 1:, :]  # Remove CLS → [B, 256, 1280]
             B, N, D = patch_tokens.shape
 
-            # Global context: mean pool ALL tokens before self-attention
-            # Captures full image context; treated as anomaly info downstream
-            global_token = patch_tokens.mean(dim=1, keepdim=True)  # [B, 1, 1280]
+            # --- Global token + active mask computation ---
+            if mask is not None:
+                grid_size = int(N ** 0.5)  # 16
+                kernel = mask.shape[-1] // grid_size
+                dil_16 = F.max_pool2d(mask.float(), kernel_size=kernel)  # [B, 1, 16, 16]
+                active_mask = (dil_16 > 0.5).float().view(B, N)  # [B, 256]
+            else:
+                active_mask = torch.ones(B, N, device=patch_tokens.device, dtype=patch_tokens.dtype)
+
+            if core_mask is not None:
+                # CLIP-UNet alignment mode: selective pooling + role embeddings
+                active_3d = active_mask.unsqueeze(-1)  # [B, 256, 1]
+                token_sum = (patch_tokens * active_3d).sum(dim=1, keepdim=True)  # [B, 1, 1280]
+                count = active_mask.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)  # [B, 1, 1]
+                global_token = token_sum / count + self.masked_self_attn.emb_global  # [B, 1, 1280]
+
+                # Role embeddings: core=anomaly, band=normal context
+                core_16 = F.max_pool2d(core_mask.float(), kernel_size=kernel)  # [B, 1, 16, 16]
+                is_core = (core_16 > 0.5).float().view(B, N)  # [B, 256]
+                is_band = (active_mask - is_core).clamp(min=0)  # [B, 256]
+                role = (is_core.unsqueeze(-1) * self.masked_self_attn.emb_anomaly
+                        + is_band.unsqueeze(-1) * self.masked_self_attn.emb_normal)
+                patch_tokens = patch_tokens + role
+            else:
+                # Original behavior: pool ALL 256 tokens, no role embeddings
+                global_token = patch_tokens.mean(dim=1, keepdim=True)  # [B, 1, 1280]
 
             visual_mode = self.config.visual_mode
 
@@ -1024,18 +1059,16 @@ class IPAdapter(nn.Module):
 
             elif visual_mode in (2, 3):
                 # Modes 2-3: extract only anomaly patch tokens, pad to batch max
-                if mask is not None:
-                    grid_size = int(N ** 0.5)  # 16
-                    kernel = mask.shape[-1] // grid_size
-                    mask_16 = F.max_pool2d(mask.float(), kernel_size=kernel)  # [B, 1, 16, 16]
-                    mask_grid = (mask_16 > 0.5).float().view(B, N)  # [B, 256]
-                else:
-                    # No mask: treat all tokens as anomaly
-                    mask_grid = torch.ones(B, N, device=patch_tokens.device, dtype=torch.float32)
+                # mask_grid = active_mask (already computed above from dilated mask)
+                mask_grid = active_mask
 
                 # Count anomaly tokens per sample
                 counts = mask_grid.sum(dim=1).long()  # [B]
                 max_count = max(counts.max().item(), 1)  # at least 1
+
+                # Always pad to 256 to eliminate CUDA allocator fragmentation
+                # (variable shapes cause non-reusable memory blocks at high VRAM usage)
+                max_count = 256
 
                 # Gather anomaly tokens with padding
                 anomaly_tokens = torch.zeros(B, max_count, D, device=patch_tokens.device, dtype=patch_tokens.dtype)
@@ -1149,7 +1182,7 @@ class IPAdapter(nn.Module):
             if k.startswith("masked_self_attn.")
         }
         if self_attn_state:
-            self.masked_self_attn.load_state_dict(self_attn_state)
+            self.masked_self_attn.load_state_dict(self_attn_state, strict=False)
 
         # Load image projection
         proj_state = {

@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.data.anomaly_dataset import AnomalyDataset
 from src.utils.mask_utils import (
     dilate_mask_batch, downsample_mask_maxpool, create_latent_band_mask,
+    unet_roundtrip_masks,
 )
 from src.utils.optim_utils import (
     flatten_modules, build_norm_param_id_set, split_decay_no_decay,
@@ -43,6 +44,14 @@ from src.utils.optim_utils import (
 )
 from src.utils.crop_utils import clip_crop_multi
 from src.inference.generate import generate_anomagic_single
+
+_SEED = 42
+
+def _worker_init_fn(worker_id):
+    """Seed Python random + numpy in DataLoader workers (required on Windows/spawn)."""
+    worker_seed = _SEED + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def train_anomagic(
@@ -125,6 +134,8 @@ def train_anomagic(
     x0_no_context: bool = False,
     x0_warmup_frac: float = 0.2,
     x0_hold_frac: float = 0.1,
+    # CLIP-UNet alignment: roundtripped masks + role embeddings
+    clip_align: bool = True,
 ):
     """Train Anomagic: IP-Adapter + captions (2 pathways)."""
     # Seed everything for reproducibility across ablation runs
@@ -162,6 +173,7 @@ def train_anomagic(
     print(f"Visual mode: {visual_mode}")
     print(f"Learnable gates: {learnable_gates} (SA layers: {sa_num_layers}, heads: {sa_num_heads})")
     print(f"Multi-crop: {multi_crop}")
+    print(f"CLIP-UNet alignment: {clip_align}")
     print(f"Optimizer: {optimizer_type}")
     print(f"Noise offset: {noise_offset}")
     print(f"Timestep sampling: {timestep_sampling}" +
@@ -198,6 +210,8 @@ def train_anomagic(
         reference_crop_size=224,
         augment=augment,
         multi_crop=multi_crop,
+        band_mode=band_mode,
+        clip_align=clip_align,
     )
 
     if len(dataset) == 0:
@@ -591,6 +605,7 @@ def train_anomagic(
         "x0_no_context": x0_no_context,
         "x0_warmup_frac": x0_warmup_frac,
         "x0_hold_frac": x0_hold_frac,
+        "clip_align": clip_align,
     }
     with open(config_file, "w") as cf:
         json.dump(run_config, cf, indent=2)
@@ -606,9 +621,12 @@ def train_anomagic(
 
     losses = resumed_losses
     type_losses = defaultdict(list)
+    g = torch.Generator()
+    g.manual_seed(seed)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                         num_workers=4, pin_memory=False, persistent_workers=True,
-                        drop_last=True)
+                        drop_last=True, worker_init_fn=_worker_init_fn,
+                        generator=g)
     data_iter = iter(infinite_loader(loader))
 
     # Keep loss file open for the entire run (avoids Windows file locking issues)
@@ -618,7 +636,7 @@ def train_anomagic(
     stats_file = save_dir / "stats.csv"
     stats_fh = open(stats_file, "a")
     if stats_fh.tell() == 0:
-        stats_fh.write("step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,x0_ratio,x0_loss,eps_loss,grad_norm,ctx_drop\n")
+        stats_fh.write("step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,x0_ratio,x0_loss,eps_loss,grad_norm,ctx_drop,emb_global_norm,emb_anomaly_norm,emb_normal_norm\n")
 
     pbar = tqdm(range(start_step, n_steps), desc="Training", initial=start_step, total=n_steps)
     skipped_nan = 0
@@ -632,11 +650,13 @@ def train_anomagic(
         references = batch["reference"].to(device)
         batch_types = batch["anomaly_type"]
         batch_captions = batch.get("caption", [""] * batch_size)
-        # Augmented CLIP mask (from crop_utils) — None when augment=False
+        # CLIP masks (from crop_utils with UNet roundtrip alignment)
         clip_masks = batch["clip_mask"].to(device) if "clip_mask" in batch else None
+        clip_core_masks = batch["clip_core_mask"].to(device) if "clip_core_mask" in batch else None
         # Multi-crop data (None when multi_crop=False)
         references_2 = batch["reference_2"].to(device) if "reference_2" in batch else None
         clip_masks_2 = batch["clip_mask_2"].to(device) if "clip_mask_2" in batch else None
+        clip_core_masks_2 = batch["clip_core_mask_2"].to(device) if "clip_core_mask_2" in batch else None
         group_valid = batch["group_valid"].to(device) if "group_valid" in batch else None
 
         optimizer.zero_grad()
@@ -683,8 +703,10 @@ def train_anomagic(
                 drop_text_prob=drop_text_prob,
                 drop_both_prob=drop_both_prob,
                 clip_masks=clip_masks,
+                clip_core_masks=clip_core_masks,
                 references_2=references_2,
                 clip_masks_2=clip_masks_2,
+                clip_core_masks_2=clip_core_masks_2,
                 group_valid=group_valid,
                 noise_offset=noise_offset,
                 timestep_sampling=timestep_sampling,
@@ -710,12 +732,14 @@ def train_anomagic(
 
         if scaler is not None:
             scaler.scale(loss).backward()
+            torch.cuda.synchronize()  # TDR prevention
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            torch.cuda.synchronize()  # TDR prevention
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
             optimizer.step()
 
@@ -744,7 +768,14 @@ def train_anomagic(
         band_l = loss_extras.get("band_loss", 0.0)
         x0_l = loss_extras.get("x0_loss", 0.0)
         eps_l = loss_extras.get("eps_loss", 0.0)
-        stats_fh.write(f"{step},{loss_val},{lr_pre},{lr_scr},{attn_gate},{ff_gate},{l2sp_val},{core_l},{band_l},{x0_ratio},{x0_l},{eps_l},{grad_norm},{ctx_drop}\n")
+        # Role embedding norms
+        emb_g = emb_a = emb_n = 0.0
+        if hasattr(ip_adapter, 'masked_self_attn'):
+            sa = ip_adapter.masked_self_attn
+            emb_g = sa.emb_global.data.norm().item()
+            emb_a = sa.emb_anomaly.data.norm().item()
+            emb_n = sa.emb_normal.data.norm().item()
+        stats_fh.write(f"{step},{loss_val},{lr_pre},{lr_scr},{attn_gate},{ff_gate},{l2sp_val},{core_l},{band_l},{x0_ratio},{x0_l},{eps_l},{grad_norm},{ctx_drop},{emb_g},{emb_a},{emb_n}\n")
         stats_fh.flush()
 
         for t in batch_types:
@@ -755,7 +786,7 @@ def train_anomagic(
             pbar.set_postfix(loss=f"{avg:.4f}")
 
         # Free unreferenced CUDA tensors every step to prevent VRAM creep
-        del images, masks, references, clip_masks, references_2, clip_masks_2, group_valid, loss, loss_diff, loss_extras
+        del images, masks, references, clip_masks, clip_core_masks, references_2, clip_masks_2, clip_core_masks_2, group_valid, loss, loss_diff, loss_extras
         #torch.cuda.empty_cache()
 
         # Early sample snapshots (no checkpoint, just samples + loss plot)
@@ -864,9 +895,11 @@ def compute_anomagic_loss(
     drop_text_prob: float = 0.10,
     drop_both_prob: float = 0.05,
     clip_masks=None,
+    clip_core_masks=None,
     # Multi-crop (Mode 4)
     references_2=None,
     clip_masks_2=None,
+    clip_core_masks_2=None,
     group_valid=None,
     # Noise offset
     noise_offset: float = 0.0,
@@ -955,18 +988,21 @@ def compute_anomagic_loss(
     # --- Pathway 2: Visual conditioning via IP-Adapter ---
     ref_01 = (references + 1.0) / 2.0
     if clip_masks is not None:
-        # Augmented: clip_masks are [B, 1, 224, 224] from crop_utils, already aligned to reference
+        # clip_masks are [B, 1, 224, 224] from crop_utils (UNet-roundtripped dilated)
         clip_mask = clip_masks
+        clip_core = clip_core_masks  # [B, 1, 224, 224] core mask for role embeddings
     else:
         clip_mask = clip_dilated if reference_mode == "full" else None
-    ip_image_embeds = ip_adapter.encode_image(ref_01, mask=clip_mask)  # [B, K, cross_attn_dim]
+        clip_core = None
+    ip_image_embeds = ip_adapter.encode_image(ref_01, mask=clip_mask, core_mask=clip_core)  # [B, K, cross_attn_dim]
 
     # --- Multi-crop: encode second crop and concatenate ---
     null_token_mask = None
     if references_2 is not None:
         ref_2_01 = (references_2 + 1.0) / 2.0
         clip_mask_2 = clip_masks_2 if clip_masks_2 is not None else None
-        ip_image_embeds_2 = ip_adapter.encode_image(ref_2_01, mask=clip_mask_2)  # [B, K, dim]
+        clip_core_2 = clip_core_masks_2 if clip_core_masks_2 is not None else None
+        ip_image_embeds_2 = ip_adapter.encode_image(ref_2_01, mask=clip_mask_2, core_mask=clip_core_2)  # [B, K, dim]
 
         # Concatenate: [B, K, dim] + [B, K, dim] → [B, 2K, dim]
         K = ip_image_embeds.shape[1]
@@ -1052,6 +1088,7 @@ def compute_anomagic_loss(
         cross_attention_kwargs=cross_attn_kwargs,
         **t2i_kwargs,
     ).sample.float()
+    torch.cuda.synchronize()  # TDR prevention
 
     # --- Ratio-based loss weighting (flat alpha, no scipy) ---
     weight_expanded = weight_map_64.expand_as(noise_pred)
@@ -1125,7 +1162,7 @@ def _ema_smooth(values, smoothing: float = 0.99):
 
 def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     """Render 2x3 training diagnostics plot. Three layouts (auto-detected):
-    - Default: trend, core/band, band/core ratio, gates, grad norm, (empty)
+    - Default: trend, core/band, band/core ratio, gates, grad norm, role embeddings
     - x0 ablation: trend, core/band, x0 vs eps + annealing, gates, band/core ratio, grad norm
     - ctx annealing: trend, core/band, ctx dropout schedule, gates, band/core ratio, grad norm
     """
@@ -1137,6 +1174,7 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     attn_gates, ff_gates, l2sp_vals = [], [], []
     core_losses, band_losses = [], []
     x0_losses, eps_losses, x0_ratios, grad_norms, ctx_drops = [], [], [], [], []
+    emb_global_norms, emb_anomaly_norms, emb_normal_norms = [], [], []
     try:
         with open(stats_file, "r", encoding="utf-8") as f:
             header = f.readline().strip()
@@ -1158,6 +1196,9 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
                 eps_losses.append(float(parts[11]) if len(parts) > 11 else 0.0)
                 grad_norms.append(float(parts[12]) if len(parts) > 12 else 0.0)
                 ctx_drops.append(float(parts[13]) if len(parts) > 13 else 0.0)
+                emb_global_norms.append(float(parts[14]) if len(parts) > 14 else 0.0)
+                emb_anomaly_norms.append(float(parts[15]) if len(parts) > 15 else 0.0)
+                emb_normal_norms.append(float(parts[16]) if len(parts) > 16 else 0.0)
     except FileNotFoundError:
         pass
 
@@ -1171,6 +1212,9 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     s_x0r = np.array(x0_ratios)
     s_gn = np.array(grad_norms)
     s_ctx = np.array(ctx_drops)
+    s_emb_g = np.array(emb_global_norms)
+    s_emb_a = np.array(emb_anomaly_norms)
+    s_emb_n = np.array(emb_normal_norms)
 
     SM = 0.99
     SF = 0.6
@@ -1186,6 +1230,7 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     # Annealed ctx dropout: ctx_drop varies (not all same value)
     has_ctx = (len(s_steps) > 0 and s_ctx.any()
                and (s_ctx.max() - s_ctx.min()) > 0.01)
+    has_emb = len(s_steps) > 0 and (s_emb_g.any() or s_emb_a.any() or s_emb_n.any())
 
     # --- Precompute core/band decomposition (shared by both layouts) ---
     ce = be = core_ps = band_ps = None
@@ -1230,13 +1275,13 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     else:
         # DEFAULT LAYOUT:
         # [0,0] Smooth Trend    [0,1] Core vs Band    [0,2] Band/Core Ratio
-        # [1,0] Gates           [1,1] Grad Norm        [1,2] (empty)
+        # [1,0] Gates           [1,1] Grad Norm        [1,2] Role Embeddings
         ax_trend  = axes[0, 0]
         ax_cb     = axes[0, 1]
         ax_ratio  = axes[0, 2]
         ax_gates  = axes[1, 0]
         ax_gn     = axes[1, 1]
-        axes[1, 2].set_visible(False)
+        ax_emb    = axes[1, 2]
 
     # --- Smooth Trend ---
     ax_trend.plot(steps, ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
@@ -1354,6 +1399,28 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
         ax_ctx.set_xlabel("Step"); ax_ctx.set_ylabel("Dropout rate")
         ax_ctx.legend(loc="upper right", fontsize=8)
         ax_ctx.grid(True, alpha=0.3)
+
+    # --- Role Embedding Norms ---
+    if not has_x0 and not has_ctx:
+        # Default layout: dedicated subplot at [1,2]
+        if has_emb:
+            ax_emb.plot(s_steps, s_emb_g, color="green", linewidth=1.5, label=f"Global ({s_emb_g[-1]:.4f})")
+            ax_emb.plot(s_steps, s_emb_a, color="red", linewidth=1.5, label=f"Anomaly ({s_emb_a[-1]:.4f})")
+            ax_emb.plot(s_steps, s_emb_n, color="blue", linewidth=1.5, label=f"Band ({s_emb_n[-1]:.4f})")
+            ax_emb.set_title(f"Role Embedding Norms")
+            ax_emb.legend(loc="upper left", fontsize=8)
+        else:
+            ax_emb.set_title("Role Embedding Norms (no data)")
+        ax_emb.set_xlabel("Step"); ax_emb.set_ylabel("L2 Norm")
+        ax_emb.grid(True, alpha=0.3)
+    elif has_emb:
+        # x0 or ctx layout: all 6 slots used — add as twinx on gates subplot
+        ax_emb_twin = ax_gates.twinx()
+        ax_emb_twin.plot(s_steps, s_emb_g, color="green", linewidth=1, linestyle="--", alpha=0.6, label="Glob emb")
+        ax_emb_twin.plot(s_steps, s_emb_a, color="red", linewidth=1, linestyle="--", alpha=0.6, label="Anom emb")
+        ax_emb_twin.plot(s_steps, s_emb_n, color="blue", linewidth=1, linestyle="--", alpha=0.6, label="Band emb")
+        ax_emb_twin.set_ylabel("Emb norm", color="gray", fontsize=8)
+        ax_emb_twin.tick_params(axis="y", labelcolor="gray", labelsize=7)
 
     # --- Run title from config ---
     run_title = None
@@ -1506,6 +1573,7 @@ def generate_anomagic_samples(
     # --- Phase 3: Generate 4 variants per sample ---
     gen_kwargs = dict(
         num_steps=30,
+        noise_strength=1.0,
         reference_mode=dataset.reference_mode,
         band_mode=band_mode,
         t2i_adapter=t2i_adapter,
@@ -1518,24 +1586,28 @@ def generate_anomagic_samples(
                 guidance_scale=1.0, cfg_mode="both", seed=42 + i,
                 **gen_kwargs,
             )
+            torch.cuda.synchronize()  # yield GPU to display driver (TDR prevention)
             s["gen_text"] = generate_anomagic_single(
                 pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
                 s["atype"], s["caption"],
                 cfg_mode="text", seed=42 + i,
                 **gen_kwargs,
             )
+            torch.cuda.synchronize()
             s["gen_visual"] = generate_anomagic_single(
                 pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
                 s["atype"], s["caption"],
                 cfg_mode="visual", seed=42 + i,
                 **gen_kwargs,
             )
+            torch.cuda.synchronize()
             s["gen_both"] = generate_anomagic_single(
                 pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
                 s["atype"], s["caption"],
                 cfg_mode="both", seed=42 + i,
                 **gen_kwargs,
             )
+            torch.cuda.synchronize()
 
     # Helper: tensor [1,C,H,W] in [-1,1] → numpy [H,W,C] in [0,1]
     def _to_np(t: torch.Tensor):
@@ -1593,6 +1665,7 @@ def generate_anomagic_samples(
                 cfg_mode="visual", seed=42 + i,
                 **gen_kwargs,
             )
+            torch.cuda.synchronize()  # TDR prevention
             all_samples[i]["gen_swap_nocfg"] = generate_anomagic_single(
                 pipeline, ip_adapter,
                 all_samples[i]["image"], all_samples[i]["mask"],
@@ -1601,6 +1674,7 @@ def generate_anomagic_samples(
                 guidance_scale=1.0, cfg_mode="visual", seed=42 + i,
                 **gen_kwargs,
             )
+            torch.cuda.synchronize()
 
     # --- Phase 6: Plot swap grid (8 rows) ---
     swap_path = save_path.parent / (save_path.stem + "_swap" + save_path.suffix)
@@ -1651,12 +1725,13 @@ def generate_anomagic_samples(
     _generate_ood_grid(
         pipeline, ip_adapter, save_path, device,
         band_mode=band_mode, t2i_adapter=t2i_adapter,
+        clip_align=dataset.clip_align,
     )
 
 
 def _generate_ood_grid(
     pipeline, ip_adapter, save_path: Path, device: str,
-    band_mode: int = 2, t2i_adapter=None,
+    band_mode: int = 2, t2i_adapter=None, clip_align: bool = True,
 ):
     """Generate OOD grid using VisA cashew data (canvas normals + placed masks).
 
@@ -1757,8 +1832,11 @@ def _generate_ood_grid(
         ).permute(2, 0, 1).unsqueeze(0).to(device)
 
         # Load placed mask → [1, 1, 512, 512]
-        placed_pil = Image.open(placed_mask_path).convert("L").resize((512, 512), Image.NEAREST)
-        mask_np = (np.array(placed_pil).astype(np.float32) / 255.0 > 0.5).astype(np.float32)
+        placed_pil = Image.open(placed_mask_path).convert("L")
+        placed_t = torch.from_numpy(np.array(placed_pil).astype(np.float32) / 255.0)
+        placed_t = (placed_t > 0.5).float().unsqueeze(0)  # [1, H, W]
+        placed_t = downsample_mask_maxpool(placed_t, 512)  # [1, 512, 512]
+        mask_np = placed_t.squeeze(0).numpy()
         mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).float().to(device)
 
         # Load reference anomaly → CLIP multi-crop
@@ -1772,11 +1850,28 @@ def _generate_ood_grid(
         ref_mask_tensor = torch.from_numpy(ref_mask_np).unsqueeze(0).float()  # [1, H, W]
 
         random.seed(42)
-        crops, crop_masks, valid = clip_crop_multi(ref_tensor, ref_mask_tensor, n_groups=2)
-        clip_ref = (crops[0] * 2.0 - 1.0).unsqueeze(0).to(device)  # [1, 3, 224, 224]
-        clip_mask_1 = crop_masks[0].unsqueeze(0).to(device)
-        clip_ref_2 = (crops[1] * 2.0 - 1.0).unsqueeze(0).to(device)
-        clip_mask_2 = crop_masks[1].unsqueeze(0).to(device)
+        if clip_align:
+            core_native, dil_native = unet_roundtrip_masks(ref_mask_tensor, band_mode)
+            crops, crop_masks, valid, extra = clip_crop_multi(
+                ref_tensor, ref_mask_tensor, n_groups=2,
+                clip_masks=[dil_native, core_native],
+            )
+            clip_ref = (crops[0] * 2.0 - 1.0).unsqueeze(0).to(device)
+            clip_mask_1 = (extra[0][0] > 0.5).float().unsqueeze(0).to(device)
+            clip_core_1 = (extra[0][1] > 0.5).float().unsqueeze(0).to(device)
+            clip_ref_2 = (crops[1] * 2.0 - 1.0).unsqueeze(0).to(device)
+            clip_mask_2 = (extra[1][0] > 0.5).float().unsqueeze(0).to(device)
+            clip_core_2 = (extra[1][1] > 0.5).float().unsqueeze(0).to(device)
+        else:
+            crops, crop_masks, valid = clip_crop_multi(
+                ref_tensor, ref_mask_tensor, n_groups=2,
+            )
+            clip_ref = (crops[0] * 2.0 - 1.0).unsqueeze(0).to(device)
+            clip_mask_1 = (crop_masks[0] > 0.5).float().unsqueeze(0).to(device)
+            clip_core_1 = None
+            clip_ref_2 = (crops[1] * 2.0 - 1.0).unsqueeze(0).to(device)
+            clip_mask_2 = (crop_masks[1] > 0.5).float().unsqueeze(0).to(device)
+            clip_core_2 = None
         group_valid = torch.tensor(
             [[float(valid[0]), float(valid[1])]], device=device,
         )
@@ -1791,8 +1886,8 @@ def _generate_ood_grid(
 
         ood_samples.append({
             "canvas_t": canvas_t, "mask_t": mask_t,
-            "clip_ref": clip_ref, "clip_mask_1": clip_mask_1,
-            "clip_ref_2": clip_ref_2, "clip_mask_2": clip_mask_2,
+            "clip_ref": clip_ref, "clip_mask_1": clip_mask_1, "clip_core_1": clip_core_1,
+            "clip_ref_2": clip_ref_2, "clip_mask_2": clip_mask_2, "clip_core_2": clip_core_2,
             "group_valid": group_valid,
             "defect_type": defect_type, "caption": caption,
             "difficulty": difficulty,
@@ -1814,8 +1909,10 @@ def _generate_ood_grid(
             reference_mode="crop", band_mode=band_mode,
             t2i_adapter=t2i_adapter, seed=42 + i,
             clip_mask=s["clip_mask_1"],
+            clip_core_mask=s["clip_core_1"],
             reference_2=s["clip_ref_2"],
             clip_mask_2=s["clip_mask_2"],
+            clip_core_mask_2=s["clip_core_2"],
             group_valid=s["group_valid"],
             dilate_clip_mask=dilate,
         )
@@ -1827,6 +1924,7 @@ def _generate_ood_grid(
                 guidance_scale=7.5, cfg_mode="visual",
                 **ood_gen_kwargs,
             )
+            torch.cuda.synchronize()  # TDR prevention
             s["gen_nocfg"] = generate_anomagic_single(
                 pipeline, ip_adapter,
                 s["canvas_t"], s["mask_t"], s["clip_ref"],
@@ -1834,6 +1932,7 @@ def _generate_ood_grid(
                 guidance_scale=1.0, cfg_mode="visual",
                 **ood_gen_kwargs,
             )
+            torch.cuda.synchronize()
 
     # --- Plot OOD grid (5 rows) ---
     def _to_np(t: torch.Tensor):
@@ -1966,6 +2065,9 @@ if __name__ == "__main__":
     # Multi-crop (orthogonal to visual-mode)
     parser.add_argument("--no-multi-crop", action="store_true",
                         help="Disable 2-group CLIP cropping (enabled by default)")
+    parser.add_argument("--no-clip-align", action="store_true",
+                        help="Disable CLIP-UNet roundtrip mask alignment and role embeddings. "
+                             "Reverts to raw cropped masks with no anomaly/normal token distinction.")
     # CLIP dilation settings — currently unused (CLIP path uses cropping instead).
     # Kept for potential future use with reference_mode="full".
     # parser.add_argument("--clip-dilation-min-r", type=int, default=2,
@@ -2122,4 +2224,5 @@ if __name__ == "__main__":
         x0_no_context=args.x0_no_context,
         x0_warmup_frac=args.x0_warmup_frac,
         x0_hold_frac=args.x0_hold_frac,
+        clip_align=not args.no_clip_align,
     )

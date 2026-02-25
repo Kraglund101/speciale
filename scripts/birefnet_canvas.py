@@ -1,8 +1,12 @@
 """
-BiRefNet foreground segmentation on canvas normal images for the experiment.
-Saves binary masks into canvas_normals/masks/ alongside canvas_normals/imgs/.
+BiRefNet foreground segmentation on images.
+Saves binary masks to an output directory.
+
+Usage:
+    python scripts/birefnet_canvas.py --input <image_dir> --output <mask_dir>
 """
 
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -11,20 +15,19 @@ from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
 
-CANVAS_DIR = Path(
-    r"C:\Users\frede\Desktop\kandidat\speciale\anomverse_extension"
-    r"\datasets\VisA_validation_dataset\datasets\easy_test\cashew\experiment"
-    r"\dataset_synthetic\source\canvas_normals"
-)
-IMAGE_DIR = CANVAS_DIR / "imgs"
-OUTPUT_DIR = CANVAS_DIR / "masks"
-
 MODEL_NAME = "ZhengPeng7/BiRefNet"
 INPUT_SIZE = (1024, 1024)
-EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".JPG"}
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="BiRefNet foreground segmentation")
+    parser.add_argument("--input", required=True, type=str, help="Directory of input images")
+    parser.add_argument("--output", required=True, type=str, help="Directory to save masks")
+    args = parser.parse_args()
+
+    IMAGE_DIR = Path(args.input)
+    OUTPUT_DIR = Path(args.output)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}" + (f" ({torch.cuda.get_device_name()})" if device.type == "cuda" else ""))
 
