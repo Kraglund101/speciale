@@ -1239,7 +1239,7 @@ def compute_contrastive_loss(
 
     # --- ||Δε|| in sigma bins (early/mid/late timestep) ---
     # Per-variant ||eps_pred - noise|| on core, binned by timestep.
-    # early = t < 333 (low noise, easy), mid = 333-666, late = t > 666 (high noise, hard)
+    # early = t < 333 (low noise, hard ε-prediction), mid = 333-666, late = t > 666 (high noise, easy ε-prediction)
     with torch.no_grad():
         t = batch.timesteps  # [V]
         per_var_eps_norm = ((diff * core).reshape(V, -1).sum(dim=1) /
@@ -2623,7 +2623,18 @@ if __name__ == "__main__":
     parser.add_argument("--logit-normal-mean", type=float, default=0.0)
     parser.add_argument("--logit-normal-std", type=float, default=1.0)
 
+    parser.add_argument("--diff-only", action="store_true",
+                        help="L_diff only: zero all regularizer lambdas (inv/rank/triplet). "
+                             "Distances still logged for observation.")
+
     args = parser.parse_args()
+
+    # --diff-only: override all regularizer lambdas to 0
+    if args.diff_only:
+        args.lambda_inv = 0.0
+        args.lambda_rank = 0.0
+        args.lambda_rank_untyped = 0.0
+        args.lambda_triplet = 0.0
 
     project_root = Path(__file__).parent.parent
 
