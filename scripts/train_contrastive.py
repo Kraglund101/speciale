@@ -117,10 +117,29 @@ class ContrastiveHostSampler:
         typed_frac: float = 0.912,
     ):
         with open(data_json_path, "r", encoding="utf-8") as f:
-            self.all_samples = json.load(f)
+            all_samples_raw = json.load(f)
 
         self.data_root = Path(data_root)
         self.typed_frac = typed_frac
+
+        # Filter out samples with empty masks (e.g. BTech plate 0028-0037)
+        # These cause UNet NaN under fp16 autocast
+        _ZERO_MASK_PATHS = {
+            "AnomVerse_data_filtered/BTech/BTech/03/test/ko/0028.bmp",
+            "AnomVerse_data_filtered/BTech/BTech/03/test/ko/0029.bmp",
+            "AnomVerse_data_filtered/BTech/BTech/03/test/ko/0030.bmp",
+            "AnomVerse_data_filtered/BTech/BTech/03/test/ko/0031.bmp",
+            "AnomVerse_data_filtered/BTech/BTech/03/test/ko/0032.bmp",
+            "AnomVerse_data_filtered/BTech/BTech/03/test/ko/0033.bmp",
+            "AnomVerse_data_filtered/BTech/BTech/03/test/ko/0034.bmp",
+            "AnomVerse_data_filtered/BTech/BTech/03/test/ko/0035.bmp",
+            "AnomVerse_data_filtered/BTech/BTech/03/test/ko/0036.bmp",
+            "AnomVerse_data_filtered/BTech/BTech/03/test/ko/0037.bmp",
+        }
+        self.all_samples = [s for s in all_samples_raw if s["image_path"] not in _ZERO_MASK_PATHS]
+        n_filtered = len(all_samples_raw) - len(self.all_samples)
+        if n_filtered > 0:
+            print(f"Filtered {n_filtered} zero-mask samples")
 
         # Load captions
         self.captions: Dict[str, str] = {}
@@ -872,7 +891,7 @@ def build_variant_batch(
 def _weighted_l2(diff: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Weighted L2 norm: sqrt(sum(diff^2 * weight) / sum(weight))."""
     w = weight.expand_as(diff)
-    return ((diff ** 2 * w).sum() / w.sum().clamp(min=1e-8)).sqrt()
+    return ((diff ** 2 * w).sum() / w.sum().clamp(min=1e-8) + 1e-8).sqrt()
 
 
 def _masked_mse(pred: torch.Tensor, target: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -966,6 +985,13 @@ def compute_contrastive_loss(
     # Margin diagnostics
     typed_margins: List[float] = []
     untyped_margins: List[float] = []
+    # Conditioning strength: ||eps_cond - eps_null|| (cond vs null, not cond vs cond)
+    cond_null_dists: List[float] = []
+    # CFG probe: L_diff of eps_cfg = eps_null + scale * (eps_cond - eps_null)
+    cfg_probe_scale = 3.0
+    cfg_L_cond_vals: List[float] = []   # L_diff of conditioned (baseline)
+    cfg_L_null_vals: List[float] = []   # L_diff of null
+    cfg_L_cfg_vals: List[float] = []    # L_diff of CFG-amplified
 
     # Triplet geometry tracking (Strategy A + B)
     triplet_gap_vals: List[float] = []     # d_diff - d_same_core (excludes ip_zero)
@@ -1054,6 +1080,14 @@ def compute_contrastive_loss(
                     d_diff_vals.append(d_diff_core.item())
                     if neg_src == "ip_zero":
                         d_diff_null_vals.append(d_diff_core.item())
+                        # Conditioning strength: raw ||eps_cond - eps_null|| (core-only)
+                        cond_null_dists.append(_weighted_l2(diff_diff, c_i).item())
+                        # CFG probe: amplify visual signal
+                        noise_i = noise[pos1_vi]
+                        eps_cfg = eps_neg + cfg_probe_scale * (eps_pos1 - eps_neg)
+                        cfg_L_cond_vals.append(_masked_mse(eps_pos1, noise_i, c_i).item())
+                        cfg_L_null_vals.append(_masked_mse(eps_neg, noise[neg_vi], c_i).item())
+                        cfg_L_cfg_vals.append(_masked_mse(eps_cfg, noise_i, c_i).item())
                     else:
                         d_diff_sem_vals.append(d_diff_core.item())
 
@@ -1132,6 +1166,14 @@ def compute_contrastive_loss(
             rank_satisfied_untyped.append(satisfied_u)
             untyped_margins.append(margin_u)
             rank_sat_by_source["untyped"].append(satisfied_u)
+            # Conditioning strength: raw ||eps_cond - eps_null|| (core-only)
+            cond_null_dists.append(_weighted_l2(eps_true - eps_null, c_i).item())
+            # CFG probe: amplify visual signal
+            noise_i = noise[true_vi]
+            eps_cfg_u = eps_null + cfg_probe_scale * (eps_true - eps_null)
+            cfg_L_cond_vals.append(L_true_u.item())
+            cfg_L_null_vals.append(L_null_u.item())
+            cfg_L_cfg_vals.append(_masked_mse(eps_cfg_u, noise_i, c_i).item())
 
     # --- Aggregate losses (sample-weight–aware) ---
     loss_total = L_diff
@@ -1195,6 +1237,26 @@ def compute_contrastive_loss(
     typed_mstats = _margin_stats(typed_margins, gamma)
     untyped_mstats = _margin_stats(untyped_margins, gamma)
 
+    # --- ||Δε|| in sigma bins (early/mid/late timestep) ---
+    # Per-variant ||eps_pred - noise|| on core, binned by timestep.
+    # early = t < 333 (low noise, easy), mid = 333-666, late = t > 666 (high noise, hard)
+    with torch.no_grad():
+        t = batch.timesteps  # [V]
+        per_var_eps_norm = ((diff * core).reshape(V, -1).sum(dim=1) /
+                           core.reshape(V, -1).sum(dim=1).clamp(min=1)).sqrt()
+        ldiff_set = set(i for i in range(V) if batch.gets_ldiff[i])
+        bins = {"early": [], "mid": [], "late": []}
+        for vi in range(V):
+            if vi not in ldiff_set:
+                continue
+            tv = t[vi].item()
+            if tv < 333:
+                bins["early"].append(per_var_eps_norm[vi].item())
+            elif tv < 667:
+                bins["mid"].append(per_var_eps_norm[vi].item())
+            else:
+                bins["late"].append(per_var_eps_norm[vi].item())
+
     # Split rank satisfaction by neg source
     def _safe_mean(lst):
         return float(np.mean(lst)) if lst else 0.0
@@ -1257,6 +1319,17 @@ def compute_contrastive_loss(
         # Per-source gap mean (rate = sign, mean = margin/strength)
         "gap_mean_same_host": float(np.mean(triplet_gap_same_host)) if triplet_gap_same_host else 0.0,
         "gap_mean_cross_host": float(np.mean(triplet_gap_cross_host)) if triplet_gap_cross_host else 0.0,
+        # ||Δε|| sigma bins (early t<333, mid 333-666, late >666)
+        "eps_norm_early": float(np.mean(bins["early"])) if bins["early"] else 0.0,
+        "eps_norm_mid": float(np.mean(bins["mid"])) if bins["mid"] else 0.0,
+        "eps_norm_late": float(np.mean(bins["late"])) if bins["late"] else 0.0,
+        # Conditioning strength: ||eps_cond - eps_null|| (cond vs null baseline)
+        "cond_null_dist_mean": float(np.mean(cond_null_dists)) if cond_null_dists else 0.0,
+        "cond_null_dist_std": float(np.std(cond_null_dists)) if cond_null_dists else 0.0,
+        # CFG visual probe (scale=3.0): L_diff under null / cond / CFG-amplified
+        "cfg_L_null": float(np.mean(cfg_L_null_vals)) if cfg_L_null_vals else 0.0,
+        "cfg_L_cond": float(np.mean(cfg_L_cond_vals)) if cfg_L_cond_vals else 0.0,
+        "cfg_L_cfg": float(np.mean(cfg_L_cfg_vals)) if cfg_L_cfg_vals else 0.0,
     }
 
     return loss_total, extras
@@ -1961,7 +2034,7 @@ def train_contrastive(
     b_no_decay = [p for p in b_no_decay_raw if id(p) not in group_c_ids]
 
     param_groups = [
-        {"params": a_decay,     "lr": lr_pretrained, "weight_decay": 0.0, "label": "A_decay"},
+        {"params": a_decay,     "lr": lr_pretrained, "weight_decay": 1e-4, "label": "A_decay"},
         {"params": a_no_decay,  "lr": lr_pretrained, "weight_decay": 0.0, "label": "A_no_decay"},
         {"params": b_decay,     "lr": lr,            "weight_decay": 1e-4, "label": "B_decay"},
         {"params": b_no_decay,  "lr": lr,            "weight_decay": 0.0, "label": "B_no_decay"},
@@ -1991,7 +2064,11 @@ def train_contrastive(
         l2sp_reg = L2SPRegularizer(a_decay, lambda_sp=lambda_sp)
         print(f"\n  L2-SP: {l2sp_reg.total_elements:,} elements, lambda={lambda_sp:.1e}")
 
+    # bf16 autocast: same exponent range as fp32 (max ~3.4e38), eliminates
+    # fp16 overflow (65504 ceiling) in attention dot products and sums.
     use_amp = True
+    amp_dtype = torch.bfloat16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     pipeline.text_encoder.float()
     pipeline.vae.float()
     pipeline.dtype = torch.float32
@@ -2128,7 +2205,10 @@ def train_contrastive(
             "triplet_n_same_host,triplet_n_cross_host,triplet_n_skipped,gap_mean,"
             "gap_positive_rate,gap_pos_rate_same_host,gap_pos_rate_cross_host,"
             "gap_mean_same_host,gap_mean_cross_host,"
-            "emb_global_norm,emb_anomaly_norm,emb_normal_norm\n"
+            "emb_global_norm,emb_anomaly_norm,emb_normal_norm,"
+            "eps_norm_early,eps_norm_mid,eps_norm_late,"
+            "cond_null_dist_mean,cond_null_dist_std,"
+            "cfg_L_null,cfg_L_cond,cfg_L_cfg\n"
         )
 
     losses = []
@@ -2153,7 +2233,7 @@ def train_contrastive(
 
         optimizer.zero_grad()
 
-        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+        with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
             # Build variant batch
             vbatch = build_variant_batch(
                 host_anchors, sampler, pipeline, ip_adapter, t2i_adapter,
@@ -2207,60 +2287,60 @@ def train_contrastive(
                 ).sample.float()
                 torch.cuda.synchronize()  # TDR prevention
 
-            # Determine if we're in warmup
-            in_warmup = step < warmup_steps
+        # Loss computed OUTSIDE autocast — sum of 16K squared fp16 values
+        # can overflow fp16 in _weighted_l2; fp32 loss is essentially free
+        in_warmup = step < warmup_steps
 
-            # Compute loss
-            if in_warmup:
-                # Only L_diff during warmup (but compute distances for calibration)
-                loss_total, extras = compute_contrastive_loss(
-                    eps_pred, vbatch,
-                    strategy=strategy,
-                    lambda_inv=0.0, lambda_rank=0.0,
-                    lambda_rank_untyped=0.0, lambda_triplet=0.0,
-                    gamma=0.0, triplet_margin_m=triplet_margin_m,
-                    use_untyped_rank_null=use_untyped_rank_null,
-                    triplet_core_only=triplet_core_only,
-                    triplet_mode=triplet_mode,
-                    triplet_softplus_k=triplet_softplus_k,
-                    triplet_softplus_offset=triplet_softplus_offset,
-                )
-                warmup_L_diff_accum.append(extras["L_diff"])
-                if extras.get("gap_mean", 0.0) != 0.0:
-                    warmup_gap_accum.append(extras["gap_mean"])
-            else:
-                # Freeze gamma + triplet margin at end of warmup
-                if step == warmup_steps and warmup_L_diff_accum:
-                    L_ref = np.mean(warmup_L_diff_accum)
-                    gamma = rank_gamma_scale * L_ref
-                    print(f"\n  Warmup done. L_ref={L_ref:.4f}, gamma={gamma:.4f}")
+        if in_warmup:
+            # Only L_diff during warmup (but compute distances for calibration)
+            loss_total, extras = compute_contrastive_loss(
+                eps_pred, vbatch,
+                strategy=strategy,
+                lambda_inv=0.0, lambda_rank=0.0,
+                lambda_rank_untyped=0.0, lambda_triplet=0.0,
+                gamma=0.0, triplet_margin_m=triplet_margin_m,
+                use_untyped_rank_null=use_untyped_rank_null,
+                triplet_core_only=triplet_core_only,
+                triplet_mode=triplet_mode,
+                triplet_softplus_k=triplet_softplus_k,
+                triplet_softplus_offset=triplet_softplus_offset,
+            )
+            warmup_L_diff_accum.append(extras["L_diff"])
+            if extras.get("gap_mean", 0.0) != 0.0:
+                warmup_gap_accum.append(extras["gap_mean"])
+        else:
+            # Freeze gamma + triplet margin at end of warmup
+            if step == warmup_steps and warmup_L_diff_accum:
+                L_ref = np.mean(warmup_L_diff_accum)
+                gamma = rank_gamma_scale * L_ref
+                print(f"\n  Warmup done. L_ref={L_ref:.4f}, gamma={gamma:.4f}")
 
-                    # Triplet margin auto-calibration (hinge only; softplus uses offset)
-                    if triplet_mode == "hinge":
-                        if triplet_margin is not None:
-                            triplet_margin_m = triplet_margin
-                        elif triplet_margin_auto and warmup_gap_accum:
-                            gap_ref = float(np.median(warmup_gap_accum))
-                            triplet_margin_m = max(0.005, triplet_margin_alpha * gap_ref)
-                        print(f"  Triplet margin: {triplet_margin_m:.4f}")
-                    else:
-                        print(f"  Softplus triplet (k={triplet_softplus_k}, offset={triplet_softplus_offset})")
+                # Triplet margin auto-calibration (hinge only; softplus uses offset)
+                if triplet_mode == "hinge":
+                    if triplet_margin is not None:
+                        triplet_margin_m = triplet_margin
+                    elif triplet_margin_auto and warmup_gap_accum:
+                        gap_ref = float(np.median(warmup_gap_accum))
+                        triplet_margin_m = max(0.005, triplet_margin_alpha * gap_ref)
+                    print(f"  Triplet margin: {triplet_margin_m:.4f}")
+                else:
+                    print(f"  Softplus triplet (k={triplet_softplus_k}, offset={triplet_softplus_offset})")
 
-                loss_total, extras = compute_contrastive_loss(
-                    eps_pred, vbatch,
-                    strategy=strategy,
-                    lambda_inv=lambda_inv,
-                    lambda_rank=lambda_rank,
-                    lambda_rank_untyped=lambda_rank_untyped,
-                    lambda_triplet=lambda_triplet,
-                    gamma=gamma,
-                    triplet_margin_m=triplet_margin_m,
-                    use_untyped_rank_null=use_untyped_rank_null,
-                    triplet_core_only=triplet_core_only,
-                    triplet_mode=triplet_mode,
-                    triplet_softplus_k=triplet_softplus_k,
-                    triplet_softplus_offset=triplet_softplus_offset,
-                )
+            loss_total, extras = compute_contrastive_loss(
+                eps_pred, vbatch,
+                strategy=strategy,
+                lambda_inv=lambda_inv,
+                lambda_rank=lambda_rank,
+                lambda_rank_untyped=lambda_rank_untyped,
+                lambda_triplet=lambda_triplet,
+                gamma=gamma,
+                triplet_margin_m=triplet_margin_m,
+                use_untyped_rank_null=use_untyped_rank_null,
+                triplet_core_only=triplet_core_only,
+                triplet_mode=triplet_mode,
+                triplet_softplus_k=triplet_softplus_k,
+                triplet_softplus_offset=triplet_softplus_offset,
+            )
 
         # L2-SP
         l2sp_val = 0.0
@@ -2271,12 +2351,17 @@ def train_contrastive(
 
         if torch.isnan(loss_total) or torch.isinf(loss_total):
             skipped_nan += 1
+            del eps_pred, loss_total, vbatch
+            gc.collect()
+            torch.cuda.empty_cache()
             continue
 
-        loss_total.backward()
+        scaler.scale(loss_total).backward()
         torch.cuda.synchronize()  # TDR prevention
+        scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         loss_val = loss_total.item()
         losses.append(extras["L_diff"])
@@ -2330,7 +2415,10 @@ def train_contrastive(
             f"{extras['gap_positive_rate']},{extras['gap_pos_rate_same_host']},"
             f"{extras['gap_pos_rate_cross_host']},"
             f"{extras['gap_mean_same_host']},{extras['gap_mean_cross_host']},"
-            f"{emb_g},{emb_a},{emb_n}\n"
+            f"{emb_g},{emb_a},{emb_n},"
+            f"{extras['eps_norm_early']},{extras['eps_norm_mid']},{extras['eps_norm_late']},"
+            f"{extras['cond_null_dist_mean']},{extras['cond_null_dist_std']},"
+            f"{extras['cfg_L_null']},{extras['cfg_L_cond']},{extras['cfg_L_cfg']}\n"
         )
         stats_fh.flush()
 

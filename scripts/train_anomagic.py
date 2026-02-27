@@ -15,6 +15,7 @@ Training loop:
 7. Masked noise prediction loss
 8. Backprop through IP-Adapter params only
 """
+import gc
 import csv
 import os
 import sys
@@ -455,13 +456,13 @@ def train_anomagic(
         l2sp_reg = L2SPRegularizer(a_decay, lambda_sp=lambda_sp)
         print(f"\n  L2-SP: {l2sp_reg.total_elements:,} elements, lambda={lambda_sp:.1e}")
 
-    # AMP autocast handles fp16 forward pass; trainable params stay fp32.
-    # GradScaler needed when LoRA is active: LoRA params are fp32 but their
-    # gradients flow through fp16 UNet intermediates, which can overflow.
-    # Without LoRA, all trainable params (IP-Adapter) receive gradients through
-    # fp32 projections, so scaler is unnecessary.
+    # AMP autocast: bf16 forward pass, trainable params stay fp32.
+    # bf16 has same exponent range as fp32 (max ~3.4e38), eliminating the
+    # fp16 overflow class (65504 ceiling) in attention dot products and sums.
+    # GradScaler kept as belt-and-suspenders for gradient underflow.
     use_amp = True
-    scaler = torch.amp.GradScaler('cuda') if lora_rank > 0 else None
+    amp_dtype = torch.bfloat16
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     pipeline.text_encoder.float()
     pipeline.vae.float()
@@ -688,34 +689,37 @@ def train_anomagic(
         else:
             ctx_drop = 0.0
 
-        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-            loss_diff, loss_extras = compute_anomagic_loss(
-                pipeline, ip_adapter, images, masks, references,
-                batch_types, batch_captions,
-                reference_mode=reference_mode,
-                clip_dilation_min_r=clip_dilation_min_r,
-                clip_dilation_max_r=clip_dilation_max_r,
-                band_mode=band_mode,
-                loss_core_ratio=loss_core_ratio,
-                binary_cross_attn_mask=binary_cross_attn_mask,
-                t2i_adapter=t2i_adapter,
-                drop_image_prob=drop_image_prob,
-                drop_text_prob=drop_text_prob,
-                drop_both_prob=drop_both_prob,
-                clip_masks=clip_masks,
-                clip_core_masks=clip_core_masks,
-                references_2=references_2,
-                clip_masks_2=clip_masks_2,
-                clip_core_masks_2=clip_core_masks_2,
-                group_valid=group_valid,
-                noise_offset=noise_offset,
-                timestep_sampling=timestep_sampling,
-                logit_normal_mean=logit_normal_mean,
-                logit_normal_std=logit_normal_std,
-                corrupt_context=ctx_drop,
-                x0_ratio=x0_ratio,
-                x0_no_context=x0_no_context,
-            )
+        # AMP autocast wraps forward pass only; loss math runs in fp32
+        # to avoid fp16 overflow in sum-of-squares reductions.
+        loss_diff, loss_extras = compute_anomagic_loss(
+            pipeline, ip_adapter, images, masks, references,
+            batch_types, batch_captions,
+            reference_mode=reference_mode,
+            clip_dilation_min_r=clip_dilation_min_r,
+            clip_dilation_max_r=clip_dilation_max_r,
+            band_mode=band_mode,
+            loss_core_ratio=loss_core_ratio,
+            binary_cross_attn_mask=binary_cross_attn_mask,
+            t2i_adapter=t2i_adapter,
+            drop_image_prob=drop_image_prob,
+            drop_text_prob=drop_text_prob,
+            drop_both_prob=drop_both_prob,
+            clip_masks=clip_masks,
+            clip_core_masks=clip_core_masks,
+            references_2=references_2,
+            clip_masks_2=clip_masks_2,
+            clip_core_masks_2=clip_core_masks_2,
+            group_valid=group_valid,
+            noise_offset=noise_offset,
+            timestep_sampling=timestep_sampling,
+            logit_normal_mean=logit_normal_mean,
+            logit_normal_std=logit_normal_std,
+            corrupt_context=ctx_drop,
+            x0_ratio=x0_ratio,
+            x0_no_context=x0_no_context,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+        )
 
         # L2-SP regularization (fp32, outside autocast)
         l2sp_val = 0.0
@@ -728,20 +732,17 @@ def train_anomagic(
 
         if torch.isnan(loss) or torch.isinf(loss):
             skipped_nan += 1
+            del loss_diff, loss, loss_extras
+            gc.collect()
+            torch.cuda.empty_cache()
             continue
 
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            torch.cuda.synchronize()  # TDR prevention
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            torch.cuda.synchronize()  # TDR prevention
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
-            optimizer.step()
+        scaler.scale(loss).backward()
+        torch.cuda.synchronize()  # TDR prevention
+        scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
+        scaler.step(optimizer)
+        scaler.update()
 
         loss_val = loss_diff.item()
         losses.append(loss_val)
@@ -912,6 +913,9 @@ def compute_anomagic_loss(
     # x0-prediction pseudo-diffusion ablation
     x0_ratio: float = 0.0,
     x0_no_context: bool = False,
+    # AMP
+    use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.bfloat16,
 ):
     """
     Compute masked diffusion loss with 2 conditioning pathways.
@@ -935,162 +939,165 @@ def compute_anomagic_loss(
     images = images.float()
     masks_fp32 = masks.float()
 
-    # --- CLIP mask ---
-    # When augmented: clip_masks come from crop_utils (already cropped to 224×224)
-    # When non-augmented: dilate the full-res mask for masked self-attention
-    if clip_masks is None:
-        clip_dilated = dilate_mask_batch(masks_fp32, clip_dilation_min_r, clip_dilation_max_r)
-    else:
-        clip_dilated = None  # not needed — clip_masks used directly
+    # --- Forward pass under AMP autocast (bf16) ---
+    with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
 
-    # Encode image to latent space
-    latents = pipeline.encode_image(images)
-
-    # Timestep sampling
-    if timestep_sampling == "logit_normal":
-        # SD3-style: sample from logit-normal distribution (bell-shaped, mid-range focus)
-        u = torch.sigmoid(logit_normal_mean + logit_normal_std * torch.randn(batch_size, device=device))
-        timesteps = (u * 1000).long().clamp(0, 999)
-    else:
-        # Uniform (standard DDPM)
-        timesteps = torch.randint(0, 1000, (batch_size,), device=device, dtype=torch.long)
-
-    noise = torch.randn_like(latents)
-    if noise_offset > 0:
-        # Per-channel constant offset: helps model handle global brightness shifts
-        noise += noise_offset * torch.randn(
-            latents.shape[0], latents.shape[1], 1, 1, device=device, dtype=latents.dtype
-        )
-    noisy_latents = pipeline.scheduler.add_noise(latents, noise, timesteps)
-
-    # --- UNet masks: maxpool to 64×64, then latent-space band dilation ---
-    latent_h = latents.shape[-1]
-    kernel = masks_fp32.shape[-1] // latent_h
-    core_mask_64 = F.max_pool2d(masks_fp32, kernel_size=kernel)
-    core_mask_64 = (core_mask_64 > 0.5).float()
-
-    dilated_binary_64, alpha_map_64, weight_map_64, band_mask_64 = create_latent_band_mask(
-        core_mask_64, band_mode, core_ratio=loss_core_ratio,
-    )
-
-    # --- Pathway 1: Text conditioning (captions only, no TI tokens) ---
-    prompts = []
-    for i, atype in enumerate(batch_types):
-        cap = captions[i] if i < len(captions) else ""
-        if cap:
-            prompts.append(cap)
+        # --- CLIP mask ---
+        # When augmented: clip_masks come from crop_utils (already cropped to 224×224)
+        # When non-augmented: dilate the full-res mask for masked self-attention
+        if clip_masks is None:
+            clip_dilated = dilate_mask_batch(masks_fp32, clip_dilation_min_r, clip_dilation_max_r)
         else:
-            type_word = atype.replace("_", " ")
-            prompts.append(f"a photo of a {type_word} defect")
+            clip_dilated = None  # not needed — clip_masks used directly
 
-    text_emb = pipeline.encode_text(prompts, enable_grad=False)
+        # Encode image to latent space
+        latents = pipeline.encode_image(images)
 
-    # --- Pathway 2: Visual conditioning via IP-Adapter ---
-    ref_01 = (references + 1.0) / 2.0
-    if clip_masks is not None:
-        # clip_masks are [B, 1, 224, 224] from crop_utils (UNet-roundtripped dilated)
-        clip_mask = clip_masks
-        clip_core = clip_core_masks  # [B, 1, 224, 224] core mask for role embeddings
-    else:
-        clip_mask = clip_dilated if reference_mode == "full" else None
-        clip_core = None
-    ip_image_embeds = ip_adapter.encode_image(ref_01, mask=clip_mask, core_mask=clip_core)  # [B, K, cross_attn_dim]
+        # Timestep sampling
+        if timestep_sampling == "logit_normal":
+            # SD3-style: sample from logit-normal distribution (bell-shaped, mid-range focus)
+            u = torch.sigmoid(logit_normal_mean + logit_normal_std * torch.randn(batch_size, device=device))
+            timesteps = (u * 1000).long().clamp(0, 999)
+        else:
+            # Uniform (standard DDPM)
+            timesteps = torch.randint(0, 1000, (batch_size,), device=device, dtype=torch.long)
 
-    # --- Multi-crop: encode second crop and concatenate ---
-    null_token_mask = None
-    if references_2 is not None:
-        ref_2_01 = (references_2 + 1.0) / 2.0
-        clip_mask_2 = clip_masks_2 if clip_masks_2 is not None else None
-        clip_core_2 = clip_core_masks_2 if clip_core_masks_2 is not None else None
-        ip_image_embeds_2 = ip_adapter.encode_image(ref_2_01, mask=clip_mask_2, core_mask=clip_core_2)  # [B, K, dim]
-
-        # Concatenate: [B, K, dim] + [B, K, dim] → [B, 2K, dim]
-        K = ip_image_embeds.shape[1]
-        ip_image_embeds = torch.cat([ip_image_embeds, ip_image_embeds_2], dim=1)  # [B, 2K, dim]
-
-        # Build null_token_mask [B, 2K]: 1=valid, 0=null (from invalid groups)
-        if group_valid is not None:
-            # group_valid [B, 2]: validity per group
-            # Expand: group 1 valid → first K tokens valid, group 2 valid → last K tokens valid
-            mask_1 = group_valid[:, 0:1].expand(-1, K)  # [B, K]
-            mask_2 = group_valid[:, 1:2].expand(-1, K)  # [B, K]
-            null_token_mask = torch.cat([mask_1, mask_2], dim=1)  # [B, 2K]
-
-    # --- Conditioning dropout for CFG (mutually exclusive, per-sample) ---
-    # Matches IP-Adapter training: single rand(), cumulative thresholds.
-    # Image drop = zeros on ip_image_embeds. Text drop = empty-string encoding.
-    if (drop_image_prob + drop_text_prob + drop_both_prob) > 0 and batch_size > 0:
-        uncond_text = pipeline.encode_text([""] * batch_size, enable_grad=False)
-        for i in range(batch_size):
-            r = random.random()
-            if r < drop_image_prob:
-                ip_image_embeds[i] = 0.0
-            elif r < drop_image_prob + drop_text_prob:
-                text_emb[i] = uncond_text[i]
-            elif r < drop_image_prob + drop_text_prob + drop_both_prob:
-                ip_image_embeds[i] = 0.0
-                text_emb[i] = uncond_text[i]
-
-    # --- Inpainting inputs — latent-space dilated mask defines regeneration region ---
-    mask_latents = dilated_binary_64  # binary [B, 1, 64, 64]
-    unet_mask_512 = F.interpolate(dilated_binary_64, size=images.shape[-2:], mode='nearest')
-    masked_image = images * (1 - unet_mask_512)
-    masked_image_latents = pipeline.encode_image(masked_image)
-
-    # --- x0-objective: replace noisy input for pseudo-path samples ---
-    x0_samples = None
-    if x0_ratio > 0:
-        x0_samples = torch.rand(batch_size, device=device) < x0_ratio  # [B] bool
-        if x0_samples.any():
-            noisy_pseudo = pipeline.scheduler.add_noise(masked_image_latents, noise, timesteps)
-            noisy_latents = torch.where(
-                x0_samples[:, None, None, None].expand_as(noisy_latents),
-                noisy_pseudo, noisy_latents,
+        noise = torch.randn_like(latents)
+        if noise_offset > 0:
+            # Per-channel constant offset: helps model handle global brightness shifts
+            noise += noise_offset * torch.randn(
+                latents.shape[0], latents.shape[1], 1, 1, device=device, dtype=latents.dtype
             )
-            # Optionally zero inpainting context for x0-path samples only
-            if x0_no_context:
-                masked_image_latents = torch.where(
-                    x0_samples[:, None, None, None].expand_as(masked_image_latents),
-                    torch.zeros_like(masked_image_latents),
-                    masked_image_latents,
-                )
+        noisy_latents = pipeline.scheduler.add_noise(latents, noise, timesteps)
+
+        # --- UNet masks: maxpool to 64×64, then latent-space band dilation ---
+        latent_h = latents.shape[-1]
+        kernel = masks_fp32.shape[-1] // latent_h
+        core_mask_64 = F.max_pool2d(masks_fp32, kernel_size=kernel)
+        core_mask_64 = (core_mask_64 > 0.5).float()
+
+        dilated_binary_64, alpha_map_64, weight_map_64, band_mask_64 = create_latent_band_mask(
+            core_mask_64, band_mode, core_ratio=loss_core_ratio,
+        )
+
+        # --- Pathway 1: Text conditioning (captions only, no TI tokens) ---
+        prompts = []
+        for i, atype in enumerate(batch_types):
+            cap = captions[i] if i < len(captions) else ""
+            if cap:
+                prompts.append(cap)
+            else:
+                type_word = atype.replace("_", " ")
+                prompts.append(f"a photo of a {type_word} defect")
+
+        text_emb = pipeline.encode_text(prompts, enable_grad=False)
+
+        # --- Pathway 2: Visual conditioning via IP-Adapter ---
+        ref_01 = (references + 1.0) / 2.0
+        if clip_masks is not None:
+            # clip_masks are [B, 1, 224, 224] from crop_utils (UNet-roundtripped dilated)
+            clip_mask = clip_masks
+            clip_core = clip_core_masks  # [B, 1, 224, 224] core mask for role embeddings
         else:
-            x0_samples = None  # no samples selected, skip x0 logic in loss
+            clip_mask = clip_dilated if reference_mode == "full" else None
+            clip_core = None
+        ip_image_embeds = ip_adapter.encode_image(ref_01, mask=clip_mask, core_mask=clip_core)  # [B, K, cross_attn_dim]
 
-    # Context dropout: per-batch zeroing of masked_image_latents
-    if corrupt_context > 0.0 and random.random() < corrupt_context:
-        masked_image_latents = torch.zeros_like(masked_image_latents)
+        # --- Multi-crop: encode second crop and concatenate ---
+        null_token_mask = None
+        if references_2 is not None:
+            ref_2_01 = (references_2 + 1.0) / 2.0
+            clip_mask_2 = clip_masks_2 if clip_masks_2 is not None else None
+            clip_core_2 = clip_core_masks_2 if clip_core_masks_2 is not None else None
+            ip_image_embeds_2 = ip_adapter.encode_image(ref_2_01, mask=clip_mask_2, core_mask=clip_core_2)  # [B, K, dim]
 
-    model_input = torch.cat([noisy_latents, mask_latents, masked_image_latents], dim=1)
+            # Concatenate: [B, K, dim] + [B, K, dim] → [B, 2K, dim]
+            K = ip_image_embeds.shape[1]
+            ip_image_embeds = torch.cat([ip_image_embeds, ip_image_embeds_2], dim=1)  # [B, 2K, dim]
 
-    # --- T2I-Adapter spatial features (AMP autocast handles dtype) ---
-    t2i_kwargs = {}
-    if t2i_adapter is not None:
-        t2i_input = torch.cat([core_mask_64, band_mask_64], dim=1)  # [B, 2, 64, 64]
-        t2i_features = t2i_adapter(t2i_input, mask=dilated_binary_64)
-        t2i_kwargs = t2i_adapter.prepare_unet_kwargs(t2i_features)
+            # Build null_token_mask [B, 2K]: 1=valid, 0=null (from invalid groups)
+            if group_valid is not None:
+                # group_valid [B, 2]: validity per group
+                # Expand: group 1 valid → first K tokens valid, group 2 valid → last K tokens valid
+                mask_1 = group_valid[:, 0:1].expand(-1, K)  # [B, K]
+                mask_2 = group_valid[:, 1:2].expand(-1, K)  # [B, K]
+                null_token_mask = torch.cat([mask_1, mask_2], dim=1)  # [B, 2K]
 
-    # --- UNet forward with both pathways via cross_attention_kwargs ---
-    cross_attn_kwargs = {"ip_adapter_image_embeds": ip_image_embeds}
-    # Cross-attn mask: soft alpha (default) or binary
-    if binary_cross_attn_mask:
-        cross_attn_kwargs["ip_adapter_mask"] = dilated_binary_64
-    else:
-        cross_attn_kwargs["ip_adapter_mask"] = alpha_map_64
-    # Multi-crop null masking
-    if null_token_mask is not None:
-        cross_attn_kwargs["null_token_mask"] = null_token_mask
+        # --- Conditioning dropout for CFG (mutually exclusive, per-sample) ---
+        # Matches IP-Adapter training: single rand(), cumulative thresholds.
+        # Image drop = zeros on ip_image_embeds. Text drop = empty-string encoding.
+        if (drop_image_prob + drop_text_prob + drop_both_prob) > 0 and batch_size > 0:
+            uncond_text = pipeline.encode_text([""] * batch_size, enable_grad=False)
+            for i in range(batch_size):
+                r = random.random()
+                if r < drop_image_prob:
+                    ip_image_embeds[i] = 0.0
+                elif r < drop_image_prob + drop_text_prob:
+                    text_emb[i] = uncond_text[i]
+                elif r < drop_image_prob + drop_text_prob + drop_both_prob:
+                    ip_image_embeds[i] = 0.0
+                    text_emb[i] = uncond_text[i]
 
-    noise_pred = pipeline.unet(
-        model_input,
-        timesteps,
-        encoder_hidden_states=text_emb,
-        cross_attention_kwargs=cross_attn_kwargs,
-        **t2i_kwargs,
-    ).sample.float()
-    torch.cuda.synchronize()  # TDR prevention
+        # --- Inpainting inputs — latent-space dilated mask defines regeneration region ---
+        mask_latents = dilated_binary_64  # binary [B, 1, 64, 64]
+        unet_mask_512 = F.interpolate(dilated_binary_64, size=images.shape[-2:], mode='nearest')
+        masked_image = images * (1 - unet_mask_512)
+        masked_image_latents = pipeline.encode_image(masked_image)
 
-    # --- Ratio-based loss weighting (flat alpha, no scipy) ---
+        # --- x0-objective: replace noisy input for pseudo-path samples ---
+        x0_samples = None
+        if x0_ratio > 0:
+            x0_samples = torch.rand(batch_size, device=device) < x0_ratio  # [B] bool
+            if x0_samples.any():
+                noisy_pseudo = pipeline.scheduler.add_noise(masked_image_latents, noise, timesteps)
+                noisy_latents = torch.where(
+                    x0_samples[:, None, None, None].expand_as(noisy_latents),
+                    noisy_pseudo, noisy_latents,
+                )
+                # Optionally zero inpainting context for x0-path samples only
+                if x0_no_context:
+                    masked_image_latents = torch.where(
+                        x0_samples[:, None, None, None].expand_as(masked_image_latents),
+                        torch.zeros_like(masked_image_latents),
+                        masked_image_latents,
+                    )
+            else:
+                x0_samples = None  # no samples selected, skip x0 logic in loss
+
+        # Context dropout: per-batch zeroing of masked_image_latents
+        if corrupt_context > 0.0 and random.random() < corrupt_context:
+            masked_image_latents = torch.zeros_like(masked_image_latents)
+
+        model_input = torch.cat([noisy_latents, mask_latents, masked_image_latents], dim=1)
+
+        # --- T2I-Adapter spatial features (AMP autocast handles dtype) ---
+        t2i_kwargs = {}
+        if t2i_adapter is not None:
+            t2i_input = torch.cat([core_mask_64, band_mask_64], dim=1)  # [B, 2, 64, 64]
+            t2i_features = t2i_adapter(t2i_input, mask=dilated_binary_64)
+            t2i_kwargs = t2i_adapter.prepare_unet_kwargs(t2i_features)
+
+        # --- UNet forward with both pathways via cross_attention_kwargs ---
+        cross_attn_kwargs = {"ip_adapter_image_embeds": ip_image_embeds}
+        # Cross-attn mask: soft alpha (default) or binary
+        if binary_cross_attn_mask:
+            cross_attn_kwargs["ip_adapter_mask"] = dilated_binary_64
+        else:
+            cross_attn_kwargs["ip_adapter_mask"] = alpha_map_64
+        # Multi-crop null masking
+        if null_token_mask is not None:
+            cross_attn_kwargs["null_token_mask"] = null_token_mask
+
+        noise_pred = pipeline.unet(
+            model_input,
+            timesteps,
+            encoder_hidden_states=text_emb,
+            cross_attention_kwargs=cross_attn_kwargs,
+            **t2i_kwargs,
+        ).sample.float()
+        torch.cuda.synchronize()  # TDR prevention
+
+    # --- Loss computed OUTSIDE autocast (fp32) to avoid fp16 overflow in reductions ---
     weight_expanded = weight_map_64.expand_as(noise_pred)
 
     if x0_samples is not None and x0_samples.any():

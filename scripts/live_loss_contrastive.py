@@ -2,11 +2,12 @@
 
 Reads stats.csv from contrastive training runs.
 
-4x3 layout:
+5x3 layout:
   [L_diff trend,        Core vs Band (stacked), Role Embedding Norms      ]
-  [Contrastive Dists,   Gap Satisfaction,       Normalized Diagnostics    ]
+  [Contrastive Dists,   Gap Satisfaction,        Normalized Diagnostics    ]
   [L_inv / L_triplet,   L_rank typed/untyped,   Rank Satisfaction %       ]
   [Gates,               Grad Norm,              L_true vs L_wrong         ]
+  [Cond Strength,       ||Δε|| Sigma Bins,      CFG Visual Probe          ]
 
 Usage:
   python live_loss_contrastive.py <stats_csv_path>
@@ -131,7 +132,7 @@ def main():
     warmup_frac = cfg.get("regularizer_warmup_frac", 0.05)
     warmup_step = int(n_steps * warmup_frac) if n_steps > 0 else 0
 
-    fig, axes = plt.subplots(4, 3, figsize=(21, 20))
+    fig, axes = plt.subplots(5, 3, figsize=(21, 25))
     fig.canvas.manager.set_window_title(run_title)
     fig.suptitle(run_title, fontsize=11, fontweight="bold")
     all_axes = list(axes.flat)
@@ -403,6 +404,70 @@ def main():
         ax.set_title(f"True vs Wrong Loss{gamma_str}")
         ax.legend(loc="upper left", fontsize=8)
         ax.set_xlabel("Step"); ax.set_ylabel("Loss")
+        ax.grid(True, alpha=0.3)
+
+        # ============================================================
+        # Row 4: Cond Strength | Sigma Bins | (empty)
+        # ============================================================
+
+        # === [4,0] Conditioning Strength (cond vs null) ===
+        cnd_mean = _get(stats, "cond_null_dist_mean")
+        ax = axes[4, 0]
+        if len(cnd_mean) > 1 and cnd_mean.any():
+            cnd_ema = ema_smooth(cnd_mean, SM)
+            ax.plot(steps, cnd_ema, color="darkred", linewidth=2, label=f"||eps_cond - eps_null|| ({cnd_ema[-1]:.4f})")
+        # Overlay gap satisfaction rate on twin axis
+        if len(gpr_sh) > 1 and gpr_sh.any():
+            ax2 = ax.twinx()
+            gpr_sh_ema = ema_smooth(gpr_sh, SM)
+            ax2.plot(steps, gpr_sh_ema, color="green", linewidth=1, linestyle=":", label=f"gap>0 ({gpr_sh_ema[-1]:.0%})")
+            ax2.set_ylim(-0.05, 1.05)
+            ax2.set_ylabel("Gap rate", fontsize=8, color="green")
+            ax2.legend(loc="upper right", fontsize=7)
+        _add_warmup_vline(ax, warmup_step, steps)
+        ax.set_title("Conditioning Strength (cond vs null)")
+        ax.legend(loc="upper left", fontsize=8)
+        ax.set_xlabel("Step"); ax.set_ylabel("||eps_cond - eps_null||")
+        ax.grid(True, alpha=0.3)
+
+        # === [4,1] ||Delta-eps|| Sigma Bins (early/mid/late) ===
+        en_early = _get(stats, "eps_norm_early")
+        en_mid = _get(stats, "eps_norm_mid")
+        en_late = _get(stats, "eps_norm_late")
+        ax = axes[4, 1]
+        if len(en_early) > 1 and en_early.any():
+            e = ema_smooth(en_early, SM)
+            ax.plot(steps, e, color="green", linewidth=2, label=f"early t<333 ({e[-1]:.4f})")
+        if len(en_mid) > 1 and en_mid.any():
+            e = ema_smooth(en_mid, SM)
+            ax.plot(steps, e, color="orange", linewidth=2, label=f"mid 333-666 ({e[-1]:.4f})")
+        if len(en_late) > 1 and en_late.any():
+            e = ema_smooth(en_late, SM)
+            ax.plot(steps, e, color="red", linewidth=2, label=f"late t>666 ({e[-1]:.4f})")
+        _add_warmup_vline(ax, warmup_step, steps)
+        ax.set_title("||eps_pred - noise|| by Timestep Bin")
+        ax.legend(loc="upper left", fontsize=8)
+        ax.set_xlabel("Step"); ax.set_ylabel("RMSE (core)")
+        ax.grid(True, alpha=0.3)
+
+        # === [4,2] CFG Visual Probe (scale=3.0) ===
+        cfg_null = _get(stats, "cfg_L_null")
+        cfg_cond = _get(stats, "cfg_L_cond")
+        cfg_cfg = _get(stats, "cfg_L_cfg")
+        ax = axes[4, 2]
+        if len(cfg_null) > 1 and cfg_null.any():
+            cn = ema_smooth(cfg_null, SM)
+            ax.plot(steps, cn, color="gray", linewidth=1.5, label=f"L_null ({cn[-1]:.4f})")
+        if len(cfg_cond) > 1 and cfg_cond.any():
+            cc = ema_smooth(cfg_cond, SM)
+            ax.plot(steps, cc, color="blue", linewidth=2, label=f"L_cond ({cc[-1]:.4f})")
+        if len(cfg_cfg) > 1 and cfg_cfg.any():
+            cg = ema_smooth(cfg_cfg, SM)
+            ax.plot(steps, cg, color="red", linewidth=2, label=f"L_cfg s=3 ({cg[-1]:.4f})")
+        _add_warmup_vline(ax, warmup_step, steps)
+        ax.set_title("CFG Visual Probe (s=3.0)")
+        ax.legend(loc="upper left", fontsize=8)
+        ax.set_xlabel("Step"); ax.set_ylabel("MSE (core)")
         ax.grid(True, alpha=0.3)
 
         fig.tight_layout(rect=[0, 0, 1, 0.96])
