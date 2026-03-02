@@ -538,6 +538,7 @@ class IPAdapterAttnProcessor(nn.Module):
         ip_adapter_image_embeds: Optional[torch.Tensor] = None,
         ip_adapter_mask: Optional[torch.Tensor] = None,
         null_token_mask: Optional[torch.Tensor] = None,
+        diagnostics: Optional[Dict[str, float]] = None,
     ) -> torch.Tensor:
         """
         Process attention with IP-Adapter injection.
@@ -618,6 +619,16 @@ class IPAdapterAttnProcessor(nn.Module):
             ip_attention_probs = attn.get_attention_scores(query, ip_key, ip_attn_mask)
             ip_hidden_states = torch.bmm(ip_attention_probs, ip_value)
             ip_hidden_states = attn.batch_to_head_dim(ip_hidden_states)
+
+            # --- Diagnostic capture (GPU tensors, no .item() sync) ---
+            if diagnostics is not None:
+                _layer = getattr(self, "_diag_layer_name", "unknown")
+                diagnostics[f"{_layer}/ip_k_norm"] = ip_key.detach().norm()
+                diagnostics[f"{_layer}/ip_out_norm"] = ip_hidden_states.detach().norm()
+                diagnostics[f"{_layer}/h_pre_norm"] = hidden_states.detach().norm()
+                diagnostics[f"{_layer}/text_k_norm"] = key.detach().norm()
+                probs = ip_attention_probs.detach()
+                diagnostics[f"{_layer}/ip_entropy"] = -(probs * probs.clamp(min=1e-8).log()).sum(-1).mean()
 
             # Mask IP output to anomaly positions only
             if spatial_mask is not None:
@@ -837,6 +848,8 @@ class IPAdapter(nn.Module):
                         scale=self.config.scale,
                         mask_visual=self.config.mask_visual,
                     )
+                    # Store layer name for diagnostic capture
+                    proc._diag_layer_name = name
 
                     attn_procs[name] = proc.to(self.pipeline.device, dtype=self.pipeline.dtype)
                     ordered_cross_attn_names.append(name)
@@ -1031,22 +1044,30 @@ class IPAdapter(nn.Module):
                 active_mask = torch.ones(B, N, device=patch_tokens.device, dtype=patch_tokens.dtype)
 
             if core_mask is not None:
-                # CLIP-UNet alignment mode: selective pooling + role embeddings
-                active_3d = active_mask.unsqueeze(-1)  # [B, 256, 1]
-                token_sum = (patch_tokens * active_3d).sum(dim=1, keepdim=True)  # [B, 1, 1280]
-                count = active_mask.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)  # [B, 1, 1]
-                global_token = token_sum / count + self.masked_self_attn.emb_global  # [B, 1, 1280]
-
-                # Role embeddings: core=anomaly, band=normal context
+                # Core mask available: pool over pure anomaly patches only
+                if mask is None:
+                    grid_size = int(N ** 0.5)  # 16
+                    kernel = core_mask.shape[-1] // grid_size
                 core_16 = F.max_pool2d(core_mask.float(), kernel_size=kernel)  # [B, 1, 16, 16]
                 is_core = (core_16 > 0.5).float().view(B, N)  # [B, 256]
+                core_3d = is_core.unsqueeze(-1)  # [B, 256, 1]
+                core_sum = (patch_tokens * core_3d).sum(dim=1, keepdim=True)  # [B, 1, 1280]
+                core_count = is_core.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)  # [B, 1, 1]
+                global_anomaly_token = core_sum / core_count + self.masked_self_attn.emb_global  # [B, 1, 1280]
+
+                # Role embeddings: core=anomaly, band=normal context
                 is_band = (active_mask - is_core).clamp(min=0)  # [B, 256]
                 role = (is_core.unsqueeze(-1) * self.masked_self_attn.emb_anomaly
                         + is_band.unsqueeze(-1) * self.masked_self_attn.emb_normal)
                 patch_tokens = patch_tokens + role
             else:
-                # Original behavior: pool ALL 256 tokens, no role embeddings
-                global_token = patch_tokens.mean(dim=1, keepdim=True)  # [B, 1, 1280]
+                # No core mask: fallback to pooling over active (dilated) patches.
+                # NOTE: this includes band tokens — callers should provide core_mask
+                # for proper anomaly-only pooling. All training scripts do.
+                active_3d = active_mask.unsqueeze(-1)  # [B, 256, 1]
+                token_sum = (patch_tokens * active_3d).sum(dim=1, keepdim=True)  # [B, 1, 1280]
+                count = active_mask.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)  # [B, 1, 1]
+                global_anomaly_token = token_sum / count + self.masked_self_attn.emb_global  # [B, 1, 1280]
 
             visual_mode = self.config.visual_mode
 
@@ -1055,7 +1076,7 @@ class IPAdapter(nn.Module):
                 aware_tokens = self.masked_self_attn(patch_tokens, mask=mask)  # [B, 256, 1280]
 
                 # Concat global summary + aware tokens → Resampler
-                resampler_input = torch.cat([global_token, aware_tokens], dim=1)  # [B, 257, 1280]
+                resampler_input = torch.cat([global_anomaly_token, aware_tokens], dim=1)  # [B, 257, 1280]
 
             elif visual_mode in (2, 3):
                 # Modes 2-3: extract only anomaly patch tokens, pad to batch max
@@ -1096,7 +1117,7 @@ class IPAdapter(nn.Module):
                 )  # [B, max_count, 1280]
 
                 # Concat global summary + anomaly tokens → Resampler
-                resampler_input = torch.cat([global_token, aware_tokens], dim=1)  # [B, max_count+1, 1280]
+                resampler_input = torch.cat([global_anomaly_token, aware_tokens], dim=1)  # [B, max_count+1, 1280]
 
                 # Build resampler mask: global token always valid + padding_mask
                 global_valid = torch.ones(B, 1, device=padding_mask.device, dtype=padding_mask.dtype)

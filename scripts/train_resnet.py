@@ -25,6 +25,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 from PIL import Image
 from sklearn.metrics import (
     accuracy_score,

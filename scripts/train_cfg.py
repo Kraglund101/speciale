@@ -3,21 +3,31 @@ CFG-Primary Training — train the conditioned path through the CFG combination.
 
 Standard diffusion training gives eps_cond and eps_null separate losses. The CFG
 combination eps_null + s*(eps_cond - eps_null) for s>1 produces worse denoising
-than either alone. CFG-primary training fixes this by training the conditioned
-path exclusively through the CFG combination:
+than either alone. This script adds a CFG regularizer that trains the conditioned
+path to produce deltas that survive amplification:
 
-    eps_cfg = (1 - s) * eps_null + s * eps_cond
-    L = masked_mse(eps_cfg, noise_target)
+    L_cond = masked_mse(eps_cond, noise)          # standard conditioned loss
+    L_null = masked_mse(eps_null, noise)           # standard unconditional loss
+    eps_cfg = eps_null.detach() + s * (eps_cond - eps_null.detach())
+    L_cfg  = masked_mse(eps_cfg, noise)            # CFG regularizer
+    L = L_cond + L_null + lambda * L_cfg           # lambda=0.1 default
 
-No detach on eps_null. No separate L_null. Varying s regularizes both modes.
+eps_null is detached in L_cfg — gradients only flow through eps_cond. L_cond + L_null
+keep both pathways as competent denoisers. L_cfg pushes eps_cond to produce a delta
+that works under amplification.
 
-Six configs:
-  A: Baseline — standard training + 50% conditioning dropout (single UNet fwd)
+ALL configs use a unified 2B packed UNet forward (cond + null in one batch).
+Config A constructs its loss from eps_cond and eps_null independently.
+Diagnostics are free arithmetic on the two outputs for all configs.
+
+Seven configs:
+  A: Baseline — standard training, both pathways independently
   B: CFG-primary, fixed s
   C: CFG-primary, random s ~ U(s_min, s_max)
   D: CFG-primary, random s + warmup (s_max ramps up)
   E: CFG-primary, learned s(t) via GuidanceSchedule MLP
   F: CFG-primary, learned s(t) + warmup clamp
+  G: CFG-primary, C→E transition (random s first, then learned s(t))
 """
 import csv
 import gc
@@ -33,6 +43,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 from PIL import Image
 from tqdm import tqdm
 
@@ -71,15 +83,16 @@ def _worker_init_fn(worker_id):
 class GuidanceSchedule(nn.Module):
     """Learned guidance scale as a function of normalised timestep.
 
-    Maps t_normalized in [0, 1] (0=clean, 1=full noise) to s >= 1.0
-    via ``s = 1.0 + softplus(MLP(t))``.
+    Maps t_normalized in [0, 1] (0=clean, 1=full noise) to s >= s_floor
+    via ``s = s_floor + softplus(MLP(t))``.
 
-    Initialised so output ~ 0 => softplus(0) ~ 0.69 => s ~ 1.69.
+    Initialised so output ~ 0 => softplus(0) ~ 0.69 => s ~ s_floor + 0.69.
     ~17K params total.
     """
 
-    def __init__(self):
+    def __init__(self, s_floor: float = 1.5):
         super().__init__()
+        self.s_floor = s_floor
         self.net = nn.Sequential(
             nn.Linear(1, 128),
             nn.SiLU(),
@@ -97,9 +110,9 @@ class GuidanceSchedule(nn.Module):
             t_normalized: [B, 1] in [0, 1], where 0=clean, 1=full noise.
 
         Returns:
-            s: [B, 1] guidance scale >= 1.0.
+            s: [B, 1] guidance scale >= s_floor.
         """
-        return 1.0 + F.softplus(self.net(t_normalized))
+        return self.s_floor + F.softplus(self.net(t_normalized))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -116,19 +129,21 @@ def sample_guidance_scale(
     cfg_scale: float = 3.0,
     cfg_s_min: float = 1.5,
     cfg_s_max: float = 4.0,
+    cfg_transition_frac: float = 0.5,
 ) -> torch.Tensor:
     """Return guidance scale s as [B, 1, 1, 1] for broadcasting.
 
     Args:
-        cfg_config: One of A, B, C, D, E, F.
+        cfg_config: One of A, B, C, D, E, F, G.
         batch_size: Number of samples.
         device: Target device.
-        timesteps: [B] diffusion timesteps (needed for E, F).
-        guidance_schedule: GuidanceSchedule module (needed for E, F).
-        progress: Training progress in [0, 1] (needed for D, F).
+        timesteps: [B] diffusion timesteps (needed for E, F, G phase 2).
+        guidance_schedule: GuidanceSchedule module (needed for E, F, G phase 2).
+        progress: Training progress in [0, 1] (needed for D, F, G).
         cfg_scale: Fixed scale for config B.
-        cfg_s_min: Min scale for random sampling (C, D).
-        cfg_s_max: Max scale for random sampling (C, D).
+        cfg_s_min: Min scale for random sampling (C, D, G phase 1).
+        cfg_s_max: Max scale for random sampling (C, D, G phase 1).
+        cfg_transition_frac: Fraction of training to use C before switching to E (G only).
 
     Returns:
         s: [B, 1, 1, 1] guidance scale tensor.
@@ -176,6 +191,18 @@ def sample_guidance_scale(
 
         return s_raw.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1, 1]
 
+    if cfg_config == "G":
+        # Phase 1: random s like Config C. Phase 2: learned s(t) like Config E.
+        if progress < cfg_transition_frac:
+            s = cfg_s_min + torch.rand(batch_size, 1, 1, 1, device=device) * (cfg_s_max - cfg_s_min)
+            return s
+        else:
+            assert guidance_schedule is not None, "GuidanceSchedule required for config G phase 2"
+            assert timesteps is not None, "timesteps required for config G phase 2"
+            t_norm = (timesteps.float() / 1000.0).unsqueeze(-1)  # [B, 1]
+            s_raw = guidance_schedule(t_norm)  # [B, 1]
+            return s_raw.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1, 1]
+
     raise ValueError(f"Unknown cfg_config: {cfg_config}")
 
 
@@ -191,6 +218,9 @@ def compute_cfg_loss(
     cfg_scale: float = 3.0,
     cfg_s_min: float = 1.5,
     cfg_s_max: float = 4.0,
+    cfg_lambda: float = 0.1,
+    cfg_transition_frac: float = 0.5,
+    no_l_cond: bool = False,
     dropout_prob: float = 0.5,
     progress: float = 0.0,
     guidance_schedule: GuidanceSchedule = None,
@@ -217,8 +247,9 @@ def compute_cfg_loss(
 ):
     """Compute CFG-primary loss for configs A-F.
 
-    For configs B-F: packs cond + null into a 2B UNet forward.
-    For config A: single UNet forward with dropout.
+    All configs use a unified 2B packed UNet forward (cond + null).
+    Config A trains both pathways independently. B-F use CFG combination.
+    Diagnostics are free arithmetic on eps_cond/eps_null for all configs.
 
     Returns:
         loss: Scalar loss tensor with gradient.
@@ -281,7 +312,8 @@ def compute_cfg_loss(
             clip_core = clip_core_masks
         else:
             clip_mask = clip_dilated if True else None
-            clip_core = None
+            # Use raw (undilated) mask as core so global token pools anomaly-only
+            clip_core = masks_fp32 if clip_mask is not None else None
         ip_cond = ip_adapter.encode_image(ref_01, mask=clip_mask, core_mask=clip_core)
 
         # --- Multi-crop: encode second crop and concatenate ---
@@ -318,87 +350,67 @@ def compute_cfg_loss(
         # --- Cross-attention mask ---
         cross_attn_mask = dilated_binary_64 if binary_cross_attn_mask else alpha_map_64
 
-        if cfg_config == "A":
-            # ============================================================
-            # Config A: Standard training + conditioning dropout
-            # Single UNet forward, randomly use cond or null IP embeddings
-            # No extra diagnostic forwards — CFG metrics are N/A for baseline
-            # ============================================================
-            ip_null = torch.zeros_like(ip_cond)
-            null_mask = torch.rand(batch_size, device=device) < dropout_prob
+        # ============================================================
+        # ALL configs: unified 2B packed UNet forward
+        # First B = conditioned (text + IP), second B = null (text + zero IP)
+        # ============================================================
+        ip_null = torch.zeros_like(ip_cond)
 
-            ip_embeds = torch.where(
-                null_mask[:, None, None].expand_as(ip_cond),
-                ip_null, ip_cond,
-            )
+        model_input_2b = torch.cat([model_input, model_input], dim=0)
+        text_emb_2b = torch.cat([text_emb, text_emb], dim=0)
+        ip_embeds_2b = torch.cat([ip_cond, ip_null], dim=0)
+        alpha_2b = torch.cat([cross_attn_mask, cross_attn_mask], dim=0)
+        timesteps_2b = torch.cat([timesteps, timesteps], dim=0)
 
-            cross_attn_kwargs = {"ip_adapter_image_embeds": ip_embeds}
-            cross_attn_kwargs["ip_adapter_mask"] = cross_attn_mask
-            if null_token_mask is not None:
-                cross_attn_kwargs["null_token_mask"] = null_token_mask
+        cross_attn_kwargs_2b = {"ip_adapter_image_embeds": ip_embeds_2b}
+        cross_attn_kwargs_2b["ip_adapter_mask"] = alpha_2b
 
-            noise_pred = pipeline.unet(
-                model_input, timesteps,
-                encoder_hidden_states=text_emb,
-                cross_attention_kwargs=cross_attn_kwargs,
-                **t2i_kwargs,
-            ).sample.float()
-            torch.cuda.synchronize()
+        if null_token_mask is not None:
+            null_token_mask_2b = torch.cat([null_token_mask, null_token_mask], dim=0)
+            cross_attn_kwargs_2b["null_token_mask"] = null_token_mask_2b
 
-            # Config A: no separate eps_cond/eps_null available without extra forwards
-            eps_cond_diag = None
-            eps_null_diag = None
+        # T2I features doubled
+        t2i_kwargs_2b = {}
+        if t2i_features is not None:
+            t2i_features_2b = [torch.cat([f, f], dim=0) for f in t2i_features]
+            t2i_kwargs_2b = t2i_adapter.prepare_unet_kwargs(t2i_features_2b)
 
-        else:
-            # ============================================================
-            # Configs B-F: 2B packed UNet forward
-            # ============================================================
-            ip_null = torch.zeros_like(ip_cond)
+        eps_all = pipeline.unet(
+            model_input_2b, timesteps_2b,
+            encoder_hidden_states=text_emb_2b,
+            cross_attention_kwargs=cross_attn_kwargs_2b,
+            **t2i_kwargs_2b,
+        ).sample.float()
+        torch.cuda.synchronize()
 
-            model_input_2b = torch.cat([model_input, model_input], dim=0)
-            text_emb_2b = torch.cat([text_emb, text_emb], dim=0)
-            ip_embeds_2b = torch.cat([ip_cond, ip_null], dim=0)
-            alpha_2b = torch.cat([cross_attn_mask, cross_attn_mask], dim=0)
-            timesteps_2b = torch.cat([timesteps, timesteps], dim=0)
+        eps_cond, eps_null = eps_all.chunk(2, dim=0)
 
-            cross_attn_kwargs_2b = {"ip_adapter_image_embeds": ip_embeds_2b}
-            cross_attn_kwargs_2b["ip_adapter_mask"] = alpha_2b
+        # For diagnostics (detached — free arithmetic)
+        eps_cond_diag = eps_cond.detach()
+        eps_null_diag = eps_null.detach()
 
-            if null_token_mask is not None:
-                null_token_mask_2b = torch.cat([null_token_mask, null_token_mask], dim=0)
-                cross_attn_kwargs_2b["null_token_mask"] = null_token_mask_2b
-
-            # T2I features doubled
-            t2i_kwargs_2b = {}
-            if t2i_features is not None:
-                t2i_features_2b = [torch.cat([f, f], dim=0) for f in t2i_features]
-                t2i_kwargs_2b = t2i_adapter.prepare_unet_kwargs(t2i_features_2b)
-
-            eps_all = pipeline.unet(
-                model_input_2b, timesteps_2b,
-                encoder_hidden_states=text_emb_2b,
-                cross_attention_kwargs=cross_attn_kwargs_2b,
-                **t2i_kwargs_2b,
-            ).sample.float()
-            torch.cuda.synchronize()
-
-            eps_cond, eps_null = eps_all.chunk(2, dim=0)
-
-            # For diagnostics (already have both)
-            eps_cond_diag = eps_cond.detach()
-            eps_null_diag = eps_null.detach()
-
-            # We set noise_pred to None — loss is computed via CFG combination
-            noise_pred = None
-
-    # ── Loss computed OUTSIDE autocast (fp32) ──
+    # ── Loss computed OUTSIDE autocast (fp32), per-sample averaging ──
     weight_expanded = weight_map_64.expand(-1, 4, -1, -1)  # [B, 4, 64, 64]
+    per_w = weight_expanded.sum(dim=(1, 2, 3)).clamp(min=1e-8)  # [B]
+    if per_w.sum() < 1e-8:
+        return torch.tensor(0.0, device=device, requires_grad=True), {}
+
+    noise_f = noise.float()
+
+    # L_cond: standard conditioned loss (always), per-sample
+    diff_cond = (eps_cond - noise_f) ** 2
+    L_cond = ((diff_cond * weight_expanded).sum(dim=(1, 2, 3)) / per_w).mean()
+
+    # L_null: standard unconditional loss (always), per-sample
+    diff_null = (eps_null - noise_f) ** 2
+    L_null = ((diff_null * weight_expanded).sum(dim=(1, 2, 3)) / per_w).mean()
 
     if cfg_config == "A":
-        # Standard MSE loss
-        diff = (noise_pred - noise.float()) ** 2
+        # Config A: both pathways, no CFG regularizer
+        loss = L_cond + L_null
+        diff = diff_cond  # cond-only for core/band diagnostics
     else:
-        # CFG combination
+        # CFG regularizer: eps_null DETACHED so L_cfg only shapes eps_cond
         s = sample_guidance_scale(
             cfg_config, batch_size, device,
             timesteps=timesteps,
@@ -407,26 +419,29 @@ def compute_cfg_loss(
             cfg_scale=cfg_scale,
             cfg_s_min=cfg_s_min,
             cfg_s_max=cfg_s_max,
+            cfg_transition_frac=cfg_transition_frac,
         )
-        eps_cfg = (1 - s) * eps_null + s * eps_cond
-        diff = (eps_cfg - noise.float()) ** 2
+        eps_cfg = eps_null.detach() + s * (eps_cond - eps_null.detach())
+        diff_cfg = (eps_cfg - noise_f) ** 2
+        L_cfg = ((diff_cfg * weight_expanded).sum(dim=(1, 2, 3)) / per_w).mean()
 
-    weighted_diff = diff * weight_expanded
-    weight_sum = weight_expanded.sum()
-    if weight_sum < 1e-8:
-        return torch.tensor(0.0, device=device, requires_grad=True), {}
-    loss = weighted_diff.sum() / weight_sum
+        if no_l_cond:
+            loss = L_null + cfg_lambda * L_cfg
+        else:
+            loss = L_cond + L_null + cfg_lambda * L_cfg
+        diff = diff_cond  # cond-only for core/band diagnostics
 
-    # ── Diagnostics (all no grad) ──
+    # ── Diagnostics (all no grad, free for all configs) ──
     extras = {}
+
     with torch.no_grad():
-        # Core vs band decomposition
+        # Core vs band decomposition — per-sample averaging
         core_expanded = core_mask_64.expand(-1, 4, -1, -1)
-        band_expanded = band_mask_64.expand(-1, 4, -1, -1)
-        core_n = core_expanded.sum().clamp(min=1)
-        band_n = band_expanded.sum().clamp(min=1)
-        extras["core_loss"] = (diff * core_expanded).sum().item() / core_n.item()
-        extras["band_loss"] = (diff * band_expanded).sum().item() / band_n.item()
+        band_w_exp = (weight_map_64 * (1.0 - core_mask_64)).expand(-1, 4, -1, -1)
+        core_per = (diff * core_expanded).sum(dim=(1, 2, 3)) / core_expanded.sum(dim=(1, 2, 3)).clamp(min=1e-8)
+        band_per = (diff * band_w_exp).sum(dim=(1, 2, 3)) / band_w_exp.sum(dim=(1, 2, 3)).clamp(min=1e-8)
+        extras["core_loss"] = core_per.mean().item()
+        extras["band_loss"] = band_per.mean().item()
 
         # s stats
         if cfg_config != "A":
@@ -437,26 +452,17 @@ def compute_cfg_loss(
         else:
             extras["s_mean"] = extras["s_std"] = extras["s_min"] = extras["s_max"] = 0.0
 
-        # CFG diagnostics: only available when we have both eps_cond and eps_null
-        if eps_cond_diag is not None and eps_null_diag is not None:
-            eps_null_d = eps_null_diag.float()
-            eps_cond_d = eps_cond_diag.float()
-            noise_f = noise.float()
-            null_diff = (eps_null_d - noise_f) ** 2
-            cond_diff = (eps_cond_d - noise_f) ** 2
-            extras["L_null"] = (null_diff * weight_expanded).sum().item() / weight_sum.item()
-            extras["L_cond"] = (cond_diff * weight_expanded).sum().item() / weight_sum.item()
-            extras["delta_norm"] = (eps_cond_d - eps_null_d).pow(2).mean().sqrt().item()
+        # CFG diagnostics — per-sample averaging
+        eps_null_d = eps_null_diag.float()
+        eps_cond_d = eps_cond_diag.float()
+        extras["L_null"] = ((diff_null.detach() * weight_expanded).sum(dim=(1, 2, 3)) / per_w).mean().item()
+        extras["L_cond"] = ((diff_cond.detach() * weight_expanded).sum(dim=(1, 2, 3)) / per_w).mean().item()
+        extras["delta_norm"] = (eps_cond_d - eps_null_d).pow(2).mean().sqrt().item()
 
-            for s_eval in [1.0, 1.5, 2.0, 3.0, 5.0]:
-                eps_cfg_eval = (1 - s_eval) * eps_null_d + s_eval * eps_cond_d
-                cfg_diff = (eps_cfg_eval - noise_f) ** 2
-                extras[f"L_cfg_s{s_eval}"] = (cfg_diff * weight_expanded).sum().item() / weight_sum.item()
-        else:
-            # Config A: no CFG diagnostics (would require 2 extra UNet forwards)
-            extras["L_null"] = extras["L_cond"] = extras["delta_norm"] = 0.0
-            for s_eval in [1.0, 1.5, 2.0, 3.0, 5.0]:
-                extras[f"L_cfg_s{s_eval}"] = 0.0
+        for s_eval in [1.5, 2.0, 3.0, 5.0]:
+            eps_cfg_eval = (1 - s_eval) * eps_null_d + s_eval * eps_cond_d
+            cfg_diff = (eps_cfg_eval - noise_f) ** 2
+            extras[f"L_cfg_s{s_eval}"] = ((cfg_diff * weight_expanded).sum(dim=(1, 2, 3)) / per_w).mean().item()
 
     return loss, extras
 
@@ -514,10 +520,10 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     ax = axes[0, 1]
     if has_data:
         cfg_colors = {
-            "1.0": "#2196F3", "1.5": "#4CAF50", "2.0": "#FF9800",
+            "1.5": "#4CAF50", "2.0": "#FF9800",
             "3.0": "#F44336", "5.0": "#9C27B0",
         }
-        for s_val in ["1.0", "1.5", "2.0", "3.0", "5.0"]:
+        for s_val in ["1.5", "2.0", "3.0", "5.0"]:
             key = f"L_cfg_s{s_val}"
             if key in stats and len(stats[key]) > 1:
                 ema_val = _ema_smooth(stats[key], SM)
@@ -732,16 +738,19 @@ def generate_cfg_samples(
     guidance_schedule: GuidanceSchedule = None,
     cfg_config: str = "C",
 ):
-    """Generate 7-row sample grid for CFG training.
+    """Generate sample grid for CFG training.
 
-    Rows:
+    Rows (9 for A-D, 10 for E/F/G):
         0: Real image
         1: Mask
         2: Reference CLIP crop
-        3: Gen s=0.0 (pure null — unconditional baseline)
-        4: Gen s=1.0 (no guidance amplification)
-        5: Gen s=3.0 (fixed high guidance)
-        6: Gen s=learned_mean (E/F) or s=2.0 (A-D)
+        3: Gen s=0.0 (pure uncond)
+        4: Gen s=1.0 (cond, no CFG amplification)
+        5: Gen s=1.5
+        6: Gen s=3.0
+        7: Gen s=5.0
+        8: Gen s=7.5
+        9: Gen learned s(t)  [E/F only]
     """
     import matplotlib.pyplot as plt
 
@@ -809,69 +818,51 @@ def generate_cfg_samples(
             "short_path": short_path,
         })
 
-    # --- Determine s for row 6 ---
-    if cfg_config in ("E", "F") and guidance_schedule is not None:
-        # Use mean of learned schedule evaluated at t=0.5
-        with torch.no_grad():
-            t_probe = torch.tensor([[0.5]], device=device)
-            s_learned = guidance_schedule(t_probe).item()
-        row6_scale = s_learned
-        row6_label = f"Gen (s=learned {row6_scale:.1f})"
-    else:
-        row6_scale = 2.0
-        row6_label = "Gen (s=2.0)"
-
-    # --- Generate ---
+    # --- Generate at ascending scales ---
+    scales = [0.0, 1.0, 1.5, 3.0, 5.0, 7.5]
     gen_kwargs = dict(
         num_steps=30, noise_strength=1.0,
         reference_mode=dataset.reference_mode,
         band_mode=band_mode, t2i_adapter=t2i_adapter,
     )
 
+    has_learned_s = guidance_schedule is not None and cfg_config in ("E", "F", "G")
+
     for i, s in enumerate(all_samples):
+        s["gens"] = []
         with torch.no_grad():
-            # s=0 (pure null): guidance_scale=0 doesn't work with standard generate.
-            # Use guidance_scale=1.0 but zero out IP embeds via cfg_mode trick.
-            # Actually, generate with guidance_scale=1 and cfg_mode to get s=1 behavior.
-            # For "pure null" we pass zeros for reference. Create a zero ref.
-            s["gen_s0"] = generate_anomagic_single(
-                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
-                s["atype"], s["caption"],
-                guidance_scale=1.0, cfg_mode="visual", seed=42 + i,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()
+            for scale in scales:
+                gen = generate_anomagic_single(
+                    pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
+                    s["atype"], s["caption"],
+                    guidance_scale=scale, cfg_mode="visual", seed=42 + i,
+                    **gen_kwargs,
+                )
+                torch.cuda.synchronize()
+                s["gens"].append(gen)
 
-            s["gen_s1"] = generate_anomagic_single(
-                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
-                s["atype"], s["caption"],
-                guidance_scale=1.0, cfg_mode="both", seed=42 + i,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()
-
-            s["gen_s3"] = generate_anomagic_single(
-                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
-                s["atype"], s["caption"],
-                guidance_scale=3.0, cfg_mode="visual", seed=42 + i,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()
-
-            s["gen_s_row6"] = generate_anomagic_single(
-                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
-                s["atype"], s["caption"],
-                guidance_scale=row6_scale, cfg_mode="visual", seed=42 + i,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()
+            # Learned s(t) row for E/F
+            if has_learned_s:
+                gen_learned = generate_anomagic_single(
+                    pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
+                    s["atype"], s["caption"],
+                    guidance_scale=1.0, cfg_mode="visual", seed=42 + i,
+                    guidance_schedule=guidance_schedule,
+                    **gen_kwargs,
+                )
+                torch.cuda.synchronize()
+                s["gen_learned"] = gen_learned
 
     def _to_np(t):
         return ((t[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
 
-    # --- Plot 7-row grid ---
-    fig, axes = plt.subplots(7, n_cols, figsize=(3.5 * n_cols, 22), squeeze=False)
+    # --- Plot grid (3 info + 6 fixed scales + optional learned s(t)) ---
+    n_gen_rows = len(scales) + (1 if has_learned_s else 0)
+    n_rows = 3 + n_gen_rows
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.5 * n_cols, 3.2 * n_rows), squeeze=False)
     ref_label = "clip_crop" if dataset.augment else dataset.reference_mode
+
+    scale_labels = ["s=0 (pure uncond)", "s=1.0 (no CFG)", "s=1.5", "s=3.0", "s=5.0", "s=7.5"]
 
     for i, s in enumerate(all_samples):
         axes[0, i].imshow(s["img_np"])
@@ -886,21 +877,15 @@ def generate_cfg_samples(
         axes[2, i].set_title(f"Reference ({ref_label})", fontsize=7)
         axes[2, i].axis("off")
 
-        axes[3, i].imshow(_to_np(s["gen_s0"]))
-        axes[3, i].set_title("Gen (CFG=1, visual uncond)", fontsize=7)
-        axes[3, i].axis("off")
+        for j, (gen, label) in enumerate(zip(s["gens"], scale_labels)):
+            axes[3 + j, i].imshow(_to_np(gen))
+            axes[3 + j, i].set_title(label, fontsize=7)
+            axes[3 + j, i].axis("off")
 
-        axes[4, i].imshow(_to_np(s["gen_s1"]))
-        axes[4, i].set_title("Gen (s=1.0, no guidance)", fontsize=7)
-        axes[4, i].axis("off")
-
-        axes[5, i].imshow(_to_np(s["gen_s3"]))
-        axes[5, i].set_title("Gen (s=3.0)", fontsize=7)
-        axes[5, i].axis("off")
-
-        axes[6, i].imshow(_to_np(s["gen_s_row6"]))
-        axes[6, i].set_title(row6_label, fontsize=7)
-        axes[6, i].axis("off")
+        if has_learned_s:
+            axes[3 + len(scales), i].imshow(_to_np(s["gen_learned"]))
+            axes[3 + len(scales), i].set_title("learned s(t)", fontsize=7)
+            axes[3 + len(scales), i].axis("off")
 
     plt.suptitle("CFG-Primary Training Samples", fontsize=12)
     plt.tight_layout()
@@ -946,6 +931,9 @@ def train_cfg(
     cfg_scale: float = 3.0,
     cfg_s_min: float = 1.5,
     cfg_s_max: float = 4.0,
+    cfg_lambda: float = 0.1,
+    cfg_transition_frac: float = 0.5,
+    no_l_cond: bool = False,
     dropout_prob: float = 0.5,
     n_steps: int = 50000,
     batch_size: int = 6,
@@ -981,6 +969,8 @@ def train_cfg(
     logit_normal_mean: float = 0.0,
     logit_normal_std: float = 1.0,
     clip_align: bool = True,
+    pilot_subset_path: str = None,
+    pilot_subset_size: int = 0,
 ):
     """Train IP-Adapter with CFG-primary objective."""
     # Seed everything
@@ -993,15 +983,15 @@ def train_cfg(
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Effective UNet batch size for configs B-F
-    unet_bs = batch_size * 2 if cfg_config != "A" else batch_size
+    # All configs use 2B packed forward
+    unet_bs = batch_size * 2
 
     print("=" * 70)
     print("CFG-PRIMARY TRAINING")
     print("=" * 70)
     print(f"Config: {cfg_config}")
     if cfg_config == "A":
-        print(f"  Baseline: standard training + {dropout_prob:.0%} dropout")
+        print(f"  Baseline: both pathways independently (2B forward)")
     elif cfg_config == "B":
         print(f"  Fixed s = {cfg_scale}")
     elif cfg_config in ("C", "D"):
@@ -1012,6 +1002,9 @@ def train_cfg(
         print(f"  Learned s(t) via GuidanceSchedule MLP")
         if cfg_config == "F":
             print(f"  Warmup: s clamped during early training")
+    elif cfg_config == "G":
+        print(f"  C->E transition: random s ~ U({cfg_s_min}, {cfg_s_max}) then learned s(t)")
+        print(f"  Transition at {cfg_transition_frac:.0%} of training")
     print(f"Batch size: {batch_size} (UNet sees {unet_bs})")
     print(f"Learning rate (scratch): {lr}")
     print(f"Learning rate (pretrained): {lr_pretrained}")
@@ -1019,6 +1012,10 @@ def train_cfg(
     print(f"Training steps: {n_steps}")
     print(f"IP-Adapter: {ip_adapter_type} (K={ip_adapter_k})")
     print(f"Band mode: {band_mode}")
+    if no_l_cond:
+        print(f"Loss: L_null + {cfg_lambda} * L_cfg (no L_cond, eps_null detached in L_cfg)")
+    else:
+        print(f"Loss: L_cond + L_null + {cfg_lambda} * L_cfg (eps_null detached in L_cfg)")
     print(f"Loss ratio: {loss_core_ratio:.0%} core / {1-loss_core_ratio:.0%} band")
     print(f"Augmentation: {augment}")
     print(f"Visual mode: {visual_mode}")
@@ -1056,6 +1053,26 @@ def train_cfg(
 
     n_captions = sum(1 for s in dataset.samples if s.get("caption"))
     print(f"Samples with captions: {n_captions}/{len(dataset.samples)}")
+
+    # =========================================
+    # Pilot Subset (optional, in-place)
+    # =========================================
+    from src.utils.pilot_subset import (
+        generate_pilot_subset, apply_pilot_subset,
+        load_pilot_subset, save_pilot_subset,
+    )
+    if pilot_subset_path and Path(pilot_subset_path).exists():
+        pilot_indices = load_pilot_subset(pilot_subset_path)
+        apply_pilot_subset(dataset, pilot_indices)
+    elif pilot_subset_size > 0 and pilot_subset_size < len(dataset):
+        pilot_indices = generate_pilot_subset(
+            dataset.samples, dataset.type_to_samples,
+            target_size=pilot_subset_size,
+        )
+        save_pilot_subset(pilot_indices, save_dir / "pilot_indices.json")
+        apply_pilot_subset(dataset, pilot_indices)
+    # In-place modification — dataset keeps .samples, .type_to_samples, etc.
+    full_dataset = dataset
 
     # =========================================
     # Initialize Pipeline
@@ -1099,10 +1116,10 @@ def train_cfg(
         print(f"\nT2I-Adapter ({t2i_adapter_mode}): {n_t2i:,} params")
 
     # =========================================
-    # Initialize GuidanceSchedule (configs E, F)
+    # Initialize GuidanceSchedule (configs E, F, G)
     # =========================================
     guidance_schedule = None
-    if cfg_config in ("E", "F"):
+    if cfg_config in ("E", "F", "G"):
         guidance_schedule = GuidanceSchedule().to(device)
         n_gs = sum(p.numel() for p in guidance_schedule.parameters())
         print(f"\nGuidanceSchedule: {n_gs:,} params")
@@ -1190,10 +1207,9 @@ def train_cfg(
         l2sp_reg = L2SPRegularizer(a_decay, lambda_sp=lambda_sp)
         print(f"\n  L2-SP: {l2sp_reg.total_elements:,} elements, lambda={lambda_sp:.1e}")
 
-    # AMP
+    # AMP — bf16 has same exponent range as fp32, no GradScaler needed
     use_amp = True
     amp_dtype = torch.bfloat16
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     pipeline.text_encoder.float()
     pipeline.vae.float()
@@ -1263,7 +1279,7 @@ def train_cfg(
         torch.cuda.empty_cache()
         try:
             generate_cfg_samples(
-                pipeline, ip_adapter, dataset,
+                pipeline, ip_adapter, full_dataset,
                 save_dir / "samples_0_pretrained.png", device,
                 band_mode=band_mode, t2i_adapter=t2i_adapter,
                 guidance_schedule=guidance_schedule,
@@ -1286,6 +1302,9 @@ def train_cfg(
         "cfg_scale": cfg_scale,
         "cfg_s_min": cfg_s_min,
         "cfg_s_max": cfg_s_max,
+        "cfg_lambda": cfg_lambda,
+        "cfg_transition_frac": cfg_transition_frac,
+        "no_l_cond": no_l_cond,
         "dropout_prob": dropout_prob,
         "visual_mode": visual_mode,
         "batch_size": batch_size,
@@ -1335,7 +1354,7 @@ def train_cfg(
     if stats_fh.tell() == 0:
         stats_fh.write(
             "step,loss,L_null,L_cond,delta_norm,"
-            "L_cfg_s1.0,L_cfg_s1.5,L_cfg_s2.0,L_cfg_s3.0,L_cfg_s5.0,"
+            "L_cfg_s1.5,L_cfg_s2.0,L_cfg_s3.0,L_cfg_s5.0,"
             "s_mean,s_std,s_min,s_max,"
             "core_loss,band_loss,grad_norm,"
             "attn_gate,ff_gate,lr_pretrained,lr_scratch,l2sp,progress\n"
@@ -1374,6 +1393,9 @@ def train_cfg(
             cfg_scale=cfg_scale,
             cfg_s_min=cfg_s_min,
             cfg_s_max=cfg_s_max,
+            cfg_lambda=cfg_lambda,
+            cfg_transition_frac=cfg_transition_frac,
+            no_l_cond=no_l_cond,
             dropout_prob=dropout_prob,
             progress=progress,
             guidance_schedule=guidance_schedule,
@@ -1415,13 +1437,11 @@ def train_cfg(
             torch.cuda.empty_cache()
             continue
 
-        scaler.scale(loss).backward()
+        loss.backward()
         torch.cuda.synchronize()
         _t_bwd = time.time()
-        scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         _t_opt = time.time()
 
         loss_val = loss_diff.item()
@@ -1449,7 +1469,7 @@ def train_cfg(
             f"{step},{loss_val},"
             f"{loss_extras.get('L_null', 0.0)},{loss_extras.get('L_cond', 0.0)},"
             f"{loss_extras.get('delta_norm', 0.0)},"
-            f"{loss_extras.get('L_cfg_s1.0', 0.0)},{loss_extras.get('L_cfg_s1.5', 0.0)},"
+            f"{loss_extras.get('L_cfg_s1.5', 0.0)},"
             f"{loss_extras.get('L_cfg_s2.0', 0.0)},{loss_extras.get('L_cfg_s3.0', 0.0)},"
             f"{loss_extras.get('L_cfg_s5.0', 0.0)},"
             f"{loss_extras.get('s_mean', 0.0)},{loss_extras.get('s_std', 0.0)},"
@@ -1489,7 +1509,7 @@ def train_cfg(
             torch.cuda.empty_cache()
             try:
                 generate_cfg_samples(
-                    pipeline, ip_adapter, dataset,
+                    pipeline, ip_adapter, full_dataset,
                     save_dir / f"samples_{step + 1}.png", device,
                     band_mode=band_mode, t2i_adapter=t2i_adapter,
                     guidance_schedule=guidance_schedule,
@@ -1520,7 +1540,7 @@ def train_cfg(
             torch.cuda.empty_cache()
             try:
                 generate_cfg_samples(
-                    pipeline, ip_adapter, dataset,
+                    pipeline, ip_adapter, full_dataset,
                     save_dir / f"samples_{step + 1}.png", device,
                     band_mode=band_mode, t2i_adapter=t2i_adapter,
                     guidance_schedule=guidance_schedule,
@@ -1557,7 +1577,7 @@ def train_cfg(
     torch.cuda.empty_cache()
     try:
         generate_cfg_samples(
-            pipeline, ip_adapter, dataset,
+            pipeline, ip_adapter, full_dataset,
             save_dir / "final_samples.png", device,
             band_mode=band_mode, t2i_adapter=t2i_adapter,
             guidance_schedule=guidance_schedule,
@@ -1608,15 +1628,22 @@ if __name__ == "__main__":
 
     # CFG-specific
     parser.add_argument("--cfg-config", type=str, required=True,
-                        choices=["A", "B", "C", "D", "E", "F"],
+                        choices=["A", "B", "C", "D", "E", "F", "G"],
                         help="CFG training config (A=baseline, B=fixed s, C=random s, "
-                             "D=random s+warmup, E=learned s(t), F=learned s(t)+warmup)")
+                             "D=random s+warmup, E=learned s(t), F=learned s(t)+warmup, "
+                             "G=C->E transition)")
     parser.add_argument("--cfg-scale", type=float, default=3.0,
                         help="Fixed guidance scale for config B (default 3.0)")
     parser.add_argument("--cfg-s-min", type=float, default=1.5,
                         help="Min guidance scale for random sampling (configs C, D; default 1.5)")
     parser.add_argument("--cfg-s-max", type=float, default=4.0,
                         help="Max guidance scale for random sampling (configs C, D; default 4.0)")
+    parser.add_argument("--cfg-lambda", type=float, default=0.1,
+                        help="Weight for L_cfg regularizer (default 0.1)")
+    parser.add_argument("--cfg-transition-frac", type=float, default=0.5,
+                        help="Fraction of training to run C before switching to E (config G only, default 0.5)")
+    parser.add_argument("--no-l-cond", action="store_true",
+                        help="Drop L_cond from loss: L = L_null + lambda*L_cfg (eps_cond only trained via CFG)")
     parser.add_argument("--dropout-prob", type=float, default=0.5,
                         help="Conditioning dropout probability for config A (default 0.5)")
 
@@ -1642,7 +1669,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda-sp", type=float, default=0.0,
                         help="L2-SP regularization strength (default 0=disabled)")
     parser.add_argument("--batch-size", type=int, default=6,
-                        help="Batch size (UNet sees 2x for configs B-F)")
+                        help="Batch size (UNet sees 2x for all configs)")
     parser.add_argument("--ip-adapter-type", type=str, default="plus",
                         choices=["standard", "plus"])
     parser.add_argument("--ip-adapter-k", type=int, default=16, choices=[1, 4, 16])
@@ -1673,6 +1700,12 @@ if __name__ == "__main__":
     parser.add_argument("--logit-normal-mean", type=float, default=0.0)
     parser.add_argument("--logit-normal-std", type=float, default=1.0)
 
+    # Pilot subset
+    parser.add_argument("--pilot-subset-path", type=str, default=None,
+                        help="Path to saved pilot subset JSON (list of indices)")
+    parser.add_argument("--pilot-subset-size", type=int, default=0,
+                        help="Auto-generate balanced pilot subset of this size (0=use all data)")
+
     args = parser.parse_args()
 
     project_root = Path(__file__).parent.parent
@@ -1697,6 +1730,9 @@ if __name__ == "__main__":
         cfg_scale=args.cfg_scale,
         cfg_s_min=args.cfg_s_min,
         cfg_s_max=args.cfg_s_max,
+        cfg_lambda=args.cfg_lambda,
+        cfg_transition_frac=args.cfg_transition_frac,
+        no_l_cond=args.no_l_cond,
         dropout_prob=args.dropout_prob,
         n_steps=args.steps,
         save_every=args.save_every,
@@ -1730,4 +1766,6 @@ if __name__ == "__main__":
         logit_normal_mean=args.logit_normal_mean,
         logit_normal_std=args.logit_normal_std,
         clip_align=not args.no_clip_align,
+        pilot_subset_path=args.pilot_subset_path,
+        pilot_subset_size=args.pilot_subset_size,
     )

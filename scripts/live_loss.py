@@ -2,12 +2,14 @@
 
 Reads:
   - losses.txt (one float per line) for per-step diffusion loss
-  - stats.csv (14 cols) for diagnostics
+  - stats.csv (23 cols) for diagnostics
 
-Three layouts (auto-detected, matches save_loss_plot):
-  Default:       [Trend, Core/Band, Band/Core Ratio] / [Gates, Grad Norm, (empty)]
-  x0 ablation:   [Trend, Core/Band, x0 vs eps + annealing] / [Gates, Band/Core Ratio, Grad Norm]
-  ctx annealing:  [Trend, Core/Band, Ctx dropout schedule] / [Gates, Band/Core Ratio, Grad Norm]
+3x3 grid layout:
+  Row 0: [Cond Modes] [Core/Band (both cond)] [Band/Core Ratio | x0 | ctx]
+  Row 1: [Gates] [Role Embeddings] [Grad Norm]
+  Row 2: [IP/Text Output Ratio] [IP Entropy] [IP/Text Key Ratio]
+
+Core/Band and Band/Core use s_core/s_band directly (both-cond filtered).
 
 Usage:
   python live_loss.py <losses_file>
@@ -42,23 +44,18 @@ def parse_losses(filepath: str) -> list:
 
 
 def parse_stats(filepath: str) -> dict:
-    """Parse stats.csv → dict of arrays.
-
-    Supports 14-col and 17-col formats:
-    step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,
-    x0_ratio,x0_loss,eps_loss,grad_norm,ctx_drop[,emb_global_norm,emb_anomaly_norm,emb_normal_norm]
-    """
+    """Parse stats.csv -> dict of arrays (23 columns)."""
     steps, diff_losses = [], []
     attn_gates, ff_gates, l2sp_vals = [], [], []
     core_losses, band_losses = [], []
     x0_ratios, x0_losses, eps_losses = [], [], []
     grad_norms, ctx_drops = [], []
     emb_global, emb_anomaly, emb_normal = [], [], []
+    loss_keeps, loss_drop_viss, loss_drop_txts = [], [], []
+    ip_entropies, ip_norm_ratios, ip_key_ratios = [], [], []
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             header = f.readline().strip()
-            cols = header.split(",")
-            n_cols = len(cols)
             for line in f:
                 parts = line.strip().split(",")
                 if len(parts) < 7:
@@ -78,6 +75,12 @@ def parse_stats(filepath: str) -> dict:
                 emb_global.append(float(parts[14]) if len(parts) > 14 else 0.0)
                 emb_anomaly.append(float(parts[15]) if len(parts) > 15 else 0.0)
                 emb_normal.append(float(parts[16]) if len(parts) > 16 else 0.0)
+                loss_keeps.append(float(parts[17]) if len(parts) > 17 else 0.0)
+                loss_drop_viss.append(float(parts[18]) if len(parts) > 18 else 0.0)
+                loss_drop_txts.append(float(parts[19]) if len(parts) > 19 else 0.0)
+                ip_entropies.append(float(parts[20]) if len(parts) > 20 else 0.0)
+                ip_norm_ratios.append(float(parts[21]) if len(parts) > 21 else 0.0)
+                ip_key_ratios.append(float(parts[22]) if len(parts) > 22 else 0.0)
     except FileNotFoundError:
         pass
     return {
@@ -96,6 +99,12 @@ def parse_stats(filepath: str) -> dict:
         "emb_global": np.array(emb_global),
         "emb_anomaly": np.array(emb_anomaly),
         "emb_normal": np.array(emb_normal),
+        "loss_keep": np.array(loss_keeps),
+        "loss_drop_vis": np.array(loss_drop_viss),
+        "loss_drop_txt": np.array(loss_drop_txts),
+        "ip_entropy": np.array(ip_entropies),
+        "ip_norm_ratio": np.array(ip_norm_ratios),
+        "ip_key_ratio": np.array(ip_key_ratios),
     }
 
 
@@ -151,7 +160,7 @@ def main():
     stats_path = str(Path(run_dir) / "stats.csv")
     run_title = _load_run_title(run_dir)
 
-    fig, axes = plt.subplots(2, 3, figsize=(21, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(21, 15))
     fig.canvas.manager.set_window_title(run_title)
     fig.suptitle(run_title, fontsize=11, fontweight="bold")
     all_axes = list(axes.flat)
@@ -167,7 +176,6 @@ def main():
 
         steps = np.arange(len(losses))
         arr = np.array(losses)
-        ema_fast = ema_smooth(arr, SMOOTH_FAST)
         ema_slow = ema_smooth(arr, SM)
 
         s_steps = stats["steps"]
@@ -178,6 +186,12 @@ def main():
         s_x0r = stats["x0_ratio"]
         s_gn = stats["grad_norm"]
         s_ctx = stats["ctx_drop"]
+        s_loss_keep = stats["loss_keep"]
+        s_loss_dv = stats["loss_drop_vis"]
+        s_loss_dt = stats["loss_drop_txt"]
+        s_ip_ent = stats["ip_entropy"]
+        s_ip_nr = stats["ip_norm_ratio"]
+        s_ip_kr = stats["ip_key_ratio"]
 
         has_cb = len(s_steps) > 0 and len(s_core) > 0 and s_core.any()
         has_x0 = len(s_steps) > 0 and s_x0.any()
@@ -187,74 +201,146 @@ def main():
         has_emb = (len(s_steps) > 0
                    and (stats["emb_global"].any() or stats["emb_anomaly"].any()
                         or stats["emb_normal"].any()))
-
-        # Precompute core/band decomposition
-        core_ps = band_ps = ce = be = None
-        if has_cb:
-            w_core_s = 0.8 * s_core
-            w_band_s = 0.2 * s_band
-            w_total_s = np.maximum(w_core_s + w_band_s, 1e-10)
-            core_share = w_core_s / w_total_s
-            core_share_ps = np.interp(steps, s_steps, core_share)
-            core_ps = arr * core_share_ps / 0.8
-            band_ps = arr * (1.0 - core_share_ps) / 0.2
-            ce = ema_smooth(core_ps, SM)
-            be = ema_smooth(band_ps, SM)
+        has_cond_modes = (len(s_steps) > 0
+                          and (s_loss_keep.any() or s_loss_dv.any() or s_loss_dt.any()))
+        has_ip_diag = len(s_steps) > 0 and (s_ip_ent.any() or s_ip_nr.any())
 
         # =====================================================
-        # Choose layout based on data presence
+        # 3x3 grid — row 0 varies, rows 1-2 fixed
+        # Row 0: [Cond Modes] [Core/Band (both cond)] [Band/Core | x0 | ctx]
+        # Row 1: [Gates] [Role Embeddings] [Grad Norm]
+        # Row 2: [IP/Text Output Ratio] [IP Entropy] [IP/Text Key Ratio]
         # =====================================================
+        ax_trend, ax_cb = axes[0, 0], axes[0, 1]
         ax_x0eps = None
         ax_ctx = None
         if has_x0:
-            # x0 ABLATION LAYOUT
-            ax_trend, ax_cb, ax_x0eps = axes[0, 0], axes[0, 1], axes[0, 2]
-            ax_gates, ax_ratio, ax_gn = axes[1, 0], axes[1, 1], axes[1, 2]
+            ax_x0eps = axes[0, 2]
         elif has_ctx:
-            # CTX ANNEALING LAYOUT
-            ax_trend, ax_cb, ax_ctx = axes[0, 0], axes[0, 1], axes[0, 2]
-            ax_gates, ax_ratio, ax_gn = axes[1, 0], axes[1, 1], axes[1, 2]
+            ax_ctx = axes[0, 2]
         else:
-            # DEFAULT LAYOUT
-            ax_trend, ax_cb, ax_ratio = axes[0, 0], axes[0, 1], axes[0, 2]
-            ax_gates, ax_gn = axes[1, 0], axes[1, 1]
-            if has_emb:
-                axes[1, 2].set_visible(True)
-            else:
-                axes[1, 2].set_visible(False)
+            ax_ratio = axes[0, 2]
 
-        # === [0,0] Smooth Trend ===
-        ax_trend.plot(steps, ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
-        ax_trend.plot(steps, ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SMOOTH_FAST})")
+        # Row 1 fixed
+        ax_gates = axes[1, 0]
+        ax_emb = axes[1, 1]
+        ax_gn = axes[1, 2]
+        # Row 2 fixed: IP Output Ratio, IP Key Ratio, IP Entropy
+        ax_ip_ratio = axes[2, 0]
+        ax_ip_key = axes[2, 1]
+        ax_ip_ent = axes[2, 2]
+
+        # === [0,0] Conditioning Mode Losses ===
+        if has_cond_modes:
+            def _mode_ema_filtered(vals, steps_arr, sm):
+                """EMA over nonzero entries only."""
+                nz = vals > 0
+                if not nz.any():
+                    return np.array([]), np.array([])
+                return steps_arr[nz], ema_smooth(vals[nz], sm)
+            all_ema = ema_smooth(stats["diff_loss"], SM)
+            ax_trend.plot(s_steps, all_ema, color="black", linewidth=2.5,
+                          label=f"Overall ({all_ema[-1]:.4f})")
+            k_st, k_em = _mode_ema_filtered(s_loss_keep, s_steps, SM)
+            if len(k_em):
+                ax_trend.plot(k_st, k_em, color="#2196F3", linewidth=2,
+                              label=f"Keep both ({k_em[-1]:.4f})")
+            dv_st, dv_em = _mode_ema_filtered(s_loss_dv, s_steps, SM)
+            if len(dv_em):
+                ax_trend.plot(dv_st, dv_em, color="#F44336", linewidth=2,
+                              label=f"Keep text ({dv_em[-1]:.4f})")
+            dt_st, dt_em = _mode_ema_filtered(s_loss_dt, s_steps, SM)
+            if len(dt_em):
+                ax_trend.plot(dt_st, dt_em, color="#FF9800", linewidth=2,
+                              label=f"Keep visual ({dt_em[-1]:.4f})")
+            ax_trend.set_title(f"Loss by Conditioning Mode, EMA({SM}) \u2014 step {len(losses)}")
+        else:
+            ax_trend.plot(steps, ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
+            ax_trend.set_title(f"Smooth Trend \u2014 step {len(losses)}, trend: {ema_slow[-1]:.4f}")
         ax_trend.set_xlabel("Step")
         ax_trend.set_ylabel("Loss")
-        ax_trend.set_title(f"Smooth Trend \u2014 step {len(losses)}, trend: {ema_slow[-1]:.4f}")
-        ax_trend.legend(loc="upper right", fontsize=8)
+        ax_trend.legend(loc="upper left", fontsize=8)
         ax_trend.grid(True, alpha=0.3)
 
-        # === [0,1] Core vs Band ===
-        if has_cb and ce is not None:
-            ax_cb.fill_between(steps, 0, ce, color="#2196F3", alpha=0.4)
-            ax_cb.fill_between(steps, ce, ce + be, color="#FF9800", alpha=0.4)
-            ax_cb.plot(steps, ce, color="#1565C0", linewidth=1.5, label="Core")
-            ax_cb.plot(steps, ce + be, color="#E65100", linewidth=1.5, label="Band (stacked)")
-            ax_cb.plot(steps, ema_slow, color="black", linewidth=2, linestyle="--",
-                       label=f"0.8\u00d7core+0.2\u00d7band = {ema_slow[-1]:.4f}")
-            last_x = steps[-1]
-            ax_cb.annotate(f"{ce[-1]:.3f}", xy=(last_x, ce[-1] / 2),
-                           fontsize=9, fontweight="bold", color="#1565C0", ha="right")
-            ax_cb.annotate(f"{be[-1]:.3f}",
-                           xy=(last_x, ce[-1] + be[-1] / 2),
-                           fontsize=9, fontweight="bold", color="#E65100", ha="right")
-            ax_cb.legend(loc="upper right", fontsize=8)
-            ax_cb.set_title(f"Core vs Band, EMA({SM}) \u2014 weighted: {ema_slow[-1]:.4f}")
+        # === [0,1] Core vs Band (both cond only — direct from stats) ===
+        if has_cb:
+            ce = ema_smooth(s_core, SM)
+            be = ema_smooth(s_band, SM)
+            combined = 0.8 * ce + 0.2 * be
+            ax_cb.fill_between(s_steps, 0, ce, color="#2196F3", alpha=0.4)
+            ax_cb.fill_between(s_steps, ce, ce + be, color="#FF9800", alpha=0.4)
+            ax_cb.plot(s_steps, ce, color="#1565C0", linewidth=1.5, label=f"Core ({ce[-1]:.4f})")
+            ax_cb.plot(s_steps, ce + be, color="#E65100", linewidth=1.5, label=f"Band stacked ({be[-1]:.4f})")
+            ax_cb.plot(s_steps, combined, color="black", linewidth=2, linestyle="--",
+                       label=f"0.8\u00d7core+0.2\u00d7band = {combined[-1]:.4f}")
+            ax_cb.legend(loc="upper left", fontsize=8)
+            ax_cb.set_title(f"Core vs Band (both cond only), EMA({SM})")
         else:
             ax_cb.set_title("Core vs Band (no data yet)")
         ax_cb.set_xlabel("Step")
         ax_cb.set_ylabel("Per-pixel MSE")
         ax_cb.grid(True, alpha=0.3)
 
-        # === Gates ===
+        # === [0,2] Band/Core Ratio (default) | x0 | ctx ===
+        if ax_x0eps is not None:
+            # x0 vs eps + annealing
+            x0_vals_f = s_x0[s_x0 > 0]
+            eps_vals_f = s_eps[s_eps > 0]
+            x0_steps_f = s_steps[s_x0 > 0]
+            eps_steps_f = s_steps[s_eps > 0]
+            lines = []
+            if len(x0_vals_f) > 1:
+                x0_slow = ema_smooth(x0_vals_f, SM)
+                l1, = ax_x0eps.plot(x0_steps_f, x0_slow, color="#D32F2F", linewidth=2.5, label="x0 loss")
+                lines.append(l1)
+            if len(eps_vals_f) > 1:
+                eps_slow = ema_smooth(eps_vals_f, SM)
+                l2, = ax_x0eps.plot(eps_steps_f, eps_slow, color="#1976D2", linewidth=2.5, label="\u03b5 loss")
+                lines.append(l2)
+            ax_ann = ax_x0eps.twinx()
+            l3, = ax_ann.plot(s_steps, s_x0r, color="#FF9800", linewidth=1.5,
+                              linestyle="--", alpha=0.7, label="x0 ratio")
+            ax_ann.fill_between(s_steps, 0, s_x0r, color="#FFE0B2", alpha=0.3)
+            ax_ann.set_ylim(-0.05, 1.1)
+            ax_ann.set_ylabel("x0 ratio", color="#FF9800")
+            lines.append(l3)
+            ax_x0eps.legend(handles=lines, loc="upper left", fontsize=7)
+            title_parts = []
+            if len(x0_vals_f) > 1:
+                title_parts.append(f"x0={ema_smooth(x0_vals_f, SM)[-1]:.4f}")
+            if len(eps_vals_f) > 1:
+                title_parts.append(f"\u03b5={ema_smooth(eps_vals_f, SM)[-1]:.4f}")
+            ax_x0eps.set_title(f"x0 vs \u03b5 Loss, EMA({SM}) \u2014 {', '.join(title_parts)}")
+            ax_x0eps.set_xlabel("Step")
+            ax_x0eps.set_ylabel("Loss")
+            ax_x0eps.grid(True, alpha=0.3)
+        elif ax_ctx is not None:
+            ax_ctx.plot(s_steps, s_ctx, color="#D32F2F", linewidth=2.5, label="Ctx dropout rate")
+            ax_ctx.fill_between(s_steps, 0, s_ctx, color="#EF9A9A", alpha=0.3)
+            ax_ctx.set_ylim(-0.05, 1.1)
+            ax_ctx.set_title(f"Context Dropout Schedule \u2014 current: {s_ctx[-1]:.1%}")
+            ax_ctx.set_xlabel("Step")
+            ax_ctx.set_ylabel("Dropout rate")
+            ax_ctx.legend(loc="upper left", fontsize=8)
+            ax_ctx.grid(True, alpha=0.3)
+        else:
+            # Default: Band/Core Ratio (both cond only — direct from stats)
+            if has_cb:
+                safe_core = np.maximum(s_core, 1e-10)
+                cbr = s_band / safe_core
+                cbre = ema_smooth(cbr, SM)
+                ax_ratio.plot(s_steps, cbr, color="gray", linewidth=0.5, alpha=0.3, label="Raw")
+                ax_ratio.plot(s_steps, cbre, color="purple", linewidth=2, label=f"EMA ({SM})")
+                ax_ratio.axhline(y=1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+                ax_ratio.set_title(f"Band/Core Ratio (both cond only), EMA({SM}) \u2014 {cbre[-1]:.2f}x")
+                ax_ratio.legend(loc="upper left", fontsize=8)
+            else:
+                ax_ratio.set_title("Band/Core Ratio (no data yet)")
+            ax_ratio.set_xlabel("Step")
+            ax_ratio.set_ylabel("Band / Core")
+            ax_ratio.grid(True, alpha=0.3)
+
+        # === [1,0] Gates ===
         if len(s_steps) > 0:
             ax_gates.plot(s_steps, stats["attn_gate"], color="blue",
                           linewidth=1.5, label="Attn gate")
@@ -269,132 +355,89 @@ def main():
         ax_gates.set_ylabel("Gate value")
         ax_gates.grid(True, alpha=0.3)
 
-        # === Band/Core Ratio (used in x0 and ctx layouts at [1,1], default at [0,2]) ===
-        if has_x0 or has_ctx:
-            # ratio goes in [1,1]
-            if has_cb and core_ps is not None:
-                safe_core_ps = np.maximum(core_ps, 1e-10)
-                ratio_ps = band_ps / safe_core_ps
-                ratio_ema = ema_smooth(ratio_ps, SM)
-                ax_ratio.plot(steps, ratio_ps, color="gray", linewidth=0.5, alpha=0.3, label="Raw")
-                ax_ratio.plot(steps, ratio_ema, color="purple", linewidth=2, label=f"EMA ({SM})")
-                ax_ratio.axhline(y=1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-                ax_ratio.set_title(f"Band/Core Ratio, EMA({SM}) \u2014 {ratio_ema[-1]:.2f}x")
-                ax_ratio.legend(loc="upper left", fontsize=8)
-            else:
-                ax_ratio.set_title("Band/Core Ratio (no data yet)")
-            ax_ratio.set_xlabel("Step")
-            ax_ratio.set_ylabel("Band / Core")
-            ax_ratio.grid(True, alpha=0.3)
+        # === [1,1] Role Embedding Norms ===
+        if has_emb:
+            s_eg = stats["emb_global"]
+            s_ea = stats["emb_anomaly"]
+            s_en = stats["emb_normal"]
+            ax_emb.plot(s_steps, s_eg, color="#4CAF50", linewidth=2,
+                        label=f"Global ({s_eg[-1]:.4f})")
+            ax_emb.plot(s_steps, s_ea, color="#F44336", linewidth=2,
+                        label=f"Anomaly ({s_ea[-1]:.4f})")
+            ax_emb.plot(s_steps, s_en, color="#2196F3", linewidth=2,
+                        label=f"Band ({s_en[-1]:.4f})")
+            ax_emb.set_title("Role Embedding Norms")
+            ax_emb.legend(loc="upper left", fontsize=8)
         else:
-            # Default layout: ratio is at [0,2]
-            if has_cb and core_ps is not None:
-                safe_core_ps = np.maximum(core_ps, 1e-10)
-                ratio_ps = band_ps / safe_core_ps
-                ratio_ema = ema_smooth(ratio_ps, SM)
-                ax_ratio.plot(steps, ratio_ps, color="gray", linewidth=0.5, alpha=0.3, label="Raw")
-                ax_ratio.plot(steps, ratio_ema, color="purple", linewidth=2, label=f"EMA ({SM})")
-                ax_ratio.axhline(y=1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-                ax_ratio.set_title(f"Band/Core Ratio, EMA({SM}) \u2014 {ratio_ema[-1]:.2f}x")
-                ax_ratio.legend(loc="upper left", fontsize=8)
-            else:
-                ax_ratio.set_title("Band/Core Ratio (no data yet)")
-            ax_ratio.set_xlabel("Step")
-            ax_ratio.set_ylabel("Band / Core")
-            ax_ratio.grid(True, alpha=0.3)
+            ax_emb.set_title("Role Embedding Norms (no data)")
+        ax_emb.set_xlabel("Step")
+        ax_emb.set_ylabel("L2 Norm")
+        ax_emb.grid(True, alpha=0.3)
 
-        # === Grad Norm ===
+        # === [1,2] Grad Norm ===
         if has_gn:
             gn_ema = ema_smooth(s_gn, SM)
             ax_gn.plot(s_steps, s_gn, color="gray", linewidth=0.5, alpha=0.3, label="Raw")
             ax_gn.plot(s_steps, gn_ema, color="#388E3C", linewidth=2.5, label=f"EMA ({SM})")
             ax_gn.axhline(y=1.0, color="black", linewidth=1, linestyle="--", alpha=0.5, label="clip=1.0")
             ax_gn.set_title(f"Grad Norm \u2014 {gn_ema[-1]:.2f}")
-            ax_gn.legend(loc="upper right", fontsize=8)
+            ax_gn.legend(loc="upper left", fontsize=8)
         else:
             ax_gn.set_title("Grad Norm (no data yet)")
         ax_gn.set_xlabel("Step")
         ax_gn.set_ylabel("Gradient L2 norm")
         ax_gn.grid(True, alpha=0.3)
 
-        # === x0 vs eps + annealing (x0 layout only) ===
-        if ax_x0eps is not None:
-            x0_vals_f = s_x0[s_x0 > 0]
-            eps_vals_f = s_eps[s_eps > 0]
-            x0_steps_f = s_steps[s_x0 > 0]
-            eps_steps_f = s_steps[s_eps > 0]
-
-            lines = []
-            if len(x0_vals_f) > 1:
-                x0_slow = ema_smooth(x0_vals_f, SM)
-                l1, = ax_x0eps.plot(x0_steps_f, x0_slow, color="#D32F2F", linewidth=2.5, label="x0 loss")
-                lines.append(l1)
-            if len(eps_vals_f) > 1:
-                eps_slow = ema_smooth(eps_vals_f, SM)
-                l2, = ax_x0eps.plot(eps_steps_f, eps_slow, color="#1976D2", linewidth=2.5, label="\u03b5 loss")
-                lines.append(l2)
-
-            # Annealing schedule on twin axis
-            ax_ann = ax_x0eps.twinx()
-            l3, = ax_ann.plot(s_steps, s_x0r, color="#FF9800", linewidth=1.5,
-                              linestyle="--", alpha=0.7, label="x0 ratio")
-            ax_ann.fill_between(s_steps, 0, s_x0r, color="#FFE0B2", alpha=0.3)
-            ax_ann.set_ylim(-0.05, 1.1)
-            ax_ann.set_ylabel("x0 ratio", color="#FF9800")
-            lines.append(l3)
-
-            ax_x0eps.legend(handles=lines, loc="upper right", fontsize=7)
-            title_parts = []
-            if len(x0_vals_f) > 1:
-                title_parts.append(f"x0={ema_smooth(x0_vals_f, SM)[-1]:.4f}")
-            if len(eps_vals_f) > 1:
-                title_parts.append(f"\u03b5={ema_smooth(eps_vals_f, SM)[-1]:.4f}")
-            ax_x0eps.set_title(f"x0 vs \u03b5 Loss, EMA({SM}) \u2014 {', '.join(title_parts)}")
-            ax_x0eps.set_xlabel("Step")
-            ax_x0eps.set_ylabel("Loss")
-            ax_x0eps.grid(True, alpha=0.3)
-
-        # === Ctx dropout schedule (ctx layout only) ===
-        if ax_ctx is not None:
-            ax_ctx.plot(s_steps, s_ctx, color="#D32F2F", linewidth=2.5, label="Ctx dropout rate")
-            ax_ctx.fill_between(s_steps, 0, s_ctx, color="#EF9A9A", alpha=0.3)
-            ax_ctx.set_ylim(-0.05, 1.1)
-            ax_ctx.set_title(f"Context Dropout Schedule \u2014 current: {s_ctx[-1]:.1%}")
-            ax_ctx.set_xlabel("Step")
-            ax_ctx.set_ylabel("Dropout rate")
-            ax_ctx.legend(loc="upper right", fontsize=8)
-            ax_ctx.grid(True, alpha=0.3)
-
-        # === Role Embedding Norms ===
-        if has_emb:
-            s_eg = stats["emb_global"]
-            s_ea = stats["emb_anomaly"]
-            s_en = stats["emb_normal"]
-            if has_x0 or has_ctx:
-                # x0/ctx layouts: all 6 slots used, add as twinx on gates
-                ax_emb = ax_gates.twinx()
-                ax_emb.plot(s_steps, s_eg, color="#4CAF50", linewidth=1.5,
-                            linestyle="--", alpha=0.7, label="Global")
-                ax_emb.plot(s_steps, s_ea, color="#F44336", linewidth=1.5,
-                            linestyle="--", alpha=0.7, label="Anomaly")
-                ax_emb.plot(s_steps, s_en, color="#2196F3", linewidth=1.5,
-                            linestyle="--", alpha=0.7, label="Band")
-                ax_emb.set_ylabel("Emb L2 norm", fontsize=8)
-                ax_emb.legend(loc="upper right", fontsize=7)
+        # === [2,0] IP Output Ratio (||ip_out|| / ||h_pre||) ===
+        if has_ip_diag and s_ip_nr.any():
+            nz = s_ip_nr > 0
+            if nz.any():
+                ema_nr = ema_smooth(s_ip_nr[nz], SM)
+                ax_ip_ratio.plot(s_steps[nz], ema_nr, color="purple", linewidth=2,
+                                 label=f"ratio ({ema_nr[-1]:.4f})")
+                ax_ip_ratio.legend(loc="upper left", fontsize=8)
+                ax_ip_ratio.set_title(f"IP Output Ratio ||ip_out||/||h_pre|| \u2014 {ema_nr[-1]:.4f}")
             else:
-                # Default layout: dedicated subplot at [1,2]
-                ax_emb = axes[1, 2]
-                ax_emb.plot(s_steps, s_eg, color="#4CAF50", linewidth=2,
-                            label=f"Global ({s_eg[-1]:.4f})")
-                ax_emb.plot(s_steps, s_ea, color="#F44336", linewidth=2,
-                            label=f"Anomaly ({s_ea[-1]:.4f})")
-                ax_emb.plot(s_steps, s_en, color="#2196F3", linewidth=2,
-                            label=f"Band ({s_en[-1]:.4f})")
-                ax_emb.set_xlabel("Step")
-                ax_emb.set_ylabel("L2 Norm")
-                ax_emb.set_title("Role Embedding Norms")
-                ax_emb.legend(loc="upper left", fontsize=8)
-                ax_emb.grid(True, alpha=0.3)
+                ax_ip_ratio.set_title("IP Output Ratio ||ip_out||/||h_pre|| (no nonzero data)")
+        else:
+            ax_ip_ratio.set_title("IP Output Ratio ||ip_out||/||h_pre|| (no data yet)")
+        ax_ip_ratio.set_xlabel("Step")
+        ax_ip_ratio.set_ylabel("Ratio")
+        ax_ip_ratio.grid(True, alpha=0.3)
+
+        # === [2,1] IP Attention Entropy ===
+        if has_ip_diag and s_ip_ent.any():
+            nz = s_ip_ent > 0
+            if nz.any():
+                ema_ent = ema_smooth(s_ip_ent[nz], SM)
+                ax_ip_ent.plot(s_steps[nz], ema_ent, color="teal", linewidth=2,
+                               label=f"entropy ({ema_ent[-1]:.2f})")
+                ax_ip_ent.legend(loc="upper left", fontsize=8)
+                ax_ip_ent.set_title(f"IP Attention Entropy \u2014 {ema_ent[-1]:.2f}")
+            else:
+                ax_ip_ent.set_title("IP Attention Entropy (no nonzero data)")
+        else:
+            ax_ip_ent.set_title("IP Attention Entropy (no data yet)")
+        ax_ip_ent.set_xlabel("Step")
+        ax_ip_ent.set_ylabel("Entropy")
+        ax_ip_ent.grid(True, alpha=0.3)
+
+        # === [2,2] IP Key Ratio (||ip_k|| / ||text_k||) ===
+        if has_ip_diag and s_ip_kr.any():
+            nz = s_ip_kr > 0
+            if nz.any():
+                ema_kr = ema_smooth(s_ip_kr[nz], SM)
+                ax_ip_key.plot(s_steps[nz], ema_kr, color="#E65100", linewidth=2,
+                               label=f"key ratio ({ema_kr[-1]:.4f})")
+                ax_ip_key.legend(loc="upper left", fontsize=8)
+                ax_ip_key.set_title(f"IP Key Ratio ||ip_k||/||text_k|| \u2014 {ema_kr[-1]:.4f}")
+            else:
+                ax_ip_key.set_title("IP Key Ratio ||ip_k||/||text_k|| (no nonzero data)")
+        else:
+            ax_ip_key.set_title("IP Key Ratio ||ip_k||/||text_k|| (no data yet)")
+        ax_ip_key.set_xlabel("Step")
+        ax_ip_key.set_ylabel("Ratio")
+        ax_ip_key.grid(True, alpha=0.3)
 
         fig.tight_layout()
 

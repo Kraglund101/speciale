@@ -26,6 +26,8 @@ from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 from torch.utils.data import DataLoader
 from PIL import Image
 import numpy as np
@@ -45,8 +47,52 @@ from src.utils.optim_utils import (
 )
 from src.utils.crop_utils import clip_crop_multi
 from src.inference.generate import generate_anomagic_single
+from scripts.validation_suite import run_validation_suite
+from src.data.split_by_type import build_reverse_mapping
 
-_SEED = 42
+_SEED = 43
+
+
+class EMA:
+    """Exponential Moving Average of model parameters.
+
+    Maintains shadow copies of all trainable parameters. After each optimizer
+    step, call update() to blend current weights into the shadow. Use
+    store()/apply()/restore() to temporarily swap EMA weights in for inference.
+    """
+
+    def __init__(self, parameters, decay: float = 0.9999):
+        self.decay = decay
+        self.params = list(parameters)
+        self.shadow = [p.data.clone() for p in self.params]
+
+    @torch.no_grad()
+    def update(self):
+        for s, p in zip(self.shadow, self.params):
+            s.mul_(self.decay).add_(p.data, alpha=1.0 - self.decay)
+
+    def store(self):
+        """Save current params before swapping in EMA for inference."""
+        self.backup = [p.data.clone() for p in self.params]
+
+    def apply(self):
+        """Swap EMA weights into the model."""
+        for p, s in zip(self.params, self.shadow):
+            p.data.copy_(s)
+
+    def restore(self):
+        """Restore original (training) params after inference."""
+        for p, b in zip(self.params, self.backup):
+            p.data.copy_(b)
+        del self.backup
+
+    def state_dict(self):
+        return {"shadow": self.shadow, "decay": self.decay}
+
+    def load_state_dict(self, state):
+        self.shadow = [s.to(self.params[0].device) for s in state["shadow"]]
+        self.decay = state["decay"]
+
 
 def _worker_init_fn(worker_id):
     """Seed Python random + numpy in DataLoader workers (required on Windows/spawn)."""
@@ -95,9 +141,9 @@ def train_anomagic(
     unfreeze_qo: str = "",
     unfreeze_qo_lr: float = 1e-5,
     # Conditioning dropout for CFG (mutually exclusive per-sample)
-    drop_image_prob: float = 0.10,
-    drop_text_prob: float = 0.10,
-    drop_both_prob: float = 0.05,
+    drop_image_prob: float = 0.15,
+    drop_text_prob: float = 0.05,
+    drop_both_prob: float = 0.0,
     # Data augmentation
     augment: bool = False,
     # Resume from checkpoint
@@ -135,12 +181,19 @@ def train_anomagic(
     x0_no_context: bool = False,
     x0_warmup_frac: float = 0.2,
     x0_hold_frac: float = 0.1,
+    # Attention diagnostics interval (ip_entropy, norm ratio)
+    diag_interval: int = 1,
     # CLIP-UNet alignment: roundtripped masks + role embeddings
     clip_align: bool = True,
+    # Validation suite
+    val_data_dir: Path = None,
+    val_panels: list = None,
+    # EMA (Exponential Moving Average)
+    ema_decay: float = 0.9999,
 ):
     """Train Anomagic: IP-Adapter + captions (2 pathways)."""
     # Seed everything for reproducibility across ablation runs
-    seed = 42
+    seed = 43
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -176,6 +229,7 @@ def train_anomagic(
     print(f"Multi-crop: {multi_crop}")
     print(f"CLIP-UNet alignment: {clip_align}")
     print(f"Optimizer: {optimizer_type}")
+    print(f"EMA: {'off' if ema_decay <= 0 else f'decay={ema_decay}'}")
     print(f"Noise offset: {noise_offset}")
     print(f"Timestep sampling: {timestep_sampling}" +
           (f" (mean={logit_normal_mean}, std={logit_normal_std})" if timestep_sampling == "logit_normal" else ""))
@@ -275,6 +329,9 @@ def train_anomagic(
         if lora_mode == "cross":
             # Cross-attention only: attn2 layers (text/IP conditioning)
             target_modules = [r"attn2\.(to_k|to_q|to_v|to_out\.0)"]
+        elif lora_mode == "mid_up":
+            # All attention (attn1+attn2) in mid_block and up_blocks only
+            target_modules = [r"(mid_block|up_blocks)\.\d+\..*?(attn1|attn2)\.(to_k|to_q|to_v|to_out\.0)"]
         else:
             # All attention layers: self-attention (attn1) + cross-attention (attn2)
             target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
@@ -457,12 +514,9 @@ def train_anomagic(
         print(f"\n  L2-SP: {l2sp_reg.total_elements:,} elements, lambda={lambda_sp:.1e}")
 
     # AMP autocast: bf16 forward pass, trainable params stay fp32.
-    # bf16 has same exponent range as fp32 (max ~3.4e38), eliminating the
-    # fp16 overflow class (65504 ceiling) in attention dot products and sums.
-    # GradScaler kept as belt-and-suspenders for gradient underflow.
+    # AMP — bf16 has same exponent range as fp32, no GradScaler needed
     use_amp = True
     amp_dtype = torch.bfloat16
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     pipeline.text_encoder.float()
     pipeline.vae.float()
@@ -473,6 +527,7 @@ def train_anomagic(
     # =========================================
     start_step = 0
     resumed_losses = []
+    _resumed_ema_state = None
 
     if resume_dir is not None:
         resume_dir = Path(resume_dir)
@@ -537,10 +592,28 @@ def train_anomagic(
                         loaded += 1
                 print(f"  Loaded {loaded} unfrozen W_Q/W_O tensors")
 
+            # EMA state (loaded after EMA is initialized below)
+            _resumed_ema_state = state.get("ema", None)
+            if _resumed_ema_state is not None:
+                print(f"  Found EMA state in checkpoint (will load after init)")
+
             del state
             torch.cuda.empty_cache()
         else:
             print(f"  WARNING: {state_path} not found, starting fresh (IP-Adapter weights loaded)")
+
+    # =========================================
+    # EMA (Exponential Moving Average)
+    # =========================================
+    ema = None
+    if ema_decay > 0:
+        ema = EMA(trainable_params, decay=ema_decay)
+        if _resumed_ema_state is not None:
+            ema.load_state_dict(_resumed_ema_state)
+            _resumed_ema_state = None
+            print(f"\n  EMA loaded from checkpoint: decay={ema_decay}, {len(trainable_params)} params")
+        else:
+            print(f"\n  EMA initialized fresh: decay={ema_decay}, {len(trainable_params)} params")
 
     remaining_steps = n_steps - start_step
     if remaining_steps <= 0:
@@ -554,14 +627,14 @@ def train_anomagic(
         print("\nGenerating step-0 baseline samples (pretrained IP-Adapter, no training)...")
         torch.cuda.empty_cache()
         try:
-            generate_anomagic_samples(
-                pipeline, ip_adapter, dataset,
-                save_dir / "samples_0_pretrained.png", device,
-                band_mode=band_mode,
-                t2i_adapter=t2i_adapter,
-                cfg_mode=cfg_mode,
+            run_validation_suite(
+                pipeline, ip_adapter, step=0,
+                output_dir=save_dir, device=device,
+                band_mode=band_mode, t2i_adapter=t2i_adapter,
+                clip_align=clip_align, data_root=data_root,
+                val_data_dir=val_data_dir, captions_file=captions_file,
+                panels=val_panels,
             )
-            print(f"  Saved to {save_dir / 'samples_0_pretrained.png'}")
         except RuntimeError as e:
             print(f"  Warning: baseline sample generation failed ({e})")
         torch.cuda.empty_cache()
@@ -607,6 +680,7 @@ def train_anomagic(
         "x0_warmup_frac": x0_warmup_frac,
         "x0_hold_frac": x0_hold_frac,
         "clip_align": clip_align,
+        "ema_decay": ema_decay,
     }
     with open(config_file, "w") as cf:
         json.dump(run_config, cf, indent=2)
@@ -625,10 +699,24 @@ def train_anomagic(
     g = torch.Generator()
     g.manual_seed(seed)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                        num_workers=4, pin_memory=False, persistent_workers=True,
+                        num_workers=4, pin_memory=True, persistent_workers=True,
                         drop_last=True, worker_init_fn=_worker_init_fn,
                         generator=g)
     data_iter = iter(infinite_loader(loader))
+
+    # Cache empty-string text encoding for conditioning dropout (constant, no need to recompute)
+    with torch.no_grad():
+        uncond_text = pipeline.encode_text([""] * batch_size, enable_grad=False)
+
+    # Per-meta-group loss tracking (semantic groups from split_by_type.py)
+    _type_to_group = build_reverse_mapping()
+    meta_group_losses = defaultdict(list)  # group_name → list of recent losses
+    meta_group_file = save_dir / "meta_group_loss.csv"
+    meta_group_fh = open(meta_group_file, "a")
+    # Sorted group names for consistent CSV column order
+    _all_groups = sorted(set(_type_to_group.values()))
+    if meta_group_fh.tell() == 0:
+        meta_group_fh.write("step," + ",".join(_all_groups) + "\n")
 
     # Keep loss file open for the entire run (avoids Windows file locking issues)
     loss_fh = open(loss_file, "a")
@@ -637,7 +725,7 @@ def train_anomagic(
     stats_file = save_dir / "stats.csv"
     stats_fh = open(stats_file, "a")
     if stats_fh.tell() == 0:
-        stats_fh.write("step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,x0_ratio,x0_loss,eps_loss,grad_norm,ctx_drop,emb_global_norm,emb_anomaly_norm,emb_normal_norm\n")
+        stats_fh.write("step,loss,lr_pretrained,lr_scratch,attn_gate,ff_gate,l2sp,core_loss,band_loss,x0_ratio,x0_loss,eps_loss,grad_norm,ctx_drop,emb_global_norm,emb_anomaly_norm,emb_normal_norm,loss_keep,loss_drop_vis,loss_drop_txt,ip_entropy,ip_norm_ratio,ip_key_ratio\n")
 
     pbar = tqdm(range(start_step, n_steps), desc="Training", initial=start_step, total=n_steps)
     skipped_nan = 0
@@ -719,6 +807,8 @@ def train_anomagic(
             x0_no_context=x0_no_context,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
+            collect_diagnostics=(step % diag_interval == 0),
+            uncond_text=uncond_text,
         )
 
         # L2-SP regularization (fp32, outside autocast)
@@ -737,12 +827,12 @@ def train_anomagic(
             torch.cuda.empty_cache()
             continue
 
-        scaler.scale(loss).backward()
+        loss.backward()
         torch.cuda.synchronize()  # TDR prevention
-        scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
+        if ema is not None:
+            ema.update()
 
         loss_val = loss_diff.item()
         losses.append(loss_val)
@@ -769,6 +859,12 @@ def train_anomagic(
         band_l = loss_extras.get("band_loss", 0.0)
         x0_l = loss_extras.get("x0_loss", 0.0)
         eps_l = loss_extras.get("eps_loss", 0.0)
+        l_keep = loss_extras.get("loss_keep", 0.0)
+        l_dv = loss_extras.get("loss_drop_vis", 0.0)
+        l_dt = loss_extras.get("loss_drop_txt", 0.0)
+        ip_ent = loss_extras.get("ip_entropy", 0.0)
+        ip_nr = loss_extras.get("ip_norm_ratio", 0.0)
+        ip_kr = loss_extras.get("ip_key_ratio", 0.0)
         # Role embedding norms
         emb_g = emb_a = emb_n = 0.0
         if hasattr(ip_adapter, 'masked_self_attn'):
@@ -776,11 +872,23 @@ def train_anomagic(
             emb_g = sa.emb_global.data.norm().item()
             emb_a = sa.emb_anomaly.data.norm().item()
             emb_n = sa.emb_normal.data.norm().item()
-        stats_fh.write(f"{step},{loss_val},{lr_pre},{lr_scr},{attn_gate},{ff_gate},{l2sp_val},{core_l},{band_l},{x0_ratio},{x0_l},{eps_l},{grad_norm},{ctx_drop},{emb_g},{emb_a},{emb_n}\n")
+        stats_fh.write(f"{step},{loss_val},{lr_pre},{lr_scr},{attn_gate},{ff_gate},{l2sp_val},{core_l},{band_l},{x0_ratio},{x0_l},{eps_l},{grad_norm},{ctx_drop},{emb_g},{emb_a},{emb_n},{l_keep},{l_dv},{l_dt},{ip_ent},{ip_nr},{ip_kr}\n")
         stats_fh.flush()
 
         for t in batch_types:
             type_losses[t].append(loss_val)
+            group = _type_to_group.get(t)
+            if group:
+                meta_group_losses[group].append(loss_val)
+
+        # Log per-meta-group rolling average every 100 steps
+        if (step + 1) % 100 == 0:
+            vals = []
+            for grp in _all_groups:
+                recent = meta_group_losses[grp][-200:]
+                vals.append(f"{sum(recent)/len(recent):.5f}" if recent else "")
+            meta_group_fh.write(f"{step}," + ",".join(vals) + "\n")
+            meta_group_fh.flush()
 
         if step % 50 == 0:
             avg = sum(losses[-100:]) / max(len(losses[-100:]), 1)
@@ -793,16 +901,22 @@ def train_anomagic(
         # Early sample snapshots (no checkpoint, just samples + loss plot)
         if (step + 1) in (500, 1000, 2000) and (step + 1) % save_every != 0:
             torch.cuda.empty_cache()
+            if ema is not None:
+                ema.store()
+                ema.apply()
             try:
-                generate_anomagic_samples(
-                    pipeline, ip_adapter, dataset,
-                    save_dir / f"samples_{step + 1}.png", device,
-                    band_mode=band_mode,
-                    t2i_adapter=t2i_adapter,
-                    cfg_mode=cfg_mode,
+                run_validation_suite(
+                    pipeline, ip_adapter, step=step + 1,
+                    output_dir=save_dir, device=device,
+                    band_mode=band_mode, t2i_adapter=t2i_adapter,
+                    clip_align=clip_align, data_root=data_root,
+                    val_data_dir=val_data_dir, captions_file=captions_file,
+                    panels=val_panels,
                 )
             except RuntimeError as e:
                 print(f"  Warning: sample generation failed ({e}), continuing training...")
+            if ema is not None:
+                ema.restore()
             torch.cuda.empty_cache()
             save_loss_plot(losses, save_dir / "stats.csv",
                            save_dir / f"loss_{step + 1}.png")
@@ -820,6 +934,7 @@ def train_anomagic(
                 step=step + 1,
                 losses=losses,
                 qo_params_named=qo_params_named if qo_params_named else None,
+                ema=ema,
             )
             # Delete previous checkpoint (keep only latest + final)
             if prev_ckpt_dir is not None and prev_ckpt_dir.exists():
@@ -827,21 +942,29 @@ def train_anomagic(
                 shutil.rmtree(prev_ckpt_dir)
             prev_ckpt_dir = ckpt_dir
             torch.cuda.empty_cache()
+            if ema is not None:
+                ema.store()
+                ema.apply()
             try:
-                generate_anomagic_samples(
-                    pipeline, ip_adapter, dataset,
-                    save_dir / f"samples_{step + 1}.png", device,
-                    band_mode=band_mode,
-                    t2i_adapter=t2i_adapter,
-                    cfg_mode=cfg_mode,
+                run_validation_suite(
+                    pipeline, ip_adapter, step=step + 1,
+                    output_dir=save_dir, device=device,
+                    band_mode=band_mode, t2i_adapter=t2i_adapter,
+                    clip_align=clip_align, data_root=data_root,
+                    val_data_dir=val_data_dir, captions_file=captions_file,
+                    panels=val_panels,
                 )
             except RuntimeError as e:
                 print(f"  Warning: sample generation failed ({e}), continuing training...")
+            if ema is not None:
+                ema.restore()
             torch.cuda.empty_cache()
             save_loss_plot(losses, save_dir / "stats.csv",
                            save_dir / f"loss_{step + 1}.png")
 
     loss_fh.close()
+    stats_fh.close()
+    meta_group_fh.close()
 
     # =========================================
     # Final Outputs
@@ -854,7 +977,7 @@ def train_anomagic(
     # Final loss plot (same 2x3 layout as checkpoints)
     save_loss_plot(losses, save_dir / "stats.csv", save_dir / "training_loss.png")
 
-    # Final checkpoint
+    # Final checkpoint (with EMA state)
     save_anomagic_checkpoint(
         ip_adapter, optimizer,
         save_dir / "checkpoint_final",
@@ -864,20 +987,27 @@ def train_anomagic(
         step=n_steps,
         losses=losses,
         qo_params_named=qo_params_named if qo_params_named else None,
+        ema=ema,
     )
 
-    # Final sample grid
+    # Final sample grid (use EMA weights)
     torch.cuda.empty_cache()
+    if ema is not None:
+        ema.store()
+        ema.apply()
     try:
-        generate_anomagic_samples(
-            pipeline, ip_adapter, dataset,
-            save_dir / "final_samples.png", device,
-            band_mode=band_mode,
-            t2i_adapter=t2i_adapter,
-            cfg_mode=cfg_mode,
+        run_validation_suite(
+            pipeline, ip_adapter, step=n_steps,
+            output_dir=save_dir, device=device,
+            band_mode=band_mode, t2i_adapter=t2i_adapter,
+            clip_align=clip_align, data_root=data_root,
+            val_data_dir=val_data_dir, captions_file=captions_file,
+            panels=val_panels,
         )
     except RuntimeError as e:
         print(f"  Warning: final samples failed ({e})")
+    if ema is not None:
+        ema.restore()
 
     print(f"\nResults saved to: {save_dir}")
 
@@ -892,9 +1022,9 @@ def compute_anomagic_loss(
     loss_core_ratio: float = 0.8,
     binary_cross_attn_mask: bool = False,
     t2i_adapter=None,
-    drop_image_prob: float = 0.10,
-    drop_text_prob: float = 0.10,
-    drop_both_prob: float = 0.05,
+    drop_image_prob: float = 0.15,
+    drop_text_prob: float = 0.05,
+    drop_both_prob: float = 0.0,
     clip_masks=None,
     clip_core_masks=None,
     # Multi-crop (Mode 4)
@@ -916,6 +1046,10 @@ def compute_anomagic_loss(
     # AMP
     use_amp: bool = True,
     amp_dtype: torch.dtype = torch.bfloat16,
+    # Diagnostics
+    collect_diagnostics: bool = False,
+    # Cached uncond text embedding (precomputed, avoids per-step recomputation)
+    uncond_text=None,
 ):
     """
     Compute masked diffusion loss with 2 conditioning pathways.
@@ -1000,7 +1134,8 @@ def compute_anomagic_loss(
             clip_core = clip_core_masks  # [B, 1, 224, 224] core mask for role embeddings
         else:
             clip_mask = clip_dilated if reference_mode == "full" else None
-            clip_core = None
+            # Use raw (undilated) mask as core so global token pools anomaly-only
+            clip_core = masks_fp32 if reference_mode == "full" else None
         ip_image_embeds = ip_adapter.encode_image(ref_01, mask=clip_mask, core_mask=clip_core)  # [B, K, cross_attn_dim]
 
         # --- Multi-crop: encode second crop and concatenate ---
@@ -1025,18 +1160,28 @@ def compute_anomagic_loss(
 
         # --- Conditioning dropout for CFG (mutually exclusive, per-sample) ---
         # Matches IP-Adapter training: single rand(), cumulative thresholds.
-        # Image drop = zeros on ip_image_embeds. Text drop = empty-string encoding.
+        # Image drop = mask-multiply (avoids in-place on grad tensor).
+        # Text drop = empty-string encoding (text_emb has no grad, safe in-place).
+        # drop_mode: 0=keep_both, 1=drop_image, 2=drop_text, 3=drop_both
+        drop_modes = [0] * batch_size
         if (drop_image_prob + drop_text_prob + drop_both_prob) > 0 and batch_size > 0:
-            uncond_text = pipeline.encode_text([""] * batch_size, enable_grad=False)
+            # Use cached uncond_text if provided, else compute (fallback)
+            if uncond_text is None:
+                uncond_text = pipeline.encode_text([""] * batch_size, enable_grad=False)
+            drop_image_mask = torch.ones(batch_size, 1, 1, device=device)
             for i in range(batch_size):
                 r = random.random()
                 if r < drop_image_prob:
-                    ip_image_embeds[i] = 0.0
+                    drop_image_mask[i] = 0.0
+                    drop_modes[i] = 1
                 elif r < drop_image_prob + drop_text_prob:
                     text_emb[i] = uncond_text[i]
+                    drop_modes[i] = 2
                 elif r < drop_image_prob + drop_text_prob + drop_both_prob:
-                    ip_image_embeds[i] = 0.0
+                    drop_image_mask[i] = 0.0
                     text_emb[i] = uncond_text[i]
+                    drop_modes[i] = 3
+            ip_image_embeds = ip_image_embeds * drop_image_mask  # new tensor, no in-place
 
         # --- Inpainting inputs — latent-space dilated mask defines regeneration region ---
         mask_latents = dilated_binary_64  # binary [B, 1, 64, 64]
@@ -1087,6 +1232,11 @@ def compute_anomagic_loss(
         # Multi-crop null masking
         if null_token_mask is not None:
             cross_attn_kwargs["null_token_mask"] = null_token_mask
+        # Attention diagnostics (ip_entropy, norm ratio)
+        diagnostics = None
+        if collect_diagnostics:
+            diagnostics = {}
+            cross_attn_kwargs["diagnostics"] = diagnostics
 
         noise_pred = pipeline.unet(
             model_input,
@@ -1120,19 +1270,33 @@ def compute_anomagic_loss(
 
     weighted_diff = diff * weight_expanded
 
-    weight_sum = weight_expanded.sum()
-    if weight_sum < 1e-8:
+    # Per-sample loss: each sample contributes equally regardless of anomaly size
+    per_sample_w = weight_expanded.sum(dim=(1, 2, 3)).clamp(min=1e-8)  # [B]
+    per_sample_loss = weighted_diff.sum(dim=(1, 2, 3)) / per_sample_w  # [B]
+    if per_sample_loss.numel() == 0:
         return torch.tensor(0.0, device=device, requires_grad=True), {}
-    loss = weighted_diff.sum() / weight_sum
+    loss = per_sample_loss.mean()
 
     # --- Diagnostics: core vs band loss (detached, no grad impact) ---
+    # Per-sample averaging so 0.8*core + 0.2*band = loss_keep exactly.
+    # Only from fully-conditioned samples (drop_mode == 0).
     with torch.no_grad():
-        core_expanded = core_mask_64.expand_as(noise_pred)
-        band_expanded = band_mask_64.expand_as(noise_pred)
-        core_n = core_expanded.sum().clamp(min=1)
-        band_n = band_expanded.sum().clamp(min=1)
-        core_loss_val = (diff * core_expanded).sum() / core_n
-        band_loss_val = (diff * band_expanded).sum() / band_n
+        dm = torch.tensor(drop_modes, device=device)
+        both_cond = (dm == 0)  # [B]
+
+        # Per-sample core/band MSE (mean over pixels per sample, then avg over both-cond)
+        # Band uses weight_map weights (not binary mask) to respect inner/outer scaling,
+        # ensuring 0.8*core + 0.2*band = loss_keep exactly.
+        core_exp = core_mask_64.expand_as(noise_pred)   # [B,C,H,W]
+        band_w_exp = (weight_map_64 * (1.0 - core_mask_64)).expand_as(noise_pred)  # [B,C,H,W]
+        core_per = (diff * core_exp).sum(dim=(1, 2, 3)) / core_exp.sum(dim=(1, 2, 3)).clamp(min=1e-8)  # [B]
+        band_per = (diff * band_w_exp).sum(dim=(1, 2, 3)) / band_w_exp.sum(dim=(1, 2, 3)).clamp(min=1e-8)  # [B]
+        if both_cond.any():
+            core_loss_val = core_per[both_cond].mean()
+            band_loss_val = band_per[both_cond].mean()
+        else:
+            core_loss_val = torch.tensor(0.0, device=device)
+            band_loss_val = torch.tensor(0.0, device=device)
 
         # x0 vs eps per-objective loss (only when mixed batch)
         x0_loss_val = 0.0
@@ -1149,11 +1313,68 @@ def compute_anomagic_loss(
             x0_loss_val = x0_loss_val.item()
             eps_loss_val = eps_loss_val.item()
 
+        # Per-conditioning-mode loss (reuses per_sample_loss from training loss above)
+        # drop_modes: 0=keep_both, 1=drop_image, 2=drop_text, 3=drop_both
+        loss_keep = loss_drop_vis = loss_drop_txt = 0.0
+        for mode_val, key in [(0, "keep"), (1, "drop_vis"), (2, "drop_txt")]:
+            sel = dm == mode_val
+            if sel.any():
+                mode_loss = per_sample_loss[sel].mean().item()
+                if key == "keep":
+                    loss_keep = mode_loss
+                elif key == "drop_vis":
+                    loss_drop_vis = mode_loss
+                else:
+                    loss_drop_txt = mode_loss
+
+    # Aggregate attention diagnostics (GPU tensors → single .item() sync)
+    ip_entropy_val = 0.0
+    ip_norm_ratio_val = 0.0
+    ip_key_ratio_val = 0.0
+    if diagnostics:
+        n_layers = 0
+        ip_out_sum = None
+        h_pre_sum = None
+        entropy_sum = None
+        ip_k_sum = None
+        text_k_sum = None
+        for dkey, dval in diagnostics.items():
+            if dkey.endswith("/ip_out_norm"):
+                ip_out_sum = dval if ip_out_sum is None else ip_out_sum + dval
+                n_layers += 1
+            elif dkey.endswith("/h_pre_norm"):
+                h_pre_sum = dval if h_pre_sum is None else h_pre_sum + dval
+            elif dkey.endswith("/ip_entropy"):
+                entropy_sum = dval if entropy_sum is None else entropy_sum + dval
+            elif dkey.endswith("/ip_k_norm"):
+                ip_k_sum = dval if ip_k_sum is None else ip_k_sum + dval
+            elif dkey.endswith("/text_k_norm"):
+                text_k_sum = dval if text_k_sum is None else text_k_sum + dval
+        if n_layers > 0:
+            # Stack and transfer to CPU in one sync
+            agg = torch.stack([ip_out_sum, h_pre_sum, entropy_sum, ip_k_sum, text_k_sum])
+            agg_cpu = agg.float().cpu()  # single GPU→CPU sync
+            ip_out_avg = agg_cpu[0].item() / n_layers
+            h_pre_avg = agg_cpu[1].item() / n_layers
+            ip_entropy_val = agg_cpu[2].item() / n_layers
+            ip_k_avg = agg_cpu[3].item() / n_layers
+            text_k_avg = agg_cpu[4].item() / n_layers
+            if h_pre_avg > 1e-8:
+                ip_norm_ratio_val = ip_out_avg / h_pre_avg
+            if text_k_avg > 1e-8:
+                ip_key_ratio_val = ip_k_avg / text_k_avg
+
     return loss, {
         "core_loss": core_loss_val.item(),
         "band_loss": band_loss_val.item(),
         "x0_loss": x0_loss_val,
         "eps_loss": eps_loss_val,
+        "loss_keep": loss_keep,
+        "loss_drop_vis": loss_drop_vis,
+        "loss_drop_txt": loss_drop_txt,
+        "ip_entropy": ip_entropy_val,
+        "ip_norm_ratio": ip_norm_ratio_val,
+        "ip_key_ratio": ip_key_ratio_val,
     }
 
 
@@ -1168,10 +1389,13 @@ def _ema_smooth(values, smoothing: float = 0.99):
 
 
 def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
-    """Render 2x3 training diagnostics plot. Three layouts (auto-detected):
-    - Default: trend, core/band, band/core ratio, gates, grad norm, role embeddings
-    - x0 ablation: trend, core/band, x0 vs eps + annealing, gates, band/core ratio, grad norm
-    - ctx annealing: trend, core/band, ctx dropout schedule, gates, band/core ratio, grad norm
+    """Render 3x3 training diagnostics plot.
+
+    Row 0: [Cond Modes] [Core/Band (both cond)] [Band/Core Ratio | x0 | ctx]
+    Row 1: [Gates] [Role Embeddings] [Grad Norm]
+    Row 2: [IP/Text Output Ratio] [IP Entropy] [IP/Text Key Ratio]
+
+    Core/Band and Band/Core use s_core/s_band directly (both-cond filtered).
     """
     if len(losses) < 2:
         return
@@ -1182,11 +1406,11 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     core_losses, band_losses = [], []
     x0_losses, eps_losses, x0_ratios, grad_norms, ctx_drops = [], [], [], [], []
     emb_global_norms, emb_anomaly_norms, emb_normal_norms = [], [], []
+    loss_keeps, loss_drop_viss, loss_drop_txts = [], [], []
+    ip_entropies, ip_norm_ratios, ip_key_ratios = [], [], []
     try:
         with open(stats_file, "r", encoding="utf-8") as f:
             header = f.readline().strip()
-            cols = header.split(",")
-            n_cols = len(cols)
             for line in f:
                 parts = line.strip().split(",")
                 if len(parts) < 7:
@@ -1206,6 +1430,12 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
                 emb_global_norms.append(float(parts[14]) if len(parts) > 14 else 0.0)
                 emb_anomaly_norms.append(float(parts[15]) if len(parts) > 15 else 0.0)
                 emb_normal_norms.append(float(parts[16]) if len(parts) > 16 else 0.0)
+                loss_keeps.append(float(parts[17]) if len(parts) > 17 else 0.0)
+                loss_drop_viss.append(float(parts[18]) if len(parts) > 18 else 0.0)
+                loss_drop_txts.append(float(parts[19]) if len(parts) > 19 else 0.0)
+                ip_entropies.append(float(parts[20]) if len(parts) > 20 else 0.0)
+                ip_norm_ratios.append(float(parts[21]) if len(parts) > 21 else 0.0)
+                ip_key_ratios.append(float(parts[22]) if len(parts) > 22 else 0.0)
     except FileNotFoundError:
         pass
 
@@ -1222,148 +1452,108 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
     s_emb_g = np.array(emb_global_norms)
     s_emb_a = np.array(emb_anomaly_norms)
     s_emb_n = np.array(emb_normal_norms)
+    s_loss_keep = np.array(loss_keeps)
+    s_loss_dv = np.array(loss_drop_viss)
+    s_loss_dt = np.array(loss_drop_txts)
+    s_ip_ent = np.array(ip_entropies)
+    s_ip_nr = np.array(ip_norm_ratios)
+    s_ip_kr = np.array(ip_key_ratios)
 
     SM = 0.99
     SF = 0.6
 
     steps = np.arange(len(losses))
     arr = np.array(losses)
-    ema_fast = _ema_smooth(arr, SF)
     ema_slow = _ema_smooth(arr, SM)
 
     has_cb = len(s_steps) > 0 and len(s_core) > 0 and s_core.any()
     has_x0 = len(s_steps) > 0 and s_x0.any()
     has_gn = len(s_steps) > 0 and s_gn.any()
-    # Annealed ctx dropout: ctx_drop varies (not all same value)
     has_ctx = (len(s_steps) > 0 and s_ctx.any()
                and (s_ctx.max() - s_ctx.min()) > 0.01)
     has_emb = len(s_steps) > 0 and (s_emb_g.any() or s_emb_a.any() or s_emb_n.any())
-
-    # --- Precompute core/band decomposition (shared by both layouts) ---
-    ce = be = core_ps = band_ps = None
-    if has_cb:
-        w_core_s = 0.8 * s_core
-        w_band_s = 0.2 * s_band
-        w_total_s = np.maximum(w_core_s + w_band_s, 1e-10)
-        core_share = w_core_s / w_total_s
-        core_share_ps = np.interp(steps, s_steps, core_share)
-        core_ps = arr * core_share_ps / 0.8
-        band_ps = arr * (1.0 - core_share_ps) / 0.2
-        ce = _ema_smooth(core_ps, SM)
-        be = _ema_smooth(band_ps, SM)
+    has_cond_modes = len(s_steps) > 0 and (s_loss_keep.any() or s_loss_dv.any() or s_loss_dt.any())
+    has_ip_diag = len(s_steps) > 0 and (s_ip_ent.any() or s_ip_nr.any())
 
     # =====================================================
-    # Choose layout based on x0 data presence
+    # 3x3 grid — row 0 varies, rows 1-2 fixed
     # =====================================================
-    fig, axes = plt.subplots(2, 3, figsize=(21, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(21, 15))
 
+    ax_trend, ax_cb = axes[0, 0], axes[0, 1]
     ax_x0eps = None
     ax_ctx = None
     if has_x0:
-        # x0 ABLATION LAYOUT:
-        # [0,0] Smooth Trend    [0,1] Core vs Band    [0,2] x0 vs eps + annealing
-        # [1,0] Gates           [1,1] Band/Core Ratio  [1,2] Grad Norm
-        ax_trend  = axes[0, 0]
-        ax_cb     = axes[0, 1]
-        ax_x0eps  = axes[0, 2]
-        ax_gates  = axes[1, 0]
-        ax_ratio  = axes[1, 1]
-        ax_gn     = axes[1, 2]
+        ax_x0eps = axes[0, 2]
     elif has_ctx:
-        # CONTEXT DROPOUT ANNEALING LAYOUT:
-        # [0,0] Smooth Trend    [0,1] Core vs Band    [0,2] Ctx dropout schedule
-        # [1,0] Gates           [1,1] Band/Core Ratio  [1,2] Grad Norm
-        ax_trend  = axes[0, 0]
-        ax_cb     = axes[0, 1]
-        ax_ctx    = axes[0, 2]
-        ax_gates  = axes[1, 0]
-        ax_ratio  = axes[1, 1]
-        ax_gn     = axes[1, 2]
+        ax_ctx = axes[0, 2]
     else:
-        # DEFAULT LAYOUT:
-        # [0,0] Smooth Trend    [0,1] Core vs Band    [0,2] Band/Core Ratio
-        # [1,0] Gates           [1,1] Grad Norm        [1,2] Role Embeddings
-        ax_trend  = axes[0, 0]
-        ax_cb     = axes[0, 1]
-        ax_ratio  = axes[0, 2]
-        ax_gates  = axes[1, 0]
-        ax_gn     = axes[1, 1]
-        ax_emb    = axes[1, 2]
+        ax_ratio = axes[0, 2]
 
-    # --- Smooth Trend ---
-    ax_trend.plot(steps, ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
-    ax_trend.plot(steps, ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
+    # Row 1 fixed: Gates, Embeddings, Grad Norm
+    ax_gates = axes[1, 0]
+    ax_emb = axes[1, 1]
+    ax_gn = axes[1, 2]
+    # Row 2 fixed: IP Output Ratio, IP Key Ratio, IP Entropy
+    ax_ip_ratio = axes[2, 0]
+    ax_ip_key = axes[2, 1]
+    ax_ip_ent = axes[2, 2]
+
+    # === [0,0] Conditioning Mode Losses ===
+    if has_cond_modes:
+        def _mode_ema_filtered(vals, steps_arr, sm):
+            nz = vals > 0
+            if not nz.any():
+                return np.array([]), np.array([])
+            return steps_arr[nz], _ema_smooth(vals[nz], sm)
+        all_ema = _ema_smooth(np.array(diff_losses), SM)
+        ax_trend.plot(s_steps, all_ema, color="black", linewidth=2.5,
+                      label=f"Overall ({all_ema[-1]:.4f})")
+        k_st, k_em = _mode_ema_filtered(s_loss_keep, s_steps, SM)
+        if len(k_em):
+            ax_trend.plot(k_st, k_em, color="#2196F3", linewidth=2,
+                          label=f"Keep both ({k_em[-1]:.4f})")
+        dv_st, dv_em = _mode_ema_filtered(s_loss_dv, s_steps, SM)
+        if len(dv_em):
+            ax_trend.plot(dv_st, dv_em, color="#F44336", linewidth=2,
+                          label=f"Keep text ({dv_em[-1]:.4f})")
+        dt_st, dt_em = _mode_ema_filtered(s_loss_dt, s_steps, SM)
+        if len(dt_em):
+            ax_trend.plot(dt_st, dt_em, color="#FF9800", linewidth=2,
+                          label=f"Keep visual ({dt_em[-1]:.4f})")
+        ax_trend.set_title(f"Loss by Conditioning Mode, EMA({SM}) -- step {len(losses)}")
+    else:
+        ax_trend.plot(steps, ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
+        ax_trend.set_title(f"Smooth Trend -- step {len(losses)}, trend: {ema_slow[-1]:.4f}")
     ax_trend.set_xlabel("Step"); ax_trend.set_ylabel("Loss")
-    ax_trend.set_title(f"Smooth Trend — step {len(losses)}, trend: {ema_slow[-1]:.4f}")
-    ax_trend.legend(loc="upper right", fontsize=8)
+    ax_trend.legend(loc="upper left", fontsize=8)
     ax_trend.grid(True, alpha=0.3)
 
-    # --- Core vs Band (stacked area) ---
+    # === [0,1] Core vs Band (both cond only — direct from stats) ===
     if has_cb:
-        ax_cb.fill_between(steps, 0, ce, color="#2196F3", alpha=0.4)
-        ax_cb.fill_between(steps, ce, ce + be, color="#FF9800", alpha=0.4)
-        ax_cb.plot(steps, ce, color="#1565C0", linewidth=1.5, label="Core")
-        ax_cb.plot(steps, ce + be, color="#E65100", linewidth=1.5, label="Band (stacked)")
-        ax_cb.plot(steps, ema_slow, color="black", linewidth=2, linestyle="--",
-                   label=f"0.8\u00d7core+0.2\u00d7band = {ema_slow[-1]:.4f}")
-        ax_cb.annotate(f"{ce[-1]:.3f}", xy=(steps[-1], ce[-1] / 2),
-                       fontsize=9, fontweight="bold", color="#1565C0", ha="right")
-        ax_cb.annotate(f"{be[-1]:.3f}", xy=(steps[-1], ce[-1] + be[-1] / 2),
-                       fontsize=9, fontweight="bold", color="#E65100", ha="right")
-        ax_cb.legend(loc="upper right", fontsize=8)
-        ax_cb.set_title(f"Core vs Band, EMA({SM}) — weighted: {ema_slow[-1]:.4f}")
+        ce = _ema_smooth(s_core, SM)
+        be = _ema_smooth(s_band, SM)
+        combined = 0.8 * ce + 0.2 * be
+        ax_cb.fill_between(s_steps, 0, ce, color="#2196F3", alpha=0.4)
+        ax_cb.fill_between(s_steps, ce, ce + be, color="#FF9800", alpha=0.4)
+        ax_cb.plot(s_steps, ce, color="#1565C0", linewidth=1.5, label=f"Core ({ce[-1]:.4f})")
+        ax_cb.plot(s_steps, ce + be, color="#E65100", linewidth=1.5, label=f"Band stacked ({be[-1]:.4f})")
+        ax_cb.plot(s_steps, combined, color="black", linewidth=2, linestyle="--",
+                   label=f"0.8\u00d7core+0.2\u00d7band = {combined[-1]:.4f}")
+        ax_cb.legend(loc="upper left", fontsize=8)
+        ax_cb.set_title(f"Core vs Band (both cond only), EMA({SM})")
     else:
         ax_cb.set_title("Core vs Band (no data yet)")
     ax_cb.set_xlabel("Step"); ax_cb.set_ylabel("Per-pixel MSE")
     ax_cb.grid(True, alpha=0.3)
 
-    # --- Band/Core Ratio ---
-    if has_cb:
-        safe_c_ps = np.maximum(core_ps, 1e-10)
-        cbr = band_ps / safe_c_ps
-        cbre = _ema_smooth(cbr, SM)
-        ax_ratio.plot(steps, cbr, color="gray", linewidth=0.5, alpha=0.3, label="Raw")
-        ax_ratio.plot(steps, cbre, color="purple", linewidth=2, label=f"EMA ({SM})")
-        ax_ratio.axhline(y=1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-        ax_ratio.set_title(f"Band/Core Ratio, EMA({SM}) — {cbre[-1]:.2f}x")
-        ax_ratio.legend(loc="upper left", fontsize=8)
-    else:
-        ax_ratio.set_title("Band/Core Ratio (no data yet)")
-    ax_ratio.set_xlabel("Step"); ax_ratio.set_ylabel("Band / Core")
-    ax_ratio.grid(True, alpha=0.3)
-
-    # --- Gates ---
-    if len(s_steps) > 0:
-        ax_gates.plot(s_steps, s_attn, color="blue", linewidth=1.5, label="Attn gate")
-        ax_gates.plot(s_steps, s_ff, color="green", linewidth=1.5, label="FF gate")
-        ax_gates.set_title(f"Gates — attn={s_attn[-1]:.4f}, ff={s_ff[-1]:.4f}")
-        ax_gates.legend(loc="upper left", fontsize=8)
-    else:
-        ax_gates.set_title("Gates (no data yet)")
-    ax_gates.set_xlabel("Step"); ax_gates.set_ylabel("Gate value")
-    ax_gates.grid(True, alpha=0.3)
-
-    # --- Grad Norm ---
-    if has_gn:
-        gn_ema_fast = _ema_smooth(s_gn, SF)
-        gn_ema_slow = _ema_smooth(s_gn, SM)
-        ax_gn.plot(s_steps, gn_ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
-        ax_gn.plot(s_steps, gn_ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
-        ax_gn.axhline(y=1.0, color="black", linewidth=1, linestyle="--", alpha=0.5, label="clip=1.0")
-        ax_gn.set_title(f"Grad Norm — trend: {gn_ema_slow[-1]:.4f}")
-        ax_gn.legend(loc="upper right", fontsize=8)
-    else:
-        ax_gn.set_title("Grad Norm (no data yet)")
-    ax_gn.set_xlabel("Step"); ax_gn.set_ylabel("Norm")
-    ax_gn.grid(True, alpha=0.3)
-
-    # --- x0 vs eps + annealing (x0 layout only) ---
+    # === [0,2] Band/Core Ratio (default) | x0 | ctx ===
     if ax_x0eps is not None and has_x0:
+        # x0 vs eps + annealing
         x0_mask = s_x0 > 0
         x0_steps_f, x0_vals_f = s_steps[x0_mask], s_x0[x0_mask]
         eps_mask = s_eps > 0
         eps_steps_f, eps_vals_f = s_steps[eps_mask], s_eps[eps_mask]
-
         lines = []
         if len(x0_vals_f) > 1:
             ax_x0eps.plot(x0_steps_f, _ema_smooth(x0_vals_f, SF), color="#CE93D8", linewidth=0.8, alpha=0.3)
@@ -1377,8 +1567,6 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
             l2, = ax_x0eps.plot(eps_steps_f, eps_slow, color="#00695C", linewidth=2.5,
                                 label=f"\u03b5 = {eps_slow[-1]:.4f}")
             lines.append(l2)
-
-        # Annealing ratio on second y-axis
         ax_r2 = ax_x0eps.twinx()
         l3, = ax_r2.plot(s_steps, s_x0r, color="gray", linewidth=1.5, linestyle="--",
                          alpha=0.6, label="x0 ratio")
@@ -1386,48 +1574,123 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
         ax_r2.set_ylabel("x0 ratio", color="gray")
         ax_r2.tick_params(axis="y", labelcolor="gray")
         lines.append(l3)
-
-        ax_x0eps.legend(handles=lines, loc="upper right", fontsize=7)
+        ax_x0eps.legend(handles=lines, loc="upper left", fontsize=7)
         title_parts = []
         if len(x0_vals_f) > 1:
             title_parts.append(f"x0={x0_slow[-1]:.4f}")
         if len(eps_vals_f) > 1:
             title_parts.append(f"\u03b5={eps_slow[-1]:.4f}")
-        ax_x0eps.set_title(f"x0 vs \u03b5 Loss, EMA({SM}) — {', '.join(title_parts)}")
+        ax_x0eps.set_title(f"x0 vs \u03b5 Loss, EMA({SM}) -- {', '.join(title_parts)}")
         ax_x0eps.set_xlabel("Step"); ax_x0eps.set_ylabel("Loss")
         ax_x0eps.grid(True, alpha=0.3)
-
-    # --- Context dropout schedule (ctx annealing layout only) ---
-    if ax_ctx is not None:
+    elif ax_ctx is not None:
         ax_ctx.plot(s_steps, s_ctx, color="#D32F2F", linewidth=2.5, label="Ctx dropout rate")
         ax_ctx.fill_between(s_steps, 0, s_ctx, color="#EF9A9A", alpha=0.3)
         ax_ctx.set_ylim(-0.05, 1.1)
-        ax_ctx.set_title(f"Context Dropout Schedule \u2014 current: {s_ctx[-1]:.1%}")
+        ax_ctx.set_title(f"Context Dropout Schedule -- current: {s_ctx[-1]:.1%}")
         ax_ctx.set_xlabel("Step"); ax_ctx.set_ylabel("Dropout rate")
-        ax_ctx.legend(loc="upper right", fontsize=8)
+        ax_ctx.legend(loc="upper left", fontsize=8)
         ax_ctx.grid(True, alpha=0.3)
-
-    # --- Role Embedding Norms ---
-    if not has_x0 and not has_ctx:
-        # Default layout: dedicated subplot at [1,2]
-        if has_emb:
-            ax_emb.plot(s_steps, s_emb_g, color="green", linewidth=1.5, label=f"Global ({s_emb_g[-1]:.4f})")
-            ax_emb.plot(s_steps, s_emb_a, color="red", linewidth=1.5, label=f"Anomaly ({s_emb_a[-1]:.4f})")
-            ax_emb.plot(s_steps, s_emb_n, color="blue", linewidth=1.5, label=f"Band ({s_emb_n[-1]:.4f})")
-            ax_emb.set_title(f"Role Embedding Norms")
-            ax_emb.legend(loc="upper left", fontsize=8)
+    else:
+        # Default: Band/Core Ratio (both cond only)
+        if has_cb:
+            safe_core = np.maximum(s_core, 1e-10)
+            cbr = s_band / safe_core
+            cbre = _ema_smooth(cbr, SM)
+            ax_ratio.plot(s_steps, cbr, color="gray", linewidth=0.5, alpha=0.3, label="Raw")
+            ax_ratio.plot(s_steps, cbre, color="purple", linewidth=2, label=f"EMA ({SM})")
+            ax_ratio.axhline(y=1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+            ax_ratio.set_title(f"Band/Core Ratio (both cond only), EMA({SM}) -- {cbre[-1]:.2f}x")
+            ax_ratio.legend(loc="upper left", fontsize=8)
         else:
-            ax_emb.set_title("Role Embedding Norms (no data)")
-        ax_emb.set_xlabel("Step"); ax_emb.set_ylabel("L2 Norm")
-        ax_emb.grid(True, alpha=0.3)
-    elif has_emb:
-        # x0 or ctx layout: all 6 slots used — add as twinx on gates subplot
-        ax_emb_twin = ax_gates.twinx()
-        ax_emb_twin.plot(s_steps, s_emb_g, color="green", linewidth=1, linestyle="--", alpha=0.6, label="Glob emb")
-        ax_emb_twin.plot(s_steps, s_emb_a, color="red", linewidth=1, linestyle="--", alpha=0.6, label="Anom emb")
-        ax_emb_twin.plot(s_steps, s_emb_n, color="blue", linewidth=1, linestyle="--", alpha=0.6, label="Band emb")
-        ax_emb_twin.set_ylabel("Emb norm", color="gray", fontsize=8)
-        ax_emb_twin.tick_params(axis="y", labelcolor="gray", labelsize=7)
+            ax_ratio.set_title("Band/Core Ratio (no data yet)")
+        ax_ratio.set_xlabel("Step"); ax_ratio.set_ylabel("Band / Core")
+        ax_ratio.grid(True, alpha=0.3)
+
+    # === [1,0] Gates ===
+    if len(s_steps) > 0:
+        ax_gates.plot(s_steps, s_attn, color="blue", linewidth=1.5, label="Attn gate")
+        ax_gates.plot(s_steps, s_ff, color="green", linewidth=1.5, label="FF gate")
+        ax_gates.set_title(f"Gates -- attn={s_attn[-1]:.4f}, ff={s_ff[-1]:.4f}")
+        ax_gates.legend(loc="upper left", fontsize=8)
+    else:
+        ax_gates.set_title("Gates (no data yet)")
+    ax_gates.set_xlabel("Step"); ax_gates.set_ylabel("Gate value")
+    ax_gates.grid(True, alpha=0.3)
+
+    # === [1,1] Role Embedding Norms ===
+    if has_emb:
+        ax_emb.plot(s_steps, s_emb_g, color="green", linewidth=1.5, label=f"Global ({s_emb_g[-1]:.4f})")
+        ax_emb.plot(s_steps, s_emb_a, color="red", linewidth=1.5, label=f"Anomaly ({s_emb_a[-1]:.4f})")
+        ax_emb.plot(s_steps, s_emb_n, color="blue", linewidth=1.5, label=f"Band ({s_emb_n[-1]:.4f})")
+        ax_emb.set_title("Role Embedding Norms")
+        ax_emb.legend(loc="upper left", fontsize=8)
+    else:
+        ax_emb.set_title("Role Embedding Norms (no data)")
+    ax_emb.set_xlabel("Step"); ax_emb.set_ylabel("L2 Norm")
+    ax_emb.grid(True, alpha=0.3)
+
+    # === [1,2] Grad Norm ===
+    if has_gn:
+        gn_ema_fast = _ema_smooth(s_gn, SF)
+        gn_ema_slow = _ema_smooth(s_gn, SM)
+        ax_gn.plot(s_steps, gn_ema_fast, color="red", linewidth=0.8, alpha=0.3, label=f"EMA ({SF})")
+        ax_gn.plot(s_steps, gn_ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
+        ax_gn.axhline(y=1.0, color="black", linewidth=1, linestyle="--", alpha=0.5, label="clip=1.0")
+        ax_gn.set_title(f"Grad Norm -- trend: {gn_ema_slow[-1]:.4f}")
+        ax_gn.legend(loc="upper left", fontsize=8)
+    else:
+        ax_gn.set_title("Grad Norm (no data yet)")
+    ax_gn.set_xlabel("Step"); ax_gn.set_ylabel("Norm")
+    ax_gn.grid(True, alpha=0.3)
+
+    # === [2,0] IP/Text Output Ratio (||ip_out|| / ||h_pre||) ===
+    if has_ip_diag and s_ip_nr.any():
+        nz = s_ip_nr > 0
+        if nz.any():
+            ema_nr = _ema_smooth(s_ip_nr[nz], SM)
+            ax_ip_ratio.plot(s_steps[nz], ema_nr, color="purple", linewidth=2,
+                             label=f"ratio ({ema_nr[-1]:.4f})")
+            ax_ip_ratio.legend(loc="upper left", fontsize=8)
+            ax_ip_ratio.set_title(f"IP Output Ratio ||ip_out||/||h_pre|| -- {ema_nr[-1]:.4f}")
+        else:
+            ax_ip_ratio.set_title("IP Output Ratio ||ip_out||/||h_pre|| (no nonzero data)")
+    else:
+        ax_ip_ratio.set_title("IP Output Ratio ||ip_out||/||h_pre|| (no data yet)")
+    ax_ip_ratio.set_xlabel("Step"); ax_ip_ratio.set_ylabel("Ratio")
+    ax_ip_ratio.grid(True, alpha=0.3)
+
+    # === [2,1] IP Attention Entropy ===
+    if has_ip_diag and s_ip_ent.any():
+        nz = s_ip_ent > 0
+        if nz.any():
+            ema_ent = _ema_smooth(s_ip_ent[nz], SM)
+            ax_ip_ent.plot(s_steps[nz], ema_ent, color="teal", linewidth=2,
+                           label=f"entropy ({ema_ent[-1]:.2f})")
+            ax_ip_ent.legend(loc="upper left", fontsize=8)
+            ax_ip_ent.set_title(f"IP Attention Entropy -- {ema_ent[-1]:.2f}")
+        else:
+            ax_ip_ent.set_title("IP Attention Entropy (no nonzero data)")
+    else:
+        ax_ip_ent.set_title("IP Attention Entropy (no data yet)")
+    ax_ip_ent.set_xlabel("Step"); ax_ip_ent.set_ylabel("Entropy")
+    ax_ip_ent.grid(True, alpha=0.3)
+
+    # === [2,2] IP/Text Key Ratio (||ip_k|| / ||text_k||) ===
+    if has_ip_diag and s_ip_kr.any():
+        nz = s_ip_kr > 0
+        if nz.any():
+            ema_kr = _ema_smooth(s_ip_kr[nz], SM)
+            ax_ip_key.plot(s_steps[nz], ema_kr, color="#E65100", linewidth=2,
+                           label=f"key ratio ({ema_kr[-1]:.4f})")
+            ax_ip_key.legend(loc="upper left", fontsize=8)
+            ax_ip_key.set_title(f"IP Key Ratio ||ip_k||/||text_k|| -- {ema_kr[-1]:.4f}")
+        else:
+            ax_ip_key.set_title("IP Key Ratio ||ip_k||/||text_k|| (no nonzero data)")
+    else:
+        ax_ip_key.set_title("IP Key Ratio ||ip_k||/||text_k|| (no data yet)")
+    ax_ip_key.set_xlabel("Step"); ax_ip_key.set_ylabel("Ratio")
+    ax_ip_key.grid(True, alpha=0.3)
 
     # --- Run title from config ---
     run_title = None
@@ -1464,8 +1727,9 @@ def save_anomagic_checkpoint(
     band_mode: int = 1, t2i_adapter=None, unet=None,
     step: int = 0, losses: list = None,
     qo_params_named: list = None,
+    ema=None,
 ):
-    """Save IP-Adapter + T2I-Adapter + LoRA + unfrozen QO checkpoint."""
+    """Save IP-Adapter + T2I-Adapter + LoRA + unfrozen QO + EMA checkpoint."""
     save_dir = Path(save_dir)
     ip_adapter.save_ip_adapter(save_dir)
 
@@ -1475,6 +1739,8 @@ def save_anomagic_checkpoint(
         "step": step,
         "losses": losses or [],
     }
+    if ema is not None:
+        state["ema"] = ema.state_dict()
     if t2i_adapter is not None:
         state["t2i_adapter"] = t2i_adapter.state_dict()
     if unet is not None:
@@ -1485,506 +1751,8 @@ def save_anomagic_checkpoint(
     torch.save(state, save_dir / "training_state.pt")
 
 
-def generate_anomagic_samples(
-    pipeline, ip_adapter, dataset,
-    save_path, device,
-    band_mode: int = 1,
-    t2i_adapter=None,
-    cfg_mode: str = "text",
-):
-    """Generate sample grids showing model outputs under various conditions.
-
-    Produces two grids:
-    1. **Main grid** (7 rows × N cols): Real, Mask, Reference, Gen(CFG=1),
-       Gen(CFG=text), Gen(CFG=visual), Gen(CFG=both).
-    2. **Token-swap grid** (5 rows × N cols): Target, Mask,
-       Gen(correct tokens), Swapped Reference, Gen(swapped tokens).
-       Each column i uses the reference from column (i+1) % N.
-
-    Uses a fixed seed so the same samples are shown at every checkpoint,
-    making it easy to track visual progress across training.
-    """
-    save_path = Path(save_path)
-
-    # --- Phase 1: Sample selection ---
-    sample_rng = random.Random(42)
-    # Fixed (type, image_path) pairs for consistent visualization across ALL runs
-    _fixed_samples = [
-        ("cut_lead", "AnomVerse_data_filtered/mvtec/mvtec/transistor/test/cut_lead/005.png"),
-        ("broken_large", "AnomVerse_data_filtered/mvtec/mvtec/bottle/test/broken_large/011.png"),
-        ("fold", "AnomVerse_data_filtered/mvtec/mvtec/leather/test/fold/016.png"),
-        ("cut", "AnomVerse_data_filtered/mvtec/mvtec/hazelnut/test/cut/011.png"),
-        ("thread", "AnomVerse_data_filtered/mvtec/mvtec/carpet/test/thread/011.png"),
-        ("faulty_imprint", "AnomVerse_data_filtered/mvtec/mvtec/pill/test/faulty_imprint/011.png"),
-        ("contamination", "realiad_1024/mint/NG/ZW/S0070/mint_0070_NG_ZW_C5_20230910095530.jpg"),
-    ]
-    # Build lookup: image_path → dataset index (normalize to forward-slash suffix)
-    _path_to_idx = {}
-    for i, s in enumerate(dataset.samples):
-        p = s["image_path"].replace("\\", "/")
-        _path_to_idx[p] = i
-        # Also index by the relative tail so fixed paths match regardless of data_root
-        for prefix in ("AnomVerse_data_filtered/", "realiad_1024/"):
-            idx = p.find(prefix)
-            if idx >= 0:
-                _path_to_idx[p[idx:]] = i
-                break
-    types_to_show = []
-    fixed_indices = {}
-    for atype, img_path in _fixed_samples:
-        if atype in dataset.type_to_samples and img_path in _path_to_idx:
-            types_to_show.append(atype)
-            fixed_indices[atype] = _path_to_idx[img_path]
-    # Fallback: fill remaining slots from available types
-    if len(types_to_show) < 6:
-        remaining = [t for t in dataset.anomaly_types if t not in types_to_show]
-        for t in sample_rng.sample(remaining, min(6 - len(types_to_show), len(remaining))):
-            types_to_show.append(t)
-
-    n_cols = len(types_to_show)
-
-    # --- Phase 2: Collect sample data ---
-    all_samples = []
-    for i, atype in enumerate(types_to_show):
-        if atype in fixed_indices:
-            idx = fixed_indices[atype]
-        else:
-            indices = dataset.type_to_samples[atype]
-            idx = sample_rng.choice(indices)
-        sample = dataset[idx]
-
-        image = sample["image"].unsqueeze(0).to(device)
-        mask_t = sample["mask"].unsqueeze(0).to(device)
-        reference = sample["reference"].unsqueeze(0).to(device)
-
-        img_path = sample.get("image_path", "unknown")
-        path_parts = Path(img_path).parts
-        short_path = "/".join(path_parts[-3:]) if len(path_parts) >= 3 else img_path
-
-        img_np = ((image[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
-        mask_np = mask_t[0, 0].cpu().numpy()
-        ref_np = ((reference[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
-
-        all_samples.append({
-            "atype": atype,
-            "image": image,
-            "mask": mask_t,
-            "reference": reference,
-            "caption": sample.get("caption", ""),
-            "img_np": img_np,
-            "mask_np": mask_np,
-            "ref_np": ref_np,
-            "short_path": short_path,
-        })
-
-    # --- Phase 3: Generate 4 variants per sample ---
-    gen_kwargs = dict(
-        num_steps=30,
-        noise_strength=1.0,
-        reference_mode=dataset.reference_mode,
-        band_mode=band_mode,
-        t2i_adapter=t2i_adapter,
-    )
-    for i, s in enumerate(all_samples):
-        with torch.no_grad():
-            s["gen_no_cfg"] = generate_anomagic_single(
-                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
-                s["atype"], s["caption"],
-                guidance_scale=1.0, cfg_mode="both", seed=42 + i,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()  # yield GPU to display driver (TDR prevention)
-            s["gen_text"] = generate_anomagic_single(
-                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
-                s["atype"], s["caption"],
-                cfg_mode="text", seed=42 + i,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()
-            s["gen_visual"] = generate_anomagic_single(
-                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
-                s["atype"], s["caption"],
-                cfg_mode="visual", seed=42 + i,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()
-            s["gen_both"] = generate_anomagic_single(
-                pipeline, ip_adapter, s["image"], s["mask"], s["reference"],
-                s["atype"], s["caption"],
-                cfg_mode="both", seed=42 + i,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()
-
-    # Helper: tensor [1,C,H,W] in [-1,1] → numpy [H,W,C] in [0,1]
-    def _to_np(t: torch.Tensor):
-        return ((t[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
-
-    # --- Phase 4: Plot main grid (7 rows) ---
-    fig, axes = plt.subplots(7, n_cols, figsize=(3.5 * n_cols, 22), squeeze=False)
-    ref_label = "clip_crop" if dataset.augment else dataset.reference_mode
-
-    for i, s in enumerate(all_samples):
-        axes[0, i].imshow(s["img_np"])
-        axes[0, i].set_title(f"Real ({s['atype']})\n{s['short_path']}", fontsize=6)
-        axes[0, i].axis("off")
-
-        axes[1, i].imshow(s["mask_np"], cmap="gray")
-        axes[1, i].set_title(f"Mask ({s['mask_np'].mean() * 100:.1f}%)", fontsize=7)
-        axes[1, i].axis("off")
-
-        axes[2, i].imshow(s["ref_np"])
-        axes[2, i].set_title(f"Reference ({ref_label})", fontsize=7)
-        axes[2, i].axis("off")
-
-        axes[3, i].imshow(_to_np(s["gen_no_cfg"]))
-        axes[3, i].set_title("Gen (CFG=1)", fontsize=8)
-        axes[3, i].axis("off")
-
-        axes[4, i].imshow(_to_np(s["gen_text"]))
-        axes[4, i].set_title("Gen (CFG=text)", fontsize=8)
-        axes[4, i].axis("off")
-
-        axes[5, i].imshow(_to_np(s["gen_visual"]))
-        axes[5, i].set_title("Gen (CFG=visual)", fontsize=8)
-        axes[5, i].axis("off")
-
-        axes[6, i].imshow(_to_np(s["gen_both"]))
-        axes[6, i].set_title("Gen (CFG=both)", fontsize=8)
-        axes[6, i].axis("off")
-
-    plt.suptitle("Anomagic Generation Samples", fontsize=12)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-
-    # --- Phase 5: Token-swap generation (CFG=visual + CFG=1) ---
-    n = len(all_samples)
-    for i in range(n):
-        j = (i + 1) % n
-        swapped_ref = all_samples[j]["reference"]
-        with torch.no_grad():
-            all_samples[i]["gen_swap_visual"] = generate_anomagic_single(
-                pipeline, ip_adapter,
-                all_samples[i]["image"], all_samples[i]["mask"],
-                swapped_ref,
-                all_samples[i]["atype"], all_samples[i]["caption"],
-                cfg_mode="visual", seed=42 + i,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()  # TDR prevention
-            all_samples[i]["gen_swap_nocfg"] = generate_anomagic_single(
-                pipeline, ip_adapter,
-                all_samples[i]["image"], all_samples[i]["mask"],
-                swapped_ref,
-                all_samples[i]["atype"], all_samples[i]["caption"],
-                guidance_scale=1.0, cfg_mode="visual", seed=42 + i,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()
-
-    # --- Phase 6: Plot swap grid (8 rows) ---
-    swap_path = save_path.parent / (save_path.stem + "_swap" + save_path.suffix)
-    fig, axes = plt.subplots(8, n_cols, figsize=(3.5 * n_cols, 25), squeeze=False)
-
-    for i, s in enumerate(all_samples):
-        j = (i + 1) % n
-        swapped_ref_np = all_samples[j]["ref_np"]
-
-        axes[0, i].imshow(s["img_np"])
-        axes[0, i].set_title(f"Target ({s['atype']})\n{s['short_path']}", fontsize=6)
-        axes[0, i].axis("off")
-
-        axes[1, i].imshow(s["mask_np"], cmap="gray")
-        axes[1, i].set_title(f"Mask ({s['mask_np'].mean() * 100:.1f}%)", fontsize=7)
-        axes[1, i].axis("off")
-
-        axes[2, i].imshow(s["ref_np"])
-        axes[2, i].set_title(f"Correct ref ({ref_label})", fontsize=7)
-        axes[2, i].axis("off")
-
-        axes[3, i].imshow(_to_np(s["gen_visual"]))
-        axes[3, i].set_title("Correct (CFG=visual)", fontsize=7)
-        axes[3, i].axis("off")
-
-        axes[4, i].imshow(_to_np(s["gen_no_cfg"]))
-        axes[4, i].set_title("Correct (CFG=1)", fontsize=7)
-        axes[4, i].axis("off")
-
-        axes[5, i].imshow(swapped_ref_np)
-        axes[5, i].set_title(f"Swapped ref ({all_samples[j]['atype']})", fontsize=7)
-        axes[5, i].axis("off")
-
-        axes[6, i].imshow(_to_np(s["gen_swap_visual"]))
-        axes[6, i].set_title("Swapped (CFG=visual)", fontsize=7)
-        axes[6, i].axis("off")
-
-        axes[7, i].imshow(_to_np(s["gen_swap_nocfg"]))
-        axes[7, i].set_title("Swapped (CFG=1)", fontsize=7)
-        axes[7, i].axis("off")
-
-    plt.suptitle("Token-Swap: Does Changing the Reference Change the Output?", fontsize=11)
-    plt.tight_layout()
-    plt.savefig(swap_path, dpi=150, bbox_inches="tight")
-    plt.close()
-
-    # --- Phase 7: OOD (VisA cashew) generation ---
-    _generate_ood_grid(
-        pipeline, ip_adapter, save_path, device,
-        band_mode=band_mode, t2i_adapter=t2i_adapter,
-        clip_align=dataset.clip_align,
-    )
-
-
-def _generate_ood_grid(
-    pipeline, ip_adapter, save_path: Path, device: str,
-    band_mode: int = 2, t2i_adapter=None, clip_align: bool = True,
-):
-    """Generate OOD grid using VisA cashew data (canvas normals + placed masks).
-
-    Shows whether the model generalises to out-of-distribution objects it was
-    never trained on.  Produces a 4-row grid:
-        Row 0: Canvas normal
-        Row 1: Placed mask
-        Row 2: Reference CLIP crop (from the anomaly donor image)
-        Row 3: Generated (CFG=both)
-
-    Silently skips if VisA experiment data is not available (e.g. on a server
-    without the validation dataset).
-    """
-    # --- Resolve paths ---
-    project_root = Path(__file__).parent.parent
-    exp_dir = (
-        project_root / "anomverse_extension" / "datasets" / "VisA_validation_dataset"
-        / "datasets" / "easy_test" / "cashew" / "experiment_ResNet"
-    )
-    cashew_root = exp_dir.parent
-    canvas_imgs_dir = exp_dir / "source" / "canvas_normals" / "imgs"
-    extra_normals_dir = cashew_root / "Data" / "Images" / "Normal"
-    image_anno_csv = cashew_root / "image_anno.csv"
-
-    # Check if experiment data exists
-    if not exp_dir.exists():
-        return
-    easy_manifest = exp_dir / "anomaly" / "masks" / "easy" / "manifest.json"
-    hard_manifest = exp_dir / "anomaly" / "masks" / "hard" / "manifest.json"
-    if not easy_manifest.exists() and not hard_manifest.exists():
-        return
-
-    # --- Load manifests ---
-    easy_entries = []
-    hard_entries = []
-    if easy_manifest.exists():
-        with open(easy_manifest) as f:
-            easy_entries = json.load(f)
-    if hard_manifest.exists():
-        with open(hard_manifest) as f:
-            hard_entries = json.load(f)
-
-    # Pick fixed subset: up to 4 easy + up to 2 hard
-    ood_rng = random.Random(123)
-    selected = []
-    if easy_entries:
-        selected += ood_rng.sample(easy_entries, min(4, len(easy_entries)))
-    if hard_entries:
-        selected += ood_rng.sample(hard_entries, min(2, len(hard_entries)))
-    if not selected:
-        return
-
-    # --- Parse defect types from image_anno.csv ---
-    defect_map: dict[str, str] = {}
-    if image_anno_csv.exists():
-        with open(image_anno_csv, newline="", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader)  # skip header
-            for row in reader:
-                label = row[1] if len(row) > 1 else ""
-                if label == "normal":
-                    continue
-                stem = Path(row[0]).stem
-                defect_map[stem] = label
-
-    # --- Helper to find canvas image ---
-    def _find_canvas(canvas_id: str) -> Path | None:
-        for d in (canvas_imgs_dir, extra_normals_dir):
-            p = d / f"{canvas_id}.JPG"
-            if p.exists():
-                return p
-        return None
-
-    # --- Collect OOD sample data ---
-    ood_samples = []
-    for entry in selected:
-        canvas_id = entry["canvas_id"]
-        ref_id = entry["ref_id"]
-        difficulty = entry["difficulty"]
-
-        canvas_path = _find_canvas(canvas_id)
-        if canvas_path is None:
-            continue
-
-        placed_mask_path = (
-            exp_dir / "anomaly" / "masks" / difficulty / f"{canvas_id}.png"
-        )
-        ref_img_path = exp_dir / "source" / "reference_anomalies" / difficulty / "imgs" / f"{ref_id}.JPG"
-        ref_mask_path = exp_dir / "source" / "reference_anomalies" / difficulty / "masks" / f"{ref_id}.png"
-
-        if not all(p.exists() for p in (placed_mask_path, ref_img_path, ref_mask_path)):
-            continue
-
-        # Load canvas → [1, 3, 512, 512] in [-1, 1]
-        canvas_pil = Image.open(canvas_path).convert("RGB").resize((512, 512), Image.LANCZOS)
-        canvas_t = torch.from_numpy(
-            np.array(canvas_pil).astype(np.float32) / 127.5 - 1.0
-        ).permute(2, 0, 1).unsqueeze(0).to(device)
-
-        # Load placed mask → [1, 1, 512, 512]
-        placed_pil = Image.open(placed_mask_path).convert("L")
-        placed_t = torch.from_numpy(np.array(placed_pil).astype(np.float32) / 255.0)
-        placed_t = (placed_t > 0.5).float().unsqueeze(0)  # [1, H, W]
-        placed_t = downsample_mask_maxpool(placed_t, 512)  # [1, 512, 512]
-        mask_np = placed_t.squeeze(0).numpy()
-        mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).float().to(device)
-
-        # Load reference anomaly → CLIP multi-crop
-        ref_pil = Image.open(ref_img_path).convert("RGB")
-        ref_mask_np = (
-            np.array(Image.open(ref_mask_path).convert("L")).astype(np.float32) / 255.0 > 0.5
-        ).astype(np.float32)
-        ref_tensor = torch.from_numpy(
-            np.array(ref_pil).astype(np.float32) / 255.0
-        ).permute(2, 0, 1)  # [3, H, W] in [0, 1]
-        ref_mask_tensor = torch.from_numpy(ref_mask_np).unsqueeze(0).float()  # [1, H, W]
-
-        random.seed(42)
-        if clip_align:
-            core_native, dil_native = unet_roundtrip_masks(ref_mask_tensor, band_mode)
-            crops, crop_masks, valid, extra = clip_crop_multi(
-                ref_tensor, ref_mask_tensor, n_groups=2,
-                clip_masks=[dil_native, core_native],
-            )
-            clip_ref = (crops[0] * 2.0 - 1.0).unsqueeze(0).to(device)
-            clip_mask_1 = (extra[0][0] > 0.5).float().unsqueeze(0).to(device)
-            clip_core_1 = (extra[0][1] > 0.5).float().unsqueeze(0).to(device)
-            clip_ref_2 = (crops[1] * 2.0 - 1.0).unsqueeze(0).to(device)
-            clip_mask_2 = (extra[1][0] > 0.5).float().unsqueeze(0).to(device)
-            clip_core_2 = (extra[1][1] > 0.5).float().unsqueeze(0).to(device)
-        else:
-            crops, crop_masks, valid = clip_crop_multi(
-                ref_tensor, ref_mask_tensor, n_groups=2,
-            )
-            clip_ref = (crops[0] * 2.0 - 1.0).unsqueeze(0).to(device)
-            clip_mask_1 = (crop_masks[0] > 0.5).float().unsqueeze(0).to(device)
-            clip_core_1 = None
-            clip_ref_2 = (crops[1] * 2.0 - 1.0).unsqueeze(0).to(device)
-            clip_mask_2 = (crop_masks[1] > 0.5).float().unsqueeze(0).to(device)
-            clip_core_2 = None
-        group_valid = torch.tensor(
-            [[float(valid[0]), float(valid[1])]], device=device,
-        )
-
-        defect_type = defect_map.get(ref_id, "defect")
-        caption = f"a photo of a {defect_type} defect on a cashew"
-
-        # Numpy for visualization
-        canvas_np = ((canvas_t[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
-        crop_np = (crops[0].permute(1, 2, 0).numpy()).clip(0, 1)
-        crop_mask_np = crop_masks[0][0].numpy()  # [H, W] binary
-
-        ood_samples.append({
-            "canvas_t": canvas_t, "mask_t": mask_t,
-            "clip_ref": clip_ref, "clip_mask_1": clip_mask_1, "clip_core_1": clip_core_1,
-            "clip_ref_2": clip_ref_2, "clip_mask_2": clip_mask_2, "clip_core_2": clip_core_2,
-            "group_valid": group_valid,
-            "defect_type": defect_type, "caption": caption,
-            "difficulty": difficulty,
-            "canvas_np": canvas_np, "mask_np": mask_np,
-            "crop_np": crop_np, "crop_mask_np": crop_mask_np,
-            "canvas_id": canvas_id, "ref_id": ref_id,
-        })
-
-    if not ood_samples:
-        return
-
-    # --- Generate (CFG=visual + CFG=1) ---
-    dilate_hard = True
-    for i, s in enumerate(ood_samples):
-        dilate = (s["difficulty"] == "hard") and dilate_hard
-        ood_gen_kwargs = dict(
-            num_steps=30,
-            noise_strength=0.7 if s["difficulty"] == "easy" else 1.0,
-            reference_mode="crop", band_mode=band_mode,
-            t2i_adapter=t2i_adapter, seed=42 + i,
-            clip_mask=s["clip_mask_1"],
-            clip_core_mask=s["clip_core_1"],
-            reference_2=s["clip_ref_2"],
-            clip_mask_2=s["clip_mask_2"],
-            clip_core_mask_2=s["clip_core_2"],
-            group_valid=s["group_valid"],
-            dilate_clip_mask=dilate,
-        )
-        with torch.no_grad():
-            s["gen_visual"] = generate_anomagic_single(
-                pipeline, ip_adapter,
-                s["canvas_t"], s["mask_t"], s["clip_ref"],
-                s["defect_type"], s["caption"],
-                guidance_scale=7.5, cfg_mode="visual",
-                **ood_gen_kwargs,
-            )
-            torch.cuda.synchronize()  # TDR prevention
-            s["gen_nocfg"] = generate_anomagic_single(
-                pipeline, ip_adapter,
-                s["canvas_t"], s["mask_t"], s["clip_ref"],
-                s["defect_type"], s["caption"],
-                guidance_scale=1.0, cfg_mode="visual",
-                **ood_gen_kwargs,
-            )
-            torch.cuda.synchronize()
-
-    # --- Plot OOD grid (5 rows) ---
-    def _to_np(t: torch.Tensor):
-        return ((t[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
-
-    n_ood = len(ood_samples)
-    ood_path = save_path.parent / (save_path.stem + "_ood" + save_path.suffix)
-    fig, axes = plt.subplots(5, n_ood, figsize=(3.5 * n_ood, 15), squeeze=False)
-
-    for i, s in enumerate(ood_samples):
-        axes[0, i].imshow(s["canvas_np"])
-        axes[0, i].set_title(
-            f"Canvas ({s['canvas_id']})\n[{s['difficulty']}]", fontsize=7,
-        )
-        axes[0, i].axis("off")
-
-        axes[1, i].imshow(s["mask_np"], cmap="gray")
-        axes[1, i].set_title(
-            f"Placed mask ({s['mask_np'].mean() * 100:.1f}%)", fontsize=7,
-        )
-        axes[1, i].axis("off")
-
-        # Overlay mask with slight red tint so anomaly region is visible
-        crop_overlay = s["crop_np"].copy()
-        m = s["crop_mask_np"][..., None]  # [H, W, 1]
-        tint = np.array([1.0, 0.2, 0.2])  # red
-        crop_overlay = (crop_overlay * (1 - 0.3 * m) + tint * 0.3 * m).clip(0, 1)
-        axes[2, i].imshow(crop_overlay)
-        axes[2, i].set_title(
-            f"Ref crop ({s['ref_id']})\n{s['defect_type'][:25]}", fontsize=6,
-        )
-        axes[2, i].axis("off")
-
-        axes[3, i].imshow(_to_np(s["gen_visual"]))
-        axes[3, i].set_title("Gen (CFG=visual)", fontsize=8)
-        axes[3, i].axis("off")
-
-        axes[4, i].imshow(_to_np(s["gen_nocfg"]))
-        axes[4, i].set_title("Gen (CFG=1)", fontsize=8)
-        axes[4, i].axis("off")
-
-    plt.suptitle("OOD Diagnostic: VisA Cashew (unseen during training)", fontsize=11)
-    plt.tight_layout()
-    plt.savefig(ood_path, dpi=150, bbox_inches="tight")
-    plt.close()
+# NOTE: generate_anomagic_samples and _generate_ood_grid removed —
+# replaced by run_validation_suite() from scripts/validation_suite.py
 
 
 def _launch_live_loss(loss_file: Path):
@@ -2004,7 +1772,12 @@ def _launch_live_loss(loss_file: Path):
 
 
 def infinite_loader(loader):
+    epoch = 0
     while True:
+        epoch += 1
+        # Set epoch on dataset so __getitem__ can seed augmentation deterministically
+        # per (epoch, index). Works with persistent_workers (init_fn doesn't re-run).
+        loader.dataset._epoch = epoch
         for batch in loader:
             yield batch
 
@@ -2029,7 +1802,7 @@ if __name__ == "__main__":
                         help="Save checkpoint + samples every N steps")
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate for IP-Adapter")
-    parser.add_argument("--batch-size", type=int, default=12,
+    parser.add_argument("--batch-size", type=int, default=10,
                         help="Batch size")
     parser.add_argument("--ip-adapter-type", type=str, default="plus",
                         choices=["standard", "plus"],
@@ -2095,11 +1868,11 @@ if __name__ == "__main__":
                         choices=["cascade", "skip_only", "off"],
                         help="T2I-Adapter injection mode (cascade=encoder+decoder, skip_only=decoder, off=disabled)")
     # Conditioning dropout for CFG (3-category, mutually exclusive per-sample)
-    parser.add_argument("--drop-image-prob", type=float, default=0.10,
+    parser.add_argument("--drop-image-prob", type=float, default=0.15,
                         help="Probability of zeroing IP-Adapter image embeddings per sample for CFG")
-    parser.add_argument("--drop-text-prob", type=float, default=0.10,
+    parser.add_argument("--drop-text-prob", type=float, default=0.05,
                         help="Probability of replacing text with empty-string encoding per sample for CFG")
-    parser.add_argument("--drop-both-prob", type=float, default=0.05,
+    parser.add_argument("--drop-both-prob", type=float, default=0.0,
                         help="Probability of dropping both image and text per sample for CFG")
     # LoRA
     # Data augmentation
@@ -2113,8 +1886,8 @@ if __name__ == "__main__":
                         help="LoRA alpha (scaling factor)")
     parser.add_argument("--lora-lr", type=float, default=5e-5,
                         help="Learning rate for LoRA params (default 5e-5)")
-    parser.add_argument("--lora-mode", type=str, default="all", choices=["all", "cross"],
-                        help="LoRA target: 'all' = self+cross attention, 'cross' = cross-attention only")
+    parser.add_argument("--lora-mode", type=str, default="all", choices=["all", "cross", "mid_up"],
+                        help="LoRA target: 'all' = self+cross attention, 'cross' = cross-attention only, 'mid_up' = all attention in mid+up blocks")
     parser.add_argument("--unfreeze-qo", type=str, default="",
                         choices=["", "mid_up", "all_cross", "all"],
                         help="Unfreeze W_Q/W_O: mid_up=mid+up cross-attn, all_cross=all cross-attn, all=cross+self")
@@ -2158,6 +1931,17 @@ if __name__ == "__main__":
     parser.add_argument("--x0-hold-frac", type=float, default=0.1,
                         help="Fraction of total steps at the END to hold x0_ratio at end value "
                              "(default 0.1 = last 10%% of training holds at end value)")
+    # EMA
+    parser.add_argument("--ema-decay", type=float, default=0.9999,
+                        help="EMA decay rate (0=disabled, 0.9999=standard diffusion default)")
+    # Attention diagnostics
+    parser.add_argument("--diag-interval", type=int, default=1,
+                        help="Attention diagnostics (ip_entropy, norm ratio) frequency (default: 1)")
+    # Validation suite
+    parser.add_argument("--val-data-dir", type=str, default=None,
+                        help="Path to prepped validation data (from prep_validation_data.py)")
+    parser.add_argument("--val-panels", type=str, nargs="+", default=None,
+                        help="Which validation panels to run (default: all). Choices: A B C D E")
 
     args = parser.parse_args()
 
@@ -2174,6 +1958,10 @@ if __name__ == "__main__":
     resume_dir = Path(args.resume) if args.resume else None
     if resume_dir and not resume_dir.is_absolute():
         resume_dir = project_root / resume_dir
+
+    val_data_dir = Path(args.val_data_dir) if args.val_data_dir else None
+    if val_data_dir and not val_data_dir.is_absolute():
+        val_data_dir = project_root / val_data_dir
 
     train_anomagic(
         splits_dir=project_root / args.splits_dir,
@@ -2231,5 +2019,9 @@ if __name__ == "__main__":
         x0_no_context=args.x0_no_context,
         x0_warmup_frac=args.x0_warmup_frac,
         x0_hold_frac=args.x0_hold_frac,
+        diag_interval=args.diag_interval,
         clip_align=not args.no_clip_align,
+        val_data_dir=val_data_dir,
+        val_panels=args.val_panels,
+        ema_decay=args.ema_decay,
     )

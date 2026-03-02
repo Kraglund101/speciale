@@ -22,12 +22,15 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.utils.crop_utils import clip_crop_multi
 from src.utils.mask_utils import create_latent_band_mask, downsample_mask_maxpool
+from src.utils.placement_utils import place_easy_mask, place_hard_mask
 from src.inference.generate import generate_anomagic_single
 
 
@@ -202,6 +205,14 @@ def parse_defect_types(csv_path: Path) -> dict[str, str]:
     return defect_map
 
 
+def resolve_anomaly_paths(ref_id: str, difficulty: str) -> tuple[Path, Path]:
+    """Resolve paths to the original anomaly image and mask in Data/."""
+    subdir = "easy_imgs" if difficulty == "easy" else "hard_imgs"
+    img_path = CASHEW_ROOT / "Data" / "Images" / "Anomaly" / subdir / f"{ref_id}.JPG"
+    mask_path = CASHEW_ROOT / "Data" / "Masks" / "Anomaly" / f"{ref_id}.png"
+    return img_path, mask_path
+
+
 def resolve_canvas_image(canvas_id: str) -> Path:
     """Find canvas normal image — standard dir first, then extra normals pool."""
     standard = CANVAS_IMGS / f"{canvas_id}.JPG"
@@ -314,6 +325,10 @@ def generate_one(
     device: str = "cuda",
     layout: str = "A",
     force_no_dilate: bool = False,
+    ref_img_override: Path | None = None,
+    ref_mask_override: Path | None = None,
+    placed_mask_override: Path | None = None,
+    save_raw: bool = False,
 ) -> Path | None:
     """Generate one synthetic anomaly and save comparison panel."""
     # 1. Load canvas normal image
@@ -325,11 +340,12 @@ def generate_one(
     ).permute(2, 0, 1).unsqueeze(0).to(device)  # [1, 3, 512, 512] in [-1, 1]
 
     # 2. Load placed mask (image resolution → 512)
-    if EXPERIMENT == "ResNet":
-        placed_dir = EXP / "anomaly" / "masks" / difficulty
+    if placed_mask_override is not None:
+        placed_mask_path = placed_mask_override
+    elif EXPERIMENT == "ResNet":
+        placed_mask_path = EXP / "anomaly" / "masks" / difficulty / f"{canvas_id}.png"
     else:
-        placed_dir = EXP / "synthetic" / "placed_masks" / difficulty
-    placed_mask_path = placed_dir / f"{canvas_id}.png"
+        placed_mask_path = EXP / "synthetic" / "placed_masks" / difficulty / f"{canvas_id}.png"
     if not placed_mask_path.exists():
         print(f"  WARNING: placed mask not found: {placed_mask_path}")
         return None
@@ -339,14 +355,19 @@ def generate_one(
     mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).float().to(device)  # [1, 1, 512, 512]
 
     # 3. Load reference anomaly image + its own mask → CLIP crop
-    if EXPERIMENT == "ResNet":
+    if ref_img_override is not None:
+        ref_img_path = ref_img_override
+        ref_mask_path = ref_mask_override
+    elif EXPERIMENT == "ResNet":
         ref_imgs_dir = EXP / "source" / "reference_anomalies" / difficulty / "imgs"
         ref_masks_dir = EXP / "source" / "reference_anomalies" / difficulty / "masks"
+        ref_img_path = ref_imgs_dir / f"{ref_id}.JPG"
+        ref_mask_path = ref_masks_dir / f"{ref_id}.png"
     else:
         ref_imgs_dir = EXP / "source" / "anomalies" / difficulty / "imgs"
         ref_masks_dir = EXP / "source" / "anomalies" / difficulty / "masks"
-    ref_img_path = ref_imgs_dir / f"{ref_id}.JPG"
-    ref_mask_path = ref_masks_dir / f"{ref_id}.png"
+        ref_img_path = ref_imgs_dir / f"{ref_id}.JPG"
+        ref_mask_path = ref_masks_dir / f"{ref_id}.png"
     if not ref_img_path.exists() or not ref_mask_path.exists():
         print(f"  WARNING: ref image/mask not found for {ref_id}")
         return None
@@ -371,10 +392,12 @@ def generate_one(
     # Convert CLIP crops to [-1, 1] for generate_anomagic_single
     clip_ref = (clip_img_t * 2.0 - 1.0).unsqueeze(0).to(device)  # [1, 3, 224, 224]
     clip_mask_for_attn = clip_mask_t.unsqueeze(0).to(device)  # [1, 1, 224, 224]
+    clip_core_for_attn = clip_mask_for_attn  # no roundtrip dilation → crop mask IS core
 
     # Second crop
     clip_ref_2 = (crops[1] * 2.0 - 1.0).unsqueeze(0).to(device)  # [1, 3, 224, 224]
     clip_mask_2 = crop_masks[1].unsqueeze(0).to(device)  # [1, 1, 224, 224]
+    clip_core_2 = clip_mask_2  # no roundtrip dilation → crop mask IS core
 
     # Group validity flags [1, 2]
     group_valid = torch.tensor(
@@ -409,15 +432,23 @@ def generate_one(
             t2i_adapter=t2i_adapter,
             seed=seed,
             clip_mask=clip_mask_for_attn,
+            clip_core_mask=clip_core_for_attn,
             reference_2=clip_ref_2,
             clip_mask_2=clip_mask_2,
+            clip_core_mask_2=clip_core_2,
             group_valid=group_valid,
-            dilate_clip_mask=dilate,
+            inference_mode="different",
         )
 
     # Decode output tensor to PIL
     gen_np = ((output[0].cpu().clamp(-1, 1) + 1) / 2 * 255).byte().permute(1, 2, 0).numpy()
     gen_pil = Image.fromarray(gen_np)
+
+    # Save raw 512×512 generated image (keyed by ref_id for 1:1 mapping)
+    if save_raw:
+        raw_dir = EXP / "anomaly" / "imgs" / difficulty
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        gen_pil.save(raw_dir / f"{ref_id}.png")
 
     # 6. Compute 64×64 roundtrip masks (same as placement viz + what UNet actually sees)
     core_64 = downsample_mask_maxpool(mask_t.cpu(), 64)
@@ -557,6 +588,165 @@ def generate_one(
     return panel_path
 
 
+# ── Full manifest builder ─────────────────────────────────────────────────
+
+def build_full_manifest(seed: int = 42) -> list[dict]:
+    """Build manifest for all 100 anomalies (reference + train_real + test).
+
+    For the 40 reference-split entries: uses existing manifest pairings.
+    For the 60 train_real + test entries: assigns canvases from the experiment
+    canvas pool and places masks on-the-fly using placement_utils.
+
+    Returns:
+        List of 100 manifest entries, each with keys:
+        canvas_id, ref_id, difficulty, and optionally placed_mask_name (for
+        new entries with non-standard naming).
+    """
+    splits_path = EXP / "splits.json"
+    with open(splits_path) as f:
+        splits = json.load(f)
+
+    # Load existing manifests (reference split — 38 easy + 2 hard = 40)
+    easy_manifest_path = EXP / "anomaly" / "masks" / "easy" / "manifest.json"
+    hard_manifest_path = EXP / "anomaly" / "masks" / "hard" / "manifest.json"
+
+    existing_easy = []
+    if easy_manifest_path.exists():
+        with open(easy_manifest_path) as f:
+            existing_easy = json.load(f)
+    existing_hard = []
+    if hard_manifest_path.exists():
+        with open(hard_manifest_path) as f:
+            existing_hard = json.load(f)
+
+    # Reference entries keep their original placed mask naming ({canvas_id}.png)
+    all_entries = []
+    for e in existing_easy + existing_hard:
+        all_entries.append(dict(e))
+
+    # Collect the 60 non-reference anomalies
+    new_anomalies = []
+    for split_name in ["train_real", "test"]:
+        for diff in ["easy", "hard"]:
+            for aid in splits[split_name].get(diff, []):
+                new_anomalies.append({"ref_id": aid, "difficulty": diff})
+
+    new_easy = [a for a in new_anomalies if a["difficulty"] == "easy"]
+    new_hard = [a for a in new_anomalies if a["difficulty"] == "hard"]
+    print(f"Full manifest: {len(all_entries)} reference + "
+          f"{len(new_easy)} new easy + {len(new_hard)} new hard = "
+          f"{len(all_entries) + len(new_anomalies)} total")
+
+    # Load canvas FG masks (from the 50 designated experiment canvases)
+    canvas_mask_dir = EXP / "source" / "canvas_normals" / "masks"
+    canvas_ids = splits["normals"]["canvas"]
+    canvas_fg: dict[str, np.ndarray] = {}
+    for cid in canvas_ids:
+        mask_path = canvas_mask_dir / f"{cid}.png"
+        if mask_path.exists():
+            canvas_fg[cid] = load_binary_mask(mask_path)
+    print(f"Loaded {len(canvas_fg)} canvas FG masks")
+
+    placed_mask_dir_easy = EXP / "anomaly" / "masks" / "easy"
+    placed_mask_dir_easy.mkdir(parents=True, exist_ok=True)
+    placed_mask_dir_hard = EXP / "anomaly" / "masks" / "hard"
+    placed_mask_dir_hard.mkdir(parents=True, exist_ok=True)
+
+    # Assign canvases to new easy entries (cycle through shuffled pool)
+    rng = random.Random(seed)
+    canvas_pool = list(canvas_fg.keys())
+    rng.shuffle(canvas_pool)
+    pool_idx = 0
+
+    for i, entry in enumerate(new_easy):
+        aid = entry["ref_id"]
+        canvas_id = canvas_pool[pool_idx % len(canvas_pool)]
+        pool_idx += 1
+
+        placed_name = f"{aid}_on_{canvas_id}.png"
+        placed_path = placed_mask_dir_easy / placed_name
+
+        if placed_path.exists():
+            print(f"  Easy {aid}: placed mask exists, skipping placement")
+        else:
+            anomaly_mask = load_binary_mask(
+                CASHEW_ROOT / "Data" / "Masks" / "Anomaly" / f"{aid}.png"
+            )
+            fg_mask = canvas_fg[canvas_id]
+            placed = place_easy_mask(anomaly_mask, fg_mask, seed=seed + i)
+
+            if placed is None:
+                # Try other canvases as fallback
+                for alt_cid in canvas_fg:
+                    if alt_cid == canvas_id:
+                        continue
+                    placed = place_easy_mask(
+                        anomaly_mask, canvas_fg[alt_cid], seed=seed + i,
+                    )
+                    if placed is not None:
+                        canvas_id = alt_cid
+                        placed_name = f"{aid}_on_{canvas_id}.png"
+                        placed_path = placed_mask_dir_easy / placed_name
+                        break
+                if placed is None:
+                    print(f"  ERROR: could not place easy {aid}, skipping")
+                    continue
+
+            Image.fromarray(
+                (placed * 255).astype(np.uint8)
+            ).save(placed_path)
+            print(f"  Placed easy {aid} on canvas {canvas_id}")
+
+        entry["canvas_id"] = canvas_id
+        entry["placed_mask_name"] = placed_name
+        all_entries.append(entry)
+
+    # Place hard anomalies (exhaustive search across all canvases)
+    hard_used: set[str] = set()
+    for i, entry in enumerate(new_hard):
+        aid = entry["ref_id"]
+
+        # Check if already placed from a previous run
+        existing = list(placed_mask_dir_hard.glob(f"{aid}_on_*.png"))
+        if existing:
+            placed_path = existing[0]
+            canvas_id = placed_path.stem.split("_on_")[1]
+            placed_name = placed_path.name
+            print(f"  Hard {aid}: placed mask exists ({placed_name})")
+        else:
+            anomaly_mask = load_binary_mask(
+                CASHEW_ROOT / "Data" / "Masks" / "Anomaly" / f"{aid}.png"
+            )
+            result = place_hard_mask(
+                anomaly_mask, canvas_fg, used=hard_used, seed=seed + 100 + i,
+            )
+            if result is None:
+                print(f"  ERROR: could not place hard {aid}, skipping")
+                continue
+
+            canvas_id, placed, angle, scale, cov = result
+            hard_used.add(canvas_id)
+            placed_name = f"{aid}_on_{canvas_id}.png"
+            placed_path = placed_mask_dir_hard / placed_name
+            Image.fromarray(
+                (placed * 255).astype(np.uint8)
+            ).save(placed_path)
+            print(f"  Placed hard {aid} on canvas {canvas_id} "
+                  f"(angle={angle:.1f}, scale={scale:.2f}, cov={cov:.2f}%)")
+
+        entry["canvas_id"] = canvas_id
+        entry["placed_mask_name"] = placed_name
+        all_entries.append(entry)
+
+    # Save combined manifest
+    manifest_path = EXP / "anomaly" / "manifest_all.json"
+    with open(manifest_path, "w") as f:
+        json.dump(all_entries, f, indent=2)
+    print(f"Saved manifest_all.json with {len(all_entries)} entries")
+
+    return all_entries
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def main():
@@ -566,6 +756,12 @@ def main():
     parser.add_argument("--experiment", type=str, default="ResNet",
                         choices=["ResNet", "UniNet"],
                         help="Experiment layout (default: ResNet)")
+    parser.add_argument("--all", action="store_true",
+                        help="Generate for ALL 100 anomalies (reference + "
+                             "train_real + test)")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Skip entries where raw image already exists "
+                             "(for resume after interruption)")
     parser.add_argument("--num-easy", type=int, default=5)
     parser.add_argument("--num-hard", type=int, default=1)
     parser.add_argument("--noise-easy", type=float, default=0.7)
@@ -594,44 +790,48 @@ def main():
     defect_map = parse_defect_types(IMAGE_ANNO_CSV)
     print(f"Loaded {len(defect_map)} defect type entries from image_anno.csv")
 
-    # Load manifests
-    if EXPERIMENT == "ResNet":
-        easy_manifest_path = EXP / "anomaly" / "masks" / "easy" / "manifest.json"
-        hard_manifest_path = EXP / "anomaly" / "masks" / "hard" / "manifest.json"
+    if args.all:
+        # ── Full generation mode: all 100 anomalies ──────────────────────
+        all_entries = build_full_manifest(seed=args.seed)
+        total = len(all_entries)
+        print(f"\nGenerating ALL {total} samples")
     else:
-        easy_manifest_path = EXP / "synthetic" / "placed_masks" / "easy" / "manifest.json"
-        hard_manifest_path = EXP / "synthetic" / "placed_masks" / "hard" / "manifest.json"
+        # ── Subset mode: random selection from reference manifests ────────
+        if EXPERIMENT == "ResNet":
+            easy_manifest_path = EXP / "anomaly" / "masks" / "easy" / "manifest.json"
+            hard_manifest_path = EXP / "anomaly" / "masks" / "hard" / "manifest.json"
+        else:
+            easy_manifest_path = EXP / "synthetic" / "placed_masks" / "easy" / "manifest.json"
+            hard_manifest_path = EXP / "synthetic" / "placed_masks" / "hard" / "manifest.json"
 
-    easy_entries = []
-    if easy_manifest_path.exists():
-        with open(easy_manifest_path) as f:
-            easy_entries = json.load(f)
-        print(f"Easy manifest: {len(easy_entries)} entries")
-    else:
-        print(f"WARNING: {easy_manifest_path} not found — run viz_mask_placement.py first")
+        easy_entries = []
+        if easy_manifest_path.exists():
+            with open(easy_manifest_path) as f:
+                easy_entries = json.load(f)
+            print(f"Easy manifest: {len(easy_entries)} entries")
+        else:
+            print(f"WARNING: {easy_manifest_path} not found")
 
-    hard_entries = []
-    if hard_manifest_path.exists():
-        with open(hard_manifest_path) as f:
-            hard_entries = json.load(f)
-        print(f"Hard manifest: {len(hard_entries)} entries")
-    else:
-        print(f"WARNING: {hard_manifest_path} not found — run redo_hard_placement.py first")
+        hard_entries = []
+        if hard_manifest_path.exists():
+            with open(hard_manifest_path) as f:
+                hard_entries = json.load(f)
+            print(f"Hard manifest: {len(hard_entries)} entries")
+        else:
+            print(f"WARNING: {hard_manifest_path} not found")
 
-    # Select subset
-    rng = random.Random(args.seed)
-    if len(easy_entries) > args.num_easy:
-        easy_selected = rng.sample(easy_entries, args.num_easy)
-    else:
-        easy_selected = easy_entries[:args.num_easy]
+        rng = random.Random(args.seed)
+        easy_selected = (rng.sample(easy_entries, args.num_easy)
+                         if len(easy_entries) > args.num_easy
+                         else easy_entries[:args.num_easy])
+        hard_selected = (rng.sample(hard_entries, args.num_hard)
+                         if len(hard_entries) > args.num_hard
+                         else hard_entries[:args.num_hard])
 
-    if len(hard_entries) > args.num_hard:
-        hard_selected = rng.sample(hard_entries, args.num_hard)
-    else:
-        hard_selected = hard_entries[:args.num_hard]
-
-    total = len(easy_selected) + len(hard_selected)
-    print(f"\nGenerating {len(easy_selected)} easy + {len(hard_selected)} hard = {total} samples")
+        all_entries = easy_selected + hard_selected
+        total = len(all_entries)
+        print(f"\nGenerating {len(easy_selected)} easy + "
+              f"{len(hard_selected)} hard = {total} samples")
 
     if total == 0:
         print("Nothing to generate. Check manifests.")
@@ -642,9 +842,30 @@ def main():
 
     # Generate
     panels = []
-    for i, entry in enumerate(easy_selected + hard_selected):
+    skipped = 0
+    for i, entry in enumerate(all_entries):
         difficulty = entry["difficulty"]
         noise = args.noise_easy if difficulty == "easy" else args.noise_hard
+
+        # Skip existing if requested
+        if args.skip_existing:
+            raw_path = (EXP / "anomaly" / "imgs" / difficulty
+                        / f"{entry['ref_id']}.png")
+            if raw_path.exists():
+                print(f"\n[{i + 1}/{total}] Skipping {entry['ref_id']} "
+                      f"(raw exists)")
+                skipped += 1
+                continue
+
+        # Resolve paths for non-reference entries (those with placed_mask_name)
+        ref_img = ref_mask = placed_mask = None
+        if "placed_mask_name" in entry:
+            ref_img, ref_mask = resolve_anomaly_paths(
+                entry["ref_id"], difficulty,
+            )
+            placed_mask = (EXP / "anomaly" / "masks" / difficulty
+                           / entry["placed_mask_name"])
+
         print(f"\n[{i + 1}/{total}]", end="")
         panel_path = generate_one(
             pipeline, ip_adapter, t2i_adapter,
@@ -660,13 +881,20 @@ def main():
             device="cuda",
             layout=args.layout,
             force_no_dilate=args.no_clip_dilate,
+            ref_img_override=ref_img,
+            ref_mask_override=ref_mask,
+            placed_mask_override=placed_mask,
+            save_raw=args.all,
         )
         if panel_path:
             panels.append(panel_path)
 
     print(f"\n{'=' * 60}")
-    print(f"Generated {len(panels)}/{total} samples")
+    skipped_msg = f" (skipped {skipped})" if skipped else ""
+    print(f"Generated {len(panels)}/{total} samples{skipped_msg}")
     print(f"Viz: {CASHEW_ROOT / 'viz'}")
+    if args.all:
+        print(f"Raw images: {EXP / 'anomaly' / 'imgs'}")
     for p in panels:
         print(f"  {p}")
 

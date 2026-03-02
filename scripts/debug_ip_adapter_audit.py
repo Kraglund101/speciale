@@ -665,21 +665,31 @@ def task5_distribution_audit(pipeline, ip_adapter, dataset, device):
         print(f"Stage 3 — After masked self-attn (mode {visual_mode}): {_tensor_stats(aware_tokens, 'aware')}")
         print(f"  Delta from input: {(aware_tokens - anomaly_tokens).norm().item():.6f}")
 
-        # Global token
-        active_3d = active_mask.unsqueeze(-1)
-        token_sum = (patch_tokens * active_3d).sum(dim=1, keepdim=True)
-        count = active_mask.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)
-        global_token = token_sum / count + ip_adapter.masked_self_attn.emb_global
-        resampler_input = torch.cat([global_token, aware_tokens], dim=1)
+        # Global anomaly token: mean pool over core-only patches
+        core_3d = is_core.unsqueeze(-1)
+        core_sum = (patch_tokens * core_3d).sum(dim=1, keepdim=True)
+        core_count = is_core.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)
+        global_anomaly_token = core_sum / core_count + ip_adapter.masked_self_attn.emb_global
+        resampler_input = torch.cat([global_anomaly_token, aware_tokens], dim=1)
     else:
         with torch.no_grad():
             aware_tokens = ip_adapter.masked_self_attn(tokens_with_role, mask=cm)
         print(f"Stage 3 — After masked self-attn (mode {visual_mode}): {_tensor_stats(aware_tokens, 'aware')}")
         print(f"  Delta from input: {(aware_tokens - tokens_with_role).norm().item():.6f}")
-        global_token = patch_tokens.mean(dim=1, keepdim=True)
-        resampler_input = torch.cat([global_token, aware_tokens], dim=1)
+        # Global anomaly token: core-only if available, else active mask fallback
+        if ccm is not None:
+            core_3d = is_core.unsqueeze(-1)
+            core_sum = (patch_tokens * core_3d).sum(dim=1, keepdim=True)
+            core_count = is_core.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)
+            global_anomaly_token = core_sum / core_count + ip_adapter.masked_self_attn.emb_global
+        else:
+            active_3d = active_mask.unsqueeze(-1) if cm is not None else torch.ones(B, N, 1, device=device)
+            token_sum = (patch_tokens * active_3d).sum(dim=1, keepdim=True)
+            count = active_3d.sum(dim=1, keepdim=True).clamp(min=1)
+            global_anomaly_token = token_sum / count + ip_adapter.masked_self_attn.emb_global
+        resampler_input = torch.cat([global_anomaly_token, aware_tokens], dim=1)
 
-    print(f"  Global token: {_tensor_stats(global_token, 'global')}")
+    print(f"  Global anomaly token: {_tensor_stats(global_anomaly_token, 'global')}")
 
     # Stage 4: Resampler output
     with torch.no_grad():
@@ -1144,7 +1154,8 @@ def task7_deterministic_overfit(
 
                 diff = (noise_pred - cb["noise"].float()) ** 2
                 weight_expanded = cb["weight_map_64"].expand_as(noise_pred)
-                loss = (diff * weight_expanded).sum() / weight_expanded.sum().clamp(min=1e-8)
+                per_w = weight_expanded.sum(dim=(1, 2, 3)).clamp(min=1e-8)  # [B]
+                loss = ((diff * weight_expanded).sum(dim=(1, 2, 3)) / per_w).mean()
 
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
@@ -1300,7 +1311,7 @@ Loss formula:
   target = noise (epsilon-prediction)
   diff = (noise_pred - noise)^2
   weighted_diff = diff * weight_map_64.expand_as(noise_pred)
-  loss = weighted_diff.sum() / weight_expanded.sum()
+  loss = mean_per_sample(weighted_diff / per_sample_weight_sum)  # per-sample averaging
 
 This is MSE between predicted and true noise, weighted by the core/band weight map.
 """)

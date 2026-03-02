@@ -44,9 +44,9 @@ def parse_losses(filepath: str) -> list:
 def parse_stats(filepath: str) -> dict:
     """Parse CFG stats.csv → dict of numpy arrays.
 
-    Expected 23 columns:
+    Expected 22 columns:
     step,loss,L_null,L_cond,delta_norm,
-    L_cfg_s1.0,L_cfg_s1.5,L_cfg_s2.0,L_cfg_s3.0,L_cfg_s5.0,
+    L_cfg_s1.5,L_cfg_s2.0,L_cfg_s3.0,L_cfg_s5.0,
     s_mean,s_std,s_min,s_max,
     core_loss,band_loss,grad_norm,
     attn_gate,ff_gate,lr_pretrained,lr_scratch,l2sp,progress
@@ -115,6 +115,10 @@ def _load_run_title(run_dir: str) -> str:
             parts.append("learned_s(t)")
             if cc == "F":
                 parts.append("warmup")
+        elif cc == "G":
+            frac = cfg.get("cfg_transition_frac", 0.5)
+            parts.append(f"C->E @{frac:.0%}")
+            parts.append(f"s=[{cfg.get('cfg_s_min', '?')},{cfg.get('cfg_s_max', '?')}]")
         parts.append(f"SA={cfg.get('sa_num_layers', '?')}L/{cfg.get('sa_num_heads', '?')}H")
         parts.append(f"gates={'forced' if cfg.get('force_gates') else 'learnable' if cfg.get('learnable_gates', True) else 'no'}")
         return " | ".join(str(p) for p in parts)
@@ -175,10 +179,10 @@ def main():
         ax = axes[0, 1]
         if has_data:
             cfg_colors = {
-                "1.0": "#2196F3", "1.5": "#4CAF50", "2.0": "#FF9800",
+                "1.5": "#4CAF50", "2.0": "#FF9800",
                 "3.0": "#F44336", "5.0": "#9C27B0",
             }
-            for s_val in ["1.0", "1.5", "2.0", "3.0", "5.0"]:
+            for s_val in ["1.5", "2.0", "3.0", "5.0"]:
                 key = f"L_cfg_s{s_val}"
                 if key in stats and len(stats[key]) > 1:
                     ema_val = ema_smooth(stats[key], SM)

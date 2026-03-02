@@ -75,6 +75,7 @@ def _clip_augmentation_transforms(
     mask: Image.Image,
     brightness_range: Tuple[float, float] = (0.85, 1.15),
     contrast_range: Tuple[float, float] = (0.85, 1.15),
+    return_meta: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply CLIP-path augmentation transforms (flip, jitter, rotate) to PIL images.
 
@@ -84,18 +85,22 @@ def _clip_augmentation_transforms(
     Args:
         image: PIL RGB image at original resolution
         mask: PIL grayscale mask at original resolution
+        return_meta: If True, return augmentation metadata dict as third element.
 
     Returns:
         (image_tensor [3, H, W] in [0,1],
          mask_tensor [1, H, W] in {0,1})
+        If return_meta: additionally returns dict with flip_h, flip_v, rotation.
     """
     # Horizontal flip p=0.5
-    if random.random() < 0.5:
+    flip_h = random.random() < 0.5
+    if flip_h:
         image = TF.hflip(image)
         mask = TF.hflip(mask)
 
     # Vertical flip p=0.5
-    if random.random() < 0.5:
+    flip_v = random.random() < 0.5
+    if flip_v:
         image = TF.vflip(image)
         mask = TF.vflip(mask)
 
@@ -116,6 +121,9 @@ def _clip_augmentation_transforms(
     mask_t = TF.to_tensor(mask.convert("L")) # [1, H, W]
     mask_t = (mask_t > 0.5).float()
 
+    if return_meta:
+        meta = {"flip_h": flip_h, "flip_v": flip_v, "rotation": angle}
+        return img_t, mask_t, meta
     return img_t, mask_t
 
 
@@ -152,6 +160,50 @@ def _apply_clip_augmentation(
     return crop_img, crop_mask
 
 
+def _serialize_clip_meta(
+    result: Dict,
+    aug_meta: Dict,
+    crop_metas: List[Dict],
+    img_shape: Tuple[int, ...],
+) -> None:
+    """Serialize CLIP augmentation metadata as individual tensors for DataLoader.
+
+    Args:
+        result: Dict to populate with tensor fields.
+        aug_meta: {"flip_h": bool, "flip_v": bool, "rotation": int}
+        crop_metas: List of {"crop_top", "crop_left", "crop_h", "crop_w", "resized"} dicts.
+        img_shape: (C, H, W) shape of the augmented image (after flips/rotation).
+    """
+    result["clip_flip_h"] = torch.tensor(float(aug_meta["flip_h"]))
+    result["clip_flip_v"] = torch.tensor(float(aug_meta["flip_v"]))
+    result["clip_rotation"] = torch.tensor(float(aug_meta["rotation"]))
+    result["orig_h"] = torch.tensor(float(img_shape[1]))
+    result["orig_w"] = torch.tensor(float(img_shape[2]))
+
+    # Crop 1
+    cm1 = crop_metas[0]
+    result["clip_crop_top"] = torch.tensor(float(cm1["crop_top"]))
+    result["clip_crop_left"] = torch.tensor(float(cm1["crop_left"]))
+    result["clip_crop_h"] = torch.tensor(float(cm1["crop_h"]))
+    result["clip_crop_w"] = torch.tensor(float(cm1["crop_w"]))
+    result["clip_resized"] = torch.tensor(float(cm1["resized"]))
+
+    # Crop 2 (multi-crop only; zeros if not available)
+    if len(crop_metas) > 1:
+        cm2 = crop_metas[1]
+        result["clip_crop_top_2"] = torch.tensor(float(cm2["crop_top"]))
+        result["clip_crop_left_2"] = torch.tensor(float(cm2["crop_left"]))
+        result["clip_crop_h_2"] = torch.tensor(float(cm2["crop_h"]))
+        result["clip_crop_w_2"] = torch.tensor(float(cm2["crop_w"]))
+        result["clip_resized_2"] = torch.tensor(float(cm2["resized"]))
+    else:
+        result["clip_crop_top_2"] = torch.tensor(0.0)
+        result["clip_crop_left_2"] = torch.tensor(0.0)
+        result["clip_crop_h_2"] = torch.tensor(0.0)
+        result["clip_crop_w_2"] = torch.tensor(0.0)
+        result["clip_resized_2"] = torch.tensor(0.0)
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -174,6 +226,7 @@ class AnomalyDataset(Dataset):
         multi_crop: bool = False,
         band_mode: int = 2,
         clip_align: bool = True,
+        return_clip_meta: bool = False,
     ):
         """
         Args:
@@ -191,6 +244,8 @@ class AnomalyDataset(Dataset):
             band_mode: Latent-space band dilation mode (1 or 2) for UNet roundtrip masks
             clip_align: Use UNet-roundtripped dilated masks for CLIP self-attention + role embeddings.
                 When False, reverts to raw cropped masks with no role embedding distinction.
+            return_clip_meta: If True, return CLIP augmentation metadata (flip, rotation,
+                crop coordinates) as individual tensor fields for DataLoader compatibility.
         """
         self.image_size = image_size
         self.splits_dir = Path(splits_dir)
@@ -203,6 +258,7 @@ class AnomalyDataset(Dataset):
         self.augment = augment
         self.multi_crop = multi_crop
         self.clip_align = clip_align
+        self.return_clip_meta = return_clip_meta
 
         # Load captions if provided (keyed by image_path for uniqueness)
         self.captions: Dict[str, str] = {}
@@ -327,6 +383,14 @@ class AnomalyDataset(Dataset):
             mask_pil = Image.new("L", (self.image_size, self.image_size), 0)
 
         if self.augment:
+            # --- Deterministic epoch-aware seeding for reproducibility ---
+            # With persistent_workers, worker_init_fn only runs once. Re-seed per
+            # (epoch, index) so augmentation varies across epochs but is reproducible.
+            _epoch = getattr(self, '_epoch', 0)
+            _local_seed = 42 + _epoch * len(self) + idx
+            random.seed(_local_seed)
+            np.random.seed(_local_seed)
+
             # --- Augmented path ---
             # UNet: flip, 90° rotate, jitter, anomaly-aware 512 crop
             image, mask = _apply_unet_augmentation(
@@ -344,16 +408,27 @@ class AnomalyDataset(Dataset):
 
             # CLIP: independent flip, jitter, continuous rotate, crop_utils crop
             if self.return_reference:
+                _rcm = self.return_clip_meta
                 if self.multi_crop:
                     # Multi-crop: apply transforms then get 2 separate group crops
-                    img_t, mask_t = _clip_augmentation_transforms(image_pil, mask_pil)
+                    if _rcm:
+                        img_t, mask_t, aug_meta = _clip_augmentation_transforms(
+                            image_pil, mask_pil, return_meta=True,
+                        )
+                    else:
+                        img_t, mask_t = _clip_augmentation_transforms(image_pil, mask_pil)
                     if self.clip_align:
                         # UNet-roundtripped masks for CLIP alignment
                         core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
-                        crops, crop_masks, valid, extra = clip_crop_multi(
+                        mc_result = clip_crop_multi(
                             img_t, mask_t, crop_size=self.reference_crop_size,
                             clip_masks=[dil_native, core_native],
+                            return_crop_meta=_rcm,
                         )
+                        if _rcm:
+                            crops, crop_masks, valid, extra, crop_metas = mc_result
+                        else:
+                            crops, crop_masks, valid, extra = mc_result
                         result["reference"] = crops[0] * 2.0 - 1.0
                         result["clip_mask"] = (extra[0][0] > 0.5).float()       # dilated (attention routing)
                         result["clip_core_mask"] = (extra[0][1] > 0.5).float()  # core (role embeddings)
@@ -365,9 +440,14 @@ class AnomalyDataset(Dataset):
                         )
                     else:
                         # Old behavior: raw cropped masks, no role embeddings
-                        crops, crop_masks, valid = clip_crop_multi(
+                        mc_result = clip_crop_multi(
                             img_t, mask_t, crop_size=self.reference_crop_size,
+                            return_crop_meta=_rcm,
                         )
+                        if _rcm:
+                            crops, crop_masks, valid, crop_metas = mc_result
+                        else:
+                            crops, crop_masks, valid = mc_result
                         result["reference"] = crops[0] * 2.0 - 1.0
                         result["clip_mask"] = (crop_masks[0] > 0.5).float()
                         result["reference_2"] = crops[1] * 2.0 - 1.0
@@ -375,28 +455,47 @@ class AnomalyDataset(Dataset):
                         result["group_valid"] = torch.tensor(
                             [float(valid[0]), float(valid[1])],
                         )
+                    if _rcm:
+                        _serialize_clip_meta(result, aug_meta, crop_metas, img_t.shape)
                 else:
                     # Single crop: apply augmentation then crop
-                    img_t, mask_t = _clip_augmentation_transforms(
-                        image_pil, mask_pil,
-                    )
+                    if _rcm:
+                        img_t, mask_t, aug_meta = _clip_augmentation_transforms(
+                            image_pil, mask_pil, return_meta=True,
+                        )
+                    else:
+                        img_t, mask_t = _clip_augmentation_transforms(
+                            image_pil, mask_pil,
+                        )
                     if self.clip_align:
                         core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
-                        crop_img, crop_mask, extra = clip_crop(
+                        sc_result = clip_crop(
                             img_t, mask_t, crop_size=self.reference_crop_size,
                             clip_masks=[dil_native, core_native],
+                            return_crop_meta=_rcm,
                         )
+                        if _rcm:
+                            crop_img, crop_mask, extra, crop_meta_1 = sc_result
+                        else:
+                            crop_img, crop_mask, extra = sc_result
                         crop_mask = (crop_mask > 0.5).float()
                         result["reference"] = crop_img * 2.0 - 1.0
                         result["clip_mask"] = (extra[0] > 0.5).float()       # dilated
                         result["clip_core_mask"] = (extra[1] > 0.5).float()  # core
                     else:
-                        crop_img, crop_mask = clip_crop(
+                        sc_result = clip_crop(
                             img_t, mask_t, crop_size=self.reference_crop_size,
+                            return_crop_meta=_rcm,
                         )
+                        if _rcm:
+                            crop_img, crop_mask, crop_meta_1 = sc_result
+                        else:
+                            crop_img, crop_mask = sc_result
                         crop_mask = (crop_mask > 0.5).float()
                         result["reference"] = crop_img * 2.0 - 1.0
                         result["clip_mask"] = crop_mask
+                    if _rcm:
+                        _serialize_clip_meta(result, aug_meta, [crop_meta_1], img_t.shape)
 
         else:
             # --- Non-augmented path (original behavior) ---
@@ -415,6 +514,7 @@ class AnomalyDataset(Dataset):
             }
 
             if self.return_reference:
+                _rcm = self.return_clip_meta
                 if self.multi_crop:
                     # Multi-crop: get 2 separate group crops from non-augmented image
                     img_t = TF.to_tensor(image_pil)  # [3, H, W] in [0, 1]
@@ -423,10 +523,15 @@ class AnomalyDataset(Dataset):
                     if self.clip_align:
                         # UNet-roundtripped masks for CLIP alignment
                         core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
-                        crops, crop_masks, valid, extra = clip_crop_multi(
+                        mc_result = clip_crop_multi(
                             img_t, mask_t, crop_size=self.reference_crop_size,
                             clip_masks=[dil_native, core_native],
+                            return_crop_meta=_rcm,
                         )
+                        if _rcm:
+                            crops, crop_masks, valid, extra, crop_metas = mc_result
+                        else:
+                            crops, crop_masks, valid, extra = mc_result
                         result["reference"] = crops[0] * 2.0 - 1.0
                         result["clip_mask"] = (extra[0][0] > 0.5).float()       # dilated
                         result["clip_core_mask"] = (extra[0][1] > 0.5).float()  # core
@@ -438,9 +543,14 @@ class AnomalyDataset(Dataset):
                         )
                     else:
                         # Old behavior: raw cropped masks, no role embeddings
-                        crops, crop_masks, valid = clip_crop_multi(
+                        mc_result = clip_crop_multi(
                             img_t, mask_t, crop_size=self.reference_crop_size,
+                            return_crop_meta=_rcm,
                         )
+                        if _rcm:
+                            crops, crop_masks, valid, crop_metas = mc_result
+                        else:
+                            crops, crop_masks, valid = mc_result
                         result["reference"] = crops[0] * 2.0 - 1.0
                         result["clip_mask"] = (crop_masks[0] > 0.5).float()
                         result["reference_2"] = crops[1] * 2.0 - 1.0
@@ -448,6 +558,9 @@ class AnomalyDataset(Dataset):
                         result["group_valid"] = torch.tensor(
                             [float(valid[0]), float(valid[1])],
                         )
+                    if _rcm:
+                        no_aug_meta = {"flip_h": False, "flip_v": False, "rotation": 0}
+                        _serialize_clip_meta(result, no_aug_meta, crop_metas, img_t.shape)
                 else:
                     # Single crop (non-augmented)
                     img_t = TF.to_tensor(image_pil)  # [3, H, W] in [0, 1]
@@ -455,20 +568,33 @@ class AnomalyDataset(Dataset):
                     mask_t = (mask_t > 0.5).float()
                     if self.clip_align:
                         core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
-                        crop_img, crop_mask, extra_crops = clip_crop(
+                        sc_result = clip_crop(
                             img_t, mask_t, crop_size=self.reference_crop_size,
                             clip_masks=[dil_native, core_native],
+                            return_crop_meta=_rcm,
                         )
+                        if _rcm:
+                            crop_img, crop_mask, extra_crops, crop_meta_1 = sc_result
+                        else:
+                            crop_img, crop_mask, extra_crops = sc_result
                         result["reference"] = crop_img * 2.0 - 1.0
                         result["clip_mask"] = (extra_crops[0] > 0.5).float()       # dilated
                         result["clip_core_mask"] = (extra_crops[1] > 0.5).float()  # core
                     else:
-                        crop_img, crop_mask = clip_crop(
+                        sc_result = clip_crop(
                             img_t, mask_t, crop_size=self.reference_crop_size,
+                            return_crop_meta=_rcm,
                         )
+                        if _rcm:
+                            crop_img, crop_mask, crop_meta_1 = sc_result
+                        else:
+                            crop_img, crop_mask = sc_result
                         crop_mask = (crop_mask > 0.5).float()
                         result["reference"] = crop_img * 2.0 - 1.0
                         result["clip_mask"] = crop_mask
+                    if _rcm:
+                        no_aug_meta = {"flip_h": False, "flip_v": False, "rotation": 0}
+                        _serialize_clip_meta(result, no_aug_meta, [crop_meta_1], img_t.shape)
 
         # Skip samples where mask is empty (tiny anomalies vanish)
         if result["mask"].sum() == 0 and _retries < 10:

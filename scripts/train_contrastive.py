@@ -24,6 +24,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 from PIL import Image
 from tqdm import tqdm
 
@@ -2068,7 +2070,7 @@ def train_contrastive(
     # fp16 overflow (65504 ceiling) in attention dot products and sums.
     use_amp = True
     amp_dtype = torch.bfloat16
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    # No GradScaler needed — bf16 has same exponent range as fp32.
     pipeline.text_encoder.float()
     pipeline.vae.float()
     pipeline.dtype = torch.float32
@@ -2356,12 +2358,11 @@ def train_contrastive(
             torch.cuda.empty_cache()
             continue
 
-        scaler.scale(loss_total).backward()
+        loss_total.backward()
         torch.cuda.synchronize()  # TDR prevention
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
-        scaler.step(optimizer)
-        scaler.update()
+        _raw_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
+        grad_norm = _raw_norm if math.isfinite(_raw_norm) else 0.0
+        optimizer.step()
 
         loss_val = loss_total.item()
         losses.append(extras["L_diff"])

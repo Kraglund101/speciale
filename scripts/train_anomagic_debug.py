@@ -40,6 +40,8 @@ from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 from torch.utils.data import DataLoader, Sampler
 from PIL import Image
 import numpy as np
@@ -55,8 +57,6 @@ from src.utils.mask_utils import (
 from scripts.train_anomagic import (
     compute_anomagic_loss,
     save_anomagic_checkpoint,
-    generate_anomagic_samples,
-    generate_anomagic_single,
     infinite_loader,
     _launch_live_loss,
 )

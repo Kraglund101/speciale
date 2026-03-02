@@ -52,6 +52,8 @@ def generate_anomagic_single(
     group_valid: torch.Tensor = None,
     dilate_clip_mask: bool = False,
     cfg_mode: str = "text",
+    guidance_schedule=None,
+    inference_mode: str = "same",
 ):
     """Generate anomaly using IP-Adapter + text captions.
 
@@ -75,6 +77,14 @@ def generate_anomagic_single(
             before self-attention. Use for hard/deformation anomalies.
         cfg_mode: CFG direction. "text" (default) = amplify text on visual
             baseline. "visual" = amplify visual on text baseline.
+        guidance_schedule: Optional callable mapping t_normalized [B, 1] to
+            s [B, 1]. When provided, overrides ``guidance_scale`` with a
+            per-timestep learned scale (used by CFG configs E/F).
+        inference_mode: "same" = reference is from the same image as target
+            (training-aligned: dilated CLIP mask + core/band role embeddings).
+            "different" = reference is from a different image (core-only CLIP
+            mask, no dilation — avoids contamination from wrong surface).
+            UNet inpainting (band_mode) is unaffected by this setting.
     """
     device = normal_image.device
 
@@ -98,15 +108,25 @@ def generate_anomagic_single(
             _clip_mask = clip_mask
             _clip_core = clip_core_mask
         elif reference_mode == "full":
-            # Full reference: reuse the UNet inpainting mask for CLIP
+            # Full reference: reuse the UNet inpainting mask for CLIP.
+            # Use raw mask as core (undilated anomaly region) — the dilated
+            # version will be computed inside encode_image via active_mask.
             _clip_mask = mask
-            _clip_core = None
+            _clip_core = mask  # core = raw mask (before band dilation)
         else:
             _clip_mask = None
             _clip_core = None
-        # +1px dilation at 16x16 grid level (for hard/deformation mode)
-        if dilate_clip_mask and _clip_mask is not None:
-            _clip_mask = _dilate_clip_mask_16(_clip_mask)
+
+        # "different" mode: use core-only for CLIP self-attention (no dilation).
+        # Avoids contaminating the encoding with surface tokens from wrong image.
+        if inference_mode == "different":
+            if _clip_core is not None:
+                _clip_mask = _clip_core  # core as both active mask and core
+            # Skip dilate_clip_mask entirely — no dilation in "different" mode
+        else:
+            # "same" mode: optionally expand CLIP mask by +1px at 16x16 grid
+            if dilate_clip_mask and _clip_mask is not None:
+                _clip_mask = _dilate_clip_mask_16(_clip_mask)
 
         ip_image_embeds = ip_adapter.encode_image(ref_01, mask=_clip_mask, core_mask=_clip_core)  # [1, K, dim]
 
@@ -116,8 +136,14 @@ def generate_anomagic_single(
             ref_2_01 = (reference_2 + 1.0) / 2.0
             _clip_mask_2 = clip_mask_2 if clip_mask_2 is not None else None
             _clip_core_2 = clip_core_mask_2 if clip_core_mask_2 is not None else None
-            if dilate_clip_mask and _clip_mask_2 is not None:
-                _clip_mask_2 = _dilate_clip_mask_16(_clip_mask_2)
+
+            if inference_mode == "different":
+                if _clip_core_2 is not None:
+                    _clip_mask_2 = _clip_core_2
+            else:
+                if dilate_clip_mask and _clip_mask_2 is not None:
+                    _clip_mask_2 = _dilate_clip_mask_16(_clip_mask_2)
+
             ip_image_embeds_2 = ip_adapter.encode_image(ref_2_01, mask=_clip_mask_2, core_mask=_clip_core_2)  # [1, K, dim]
 
             # Concatenate: [1, K, dim] + [1, K, dim] -> [1, 2K, dim]
@@ -213,7 +239,14 @@ def generate_anomagic_single(
             ).sample.float()
 
             noise_uncond, noise_cond = noise_pred.chunk(2)
-            noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+            if guidance_schedule is not None:
+                # Learned per-timestep scale: s(t) from GuidanceSchedule MLP
+                # Match training: t_norm = t / 1000.0 (num_train_timesteps)
+                t_norm = (t.float() / 1000.0).reshape(1, 1)  # [1, 1]
+                s_t = guidance_schedule(t_norm)  # [1, 1]
+                noise_pred = noise_uncond + s_t.unsqueeze(-1).unsqueeze(-1) * (noise_cond - noise_uncond)
+            else:
+                noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 
             latents = pipeline.scheduler.step(noise_pred, t, latents).prev_sample
 
