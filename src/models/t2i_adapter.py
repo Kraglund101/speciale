@@ -33,6 +33,23 @@ Injection modes (controlled via `injection_mode` flag):
       then: skip[0] += feat[0], skip[1] += feat[1], ...
       decoder receives modified skips
 
+Pair injection modes (controlled via `pair_injection` flag):
+
+  "last" (default): Feature injected once per CrossAttnDownBlock2D, after the
+      last ResBlock-Transformer pair (diffusers' native mechanism).
+
+      ResBlock[0] → Transformer[0] → ResBlock[1] → Transformer[1] → (+feat) → Downsample
+
+  "all": Feature injected at every point within each CrossAttnDownBlock2D:
+      before the first pair (via pre-hook), after each intermediate pair
+      (via post-hooks), and after the last pair (diffusers' native mechanism).
+
+      (+feat) → ResBlock[0] → Transformer[0] → (+feat) → ResBlock[1] → Transformer[1] → (+feat) → Downsample
+
+      Same feature tensor reused at each injection point. The learned scale
+      compensates for the higher effective injection count (starts at zero
+      due to zero-init convs, then converges to ~1/N of the "last" value).
+
 Each feature is masked to anomaly regions and scaled by a learned parameter.
 Zero-init on last conv per block → adapter contributes nothing at step 0.
 """
@@ -96,6 +113,9 @@ class T2IAdapter(nn.Module):
         injection_mode: Where to inject features into UNet.
             "cascade"   — encoder + decoder (features flow through encoder)
             "skip_only" — decoder only (encoder untouched)
+        pair_injection: When within each CrossAttnDownBlock2D to inject.
+            "last" — after last ResBlock-Transformer pair only (default)
+            "all"  — before first pair + after every pair (denser injection)
     """
 
     def __init__(
@@ -103,11 +123,17 @@ class T2IAdapter(nn.Module):
         in_channels: int = 2,
         block_out_channels: Tuple[int, ...] = (320, 640, 1280, 1280),
         injection_mode: str = "cascade",
+        pair_injection: str = "last",
+        decoder_inject: bool = False,
     ):
         super().__init__()
         assert injection_mode in ("cascade", "skip_only")
+        assert pair_injection in ("last", "all")
         self.block_out_channels = block_out_channels
         self.injection_mode = injection_mode
+        self.pair_injection = pair_injection
+        self.decoder_inject = decoder_inject
+        self._hook_features: List[torch.Tensor] = None  # set via set_hook_features()
 
         # Block 0: embedding + spatial mixing
         self.block0 = EmbeddingBlock(in_channels, block_out_channels[0])
@@ -182,3 +208,111 @@ class T2IAdapter(nn.Module):
         else:
             # Added to saved skips after encoder finishes → decoder only
             return {"down_block_additional_residuals": list(features)}
+
+    def set_hook_features(self, features: List[torch.Tensor]) -> None:
+        """Activate dense injection hooks with the given features.
+
+        Must be called before each UNet forward pass when pair_injection='all'.
+        Call clear_hook_features() after the UNet call.
+        """
+        self._hook_features = features
+
+    def clear_hook_features(self) -> None:
+        """Deactivate dense injection hooks (hooks become no-ops)."""
+        self._hook_features = None
+
+    def register_dense_hooks(self, unet) -> None:
+        """Register forward hooks for pair_injection='all' mode.
+
+        Injects T2I feature at every pair endpoint within each
+        CrossAttnDownBlock2D:
+          - After pairs 0..N-2: post-hook on attentions[i] (non-last pairs)
+          - After pair N-1: handled by diffusers' native mechanism
+            (down_intrablock_additional_residuals, no hook needed)
+
+        Total injections per block = N (one per pair). Pre-block injection is
+        not possible because down-block input channels differ from output
+        channels at block boundaries (e.g. 320→640 at block 1).
+
+        Hooks are permanently registered but only active when _hook_features
+        is set (i.e. between set_hook_features() and clear_hook_features()).
+        Call once after model and UNet are fully initialised.
+
+        Args:
+            unet: The SD 1.5 UNet2DConditionModel instance.
+        """
+        from diffusers.models.unets.unet_2d_blocks import CrossAttnDownBlock2D
+
+        block_idx = 0
+        for down_block in unet.down_blocks:
+            if not isinstance(down_block, CrossAttnDownBlock2D):
+                continue
+
+            bi = block_idx
+
+            # Post-hook on each non-last Transformer: inject after pairs 0..N-2
+            # (final pair handled by diffusers' native mechanism)
+            for attn in down_block.attentions[:-1]:
+                def _make_post_hook(b: int):
+                    def hook(module, input, output):
+                        if self._hook_features is None:
+                            return output
+                        feat = self._hook_features[b]
+                        if isinstance(output, tuple):
+                            return (output[0] + feat,) + output[1:]
+                        return output + feat
+                    return hook
+                attn.register_forward_hook(_make_post_hook(bi))
+
+            block_idx += 1
+
+    def register_decoder_hooks(self, unet) -> None:
+        """Register forward hooks to inject T2I features into decoder up-blocks.
+
+        Diffusers UNet has no native `up_block_additional_residuals` argument, so
+        decoder injection always requires hooks. Feature channel-dim mapping
+        (symmetric to encoder): features[3-i] is injected at unet.up_blocks[i], so
+        an up-block operating at resolution R receives the encoder feature at the
+        matching R. Channel counts align for SD 1.5:
+          up_blocks[0] (UpBlock2D,           1280 ch, 8×8)   ← features[3]
+          up_blocks[1] (CrossAttnUpBlock2D,  1280 ch, 16×16) ← features[2]
+          up_blocks[2] (CrossAttnUpBlock2D,   640 ch, 32×32) ← features[1]
+          up_blocks[3] (CrossAttnUpBlock2D,   320 ch, 64×64) ← features[0]
+
+        `pair_injection="last"` → post-hook on the last pair only.
+        `pair_injection="all"`  → post-hook on every pair inside each up-block.
+
+        For CrossAttnUpBlock2D the "pair" endpoint is the attention output; for
+        UpBlock2D it is the resnet output (no attention module in that block).
+        """
+        from diffusers.models.unets.unet_2d_blocks import (
+            CrossAttnUpBlock2D,
+            UpBlock2D,
+        )
+
+        n_up = len(unet.up_blocks)
+        for ui, up_block in enumerate(unet.up_blocks):
+            feat_idx = n_up - 1 - ui  # features[3-i] for SD 1.5
+
+            if isinstance(up_block, CrossAttnUpBlock2D):
+                endpoints = list(up_block.attentions)
+            elif isinstance(up_block, UpBlock2D):
+                endpoints = list(up_block.resnets)
+            else:
+                continue  # unknown block type — skip
+
+            if self.pair_injection == "last":
+                endpoints = endpoints[-1:]
+            # else "all" — keep every pair endpoint
+
+            for ep in endpoints:
+                def _make_hook(fi: int):
+                    def hook(module, input, output):
+                        if self._hook_features is None:
+                            return output
+                        feat = self._hook_features[fi]
+                        if isinstance(output, tuple):
+                            return (output[0] + feat,) + output[1:]
+                        return output + feat
+                    return hook
+                ep.register_forward_hook(_make_hook(feat_idx))

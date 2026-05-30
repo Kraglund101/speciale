@@ -239,20 +239,20 @@ def main():
                     return np.array([]), np.array([])
                 return steps_arr[nz], ema_smooth(vals[nz], sm)
             all_ema = ema_smooth(stats["diff_loss"], SM)
-            ax_trend.plot(s_steps, all_ema, color="black", linewidth=2.5,
-                          label=f"Overall ({all_ema[-1]:.4f})")
+            ax_trend.plot(s_steps, all_ema, color="black", linewidth=2,
+                          alpha=1.0, label=f"Overall ({all_ema[-1]:.4f})")
             k_st, k_em = _mode_ema_filtered(s_loss_keep, s_steps, SM)
             if len(k_em):
-                ax_trend.plot(k_st, k_em, color="#2196F3", linewidth=2,
-                              label=f"Keep both ({k_em[-1]:.4f})")
+                ax_trend.plot(k_st, k_em, color="blue", linewidth=2,
+                              alpha=1.0, label=f"Keep both ({k_em[-1]:.4f})")
             dv_st, dv_em = _mode_ema_filtered(s_loss_dv, s_steps, SM)
             if len(dv_em):
-                ax_trend.plot(dv_st, dv_em, color="#F44336", linewidth=2,
-                              label=f"Keep text ({dv_em[-1]:.4f})")
+                ax_trend.plot(dv_st, dv_em, color="red", linewidth=1,
+                              alpha=0.35, label=f"Keep text ({dv_em[-1]:.4f})")
             dt_st, dt_em = _mode_ema_filtered(s_loss_dt, s_steps, SM)
             if len(dt_em):
-                ax_trend.plot(dt_st, dt_em, color="#FF9800", linewidth=2,
-                              label=f"Keep visual ({dt_em[-1]:.4f})")
+                ax_trend.plot(dt_st, dt_em, color="orange", linewidth=1,
+                              alpha=0.35, label=f"Keep visual ({dt_em[-1]:.4f})")
             ax_trend.set_title(f"Loss by Conditioning Mode, EMA({SM}) \u2014 step {len(losses)}")
         else:
             ax_trend.plot(steps, ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")

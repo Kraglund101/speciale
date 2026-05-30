@@ -1188,6 +1188,8 @@ class IPAdapter(nn.Module):
                 "anomaly_residual": self.config.anomaly_residual,
                 "mask_visual": self.config.mask_visual,
                 "visual_mode": self.config.visual_mode,
+                "learnable_gates": self.config.learnable_gates,
+                "force_gates": self.config.force_gates,
             }, f, indent=2)
 
     def load_finetuned(self, load_path: Path) -> None:

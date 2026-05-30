@@ -19,7 +19,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image, ImageEnhance
 import numpy as np
 
-from src.utils.crop_utils import clip_crop, clip_crop_multi
+from src.utils.crop_utils import clip_crop, clip_crop_multi, lanczos_resize_tensor
 from src.utils.mask_utils import downsample_mask_maxpool, unet_roundtrip_masks
 
 
@@ -34,7 +34,7 @@ def _apply_unet_augmentation(
     brightness_range: Tuple[float, float] = (0.85, 1.15),
     contrast_range: Tuple[float, float] = (0.85, 1.15),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """UNet-path augmentation: color jitter only + bilinear downsample to target_size.
+    """UNet-path augmentation: color jitter + LANCZOS-3 downsample to target_size.
 
     No flips, rotations, or crops — captions contain spatial references that must
     match the image orientation and framing. Decorrelation is achieved by
@@ -55,13 +55,11 @@ def _apply_unet_augmentation(
     image = ImageEnhance.Brightness(image).enhance(b)
     image = ImageEnhance.Contrast(image).enhance(c)
 
-    # Simple downsample to target_size (no crop — preserves spatial layout for captions)
+    # LANCZOS-3 resize in PIL space (sharper + properly antialiased).
+    image = image.resize((target_size, target_size), Image.LANCZOS)
     img_t = TF.to_tensor(image)                    # [3, H, W] in [0, 1]
     mask_t = TF.to_tensor(mask.convert("L"))        # [1, H, W]
     mask_t = (mask_t > 0.5).float()
-
-    img_t = F.interpolate(img_t.unsqueeze(0), size=(target_size, target_size),
-                          mode='bilinear', align_corners=False).squeeze(0)
     mask_t = downsample_mask_maxpool(mask_t, target_size)  # [1, H, W]
 
     # Normalize to [-1, 1]
@@ -154,7 +152,7 @@ def _apply_clip_augmentation(
     )
 
     # crop_utils: component grouping + anomaly-aware crop → 224×224
-    crop_img, crop_mask = clip_crop(img_t, mask_t, crop_size=crop_size, pad_frac=0.10)
+    crop_img, crop_mask = clip_crop(img_t, mask_t, crop_size=crop_size, pad_frac=0.0)
     crop_mask = (crop_mask > 0.5).float()
 
     return crop_img, crop_mask
@@ -226,6 +224,7 @@ class AnomalyDataset(Dataset):
         multi_crop: bool = False,
         band_mode: int = 2,
         clip_align: bool = True,
+        clip_core_only: bool = False,
         return_clip_meta: bool = False,
     ):
         """
@@ -244,6 +243,9 @@ class AnomalyDataset(Dataset):
             band_mode: Latent-space band dilation mode (1 or 2) for UNet roundtrip masks
             clip_align: Use UNet-roundtripped dilated masks for CLIP self-attention + role embeddings.
                 When False, reverts to raw cropped masks with no role embedding distinction.
+            clip_core_only: When True (and clip_align=True), use core-only roundtripped mask
+                (no band dilation) for CLIP attention. Core = anomaly pixels only after
+                latent quantization roundtrip.
             return_clip_meta: If True, return CLIP augmentation metadata (flip, rotation,
                 crop coordinates) as individual tensor fields for DataLoader compatibility.
         """
@@ -258,6 +260,7 @@ class AnomalyDataset(Dataset):
         self.augment = augment
         self.multi_crop = multi_crop
         self.clip_align = clip_align
+        self.clip_core_only = clip_core_only
         self.return_clip_meta = return_clip_meta
 
         # Load captions if provided (keyed by image_path for uniqueness)
@@ -355,7 +358,10 @@ class AnomalyDataset(Dataset):
 
         # Non-augmented transforms (fallback when augment=False)
         self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
+            transforms.Resize(
+                (image_size, image_size),
+                interpolation=transforms.InterpolationMode.LANCZOS,
+            ),
             transforms.ToTensor(),
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ])
@@ -418,11 +424,13 @@ class AnomalyDataset(Dataset):
                     else:
                         img_t, mask_t = _clip_augmentation_transforms(image_pil, mask_pil)
                     if self.clip_align:
-                        # UNet-roundtripped masks for CLIP alignment
+                        # UNet-roundtripped masks for CLIP alignment.
+                        # Group on the roundtripped mask (core or dilated per clip_core_only).
                         core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
+                        attn_mask = core_native if self.clip_core_only else dil_native
                         mc_result = clip_crop_multi(
-                            img_t, mask_t, crop_size=self.reference_crop_size,
-                            clip_masks=[dil_native, core_native],
+                            img_t, attn_mask, crop_size=self.reference_crop_size,
+                            clip_masks=[attn_mask, core_native],
                             return_crop_meta=_rcm,
                         )
                         if _rcm:
@@ -430,10 +438,10 @@ class AnomalyDataset(Dataset):
                         else:
                             crops, crop_masks, valid, extra = mc_result
                         result["reference"] = crops[0] * 2.0 - 1.0
-                        result["clip_mask"] = (extra[0][0] > 0.5).float()       # dilated (attention routing)
+                        result["clip_mask"] = (extra[0][0] > 0.5).float()       # attn (dilated or core per clip_core_only)
                         result["clip_core_mask"] = (extra[0][1] > 0.5).float()  # core (role embeddings)
                         result["reference_2"] = crops[1] * 2.0 - 1.0
-                        result["clip_mask_2"] = (extra[1][0] > 0.5).float()
+                        result["clip_mask_2"] = (extra[1][0] > 0.5).float()     # attn (matches clip_mask)
                         result["clip_core_mask_2"] = (extra[1][1] > 0.5).float()
                         result["group_valid"] = torch.tensor(
                             [float(valid[0]), float(valid[1])],
@@ -468,10 +476,12 @@ class AnomalyDataset(Dataset):
                             image_pil, mask_pil,
                         )
                     if self.clip_align:
+                        # Group on the roundtripped mask (core or dilated per clip_core_only).
                         core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
+                        attn_mask = core_native if self.clip_core_only else dil_native
                         sc_result = clip_crop(
-                            img_t, mask_t, crop_size=self.reference_crop_size,
-                            clip_masks=[dil_native, core_native],
+                            img_t, attn_mask, crop_size=self.reference_crop_size,
+                            clip_masks=[attn_mask, core_native],
                             return_crop_meta=_rcm,
                         )
                         if _rcm:
@@ -480,7 +490,7 @@ class AnomalyDataset(Dataset):
                             crop_img, crop_mask, extra = sc_result
                         crop_mask = (crop_mask > 0.5).float()
                         result["reference"] = crop_img * 2.0 - 1.0
-                        result["clip_mask"] = (extra[0] > 0.5).float()       # dilated
+                        result["clip_mask"] = (extra[0] > 0.5).float()       # attn (dilated or core per clip_core_only)
                         result["clip_core_mask"] = (extra[1] > 0.5).float()  # core
                     else:
                         sc_result = clip_crop(
@@ -521,11 +531,13 @@ class AnomalyDataset(Dataset):
                     mask_t = TF.to_tensor(mask_pil.convert("L"))
                     mask_t = (mask_t > 0.5).float()
                     if self.clip_align:
-                        # UNet-roundtripped masks for CLIP alignment
+                        # UNet-roundtripped masks for CLIP alignment.
+                        # Group on the roundtripped mask (core or dilated per clip_core_only).
                         core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
+                        attn_mask = core_native if self.clip_core_only else dil_native
                         mc_result = clip_crop_multi(
-                            img_t, mask_t, crop_size=self.reference_crop_size,
-                            clip_masks=[dil_native, core_native],
+                            img_t, attn_mask, crop_size=self.reference_crop_size,
+                            clip_masks=[attn_mask, core_native],
                             return_crop_meta=_rcm,
                         )
                         if _rcm:
@@ -536,7 +548,7 @@ class AnomalyDataset(Dataset):
                         result["clip_mask"] = (extra[0][0] > 0.5).float()       # dilated
                         result["clip_core_mask"] = (extra[0][1] > 0.5).float()  # core
                         result["reference_2"] = crops[1] * 2.0 - 1.0
-                        result["clip_mask_2"] = (extra[1][0] > 0.5).float()
+                        result["clip_mask_2"] = (extra[1][0] > 0.5).float()     # attn (matches clip_mask)
                         result["clip_core_mask_2"] = (extra[1][1] > 0.5).float()
                         result["group_valid"] = torch.tensor(
                             [float(valid[0]), float(valid[1])],
@@ -567,10 +579,12 @@ class AnomalyDataset(Dataset):
                     mask_t = TF.to_tensor(mask_pil.convert("L"))
                     mask_t = (mask_t > 0.5).float()
                     if self.clip_align:
+                        # Group on the roundtripped mask (core or dilated per clip_core_only).
                         core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
+                        attn_mask = core_native if self.clip_core_only else dil_native
                         sc_result = clip_crop(
-                            img_t, mask_t, crop_size=self.reference_crop_size,
-                            clip_masks=[dil_native, core_native],
+                            img_t, attn_mask, crop_size=self.reference_crop_size,
+                            clip_masks=[attn_mask, core_native],
                             return_crop_meta=_rcm,
                         )
                         if _rcm:
@@ -578,7 +592,7 @@ class AnomalyDataset(Dataset):
                         else:
                             crop_img, crop_mask, extra_crops = sc_result
                         result["reference"] = crop_img * 2.0 - 1.0
-                        result["clip_mask"] = (extra_crops[0] > 0.5).float()       # dilated
+                        result["clip_mask"] = (extra_crops[0] > 0.5).float()       # attn (dilated or core per clip_core_only)
                         result["clip_core_mask"] = (extra_crops[1] > 0.5).float()  # core
                     else:
                         sc_result = clip_crop(
@@ -621,10 +635,7 @@ def _prepare_reference_image(
     if mode == "crop":
         return _extract_anomaly_crop(image, mask, crop_size)
     else:
-        return F.interpolate(
-            image.unsqueeze(0), size=(crop_size, crop_size),
-            mode="bilinear", align_corners=False,
-        ).squeeze(0)
+        return lanczos_resize_tensor(image, crop_size, value_range="-11")
 
 
 def _extract_anomaly_crop(
@@ -641,10 +652,7 @@ def _extract_anomaly_crop(
         top = max(0, (h - crop_size) // 2)
         left = max(0, (w - crop_size) // 2)
         crop = image[:, top:top + crop_size, left:left + crop_size]
-        return F.interpolate(
-            crop.unsqueeze(0), size=(crop_size, crop_size),
-            mode="bilinear", align_corners=False,
-        ).squeeze(0)
+        return lanczos_resize_tensor(crop, crop_size, value_range="-11")
 
     y_min, x_min = nonzero.min(dim=0).values
     y_max, x_max = nonzero.max(dim=0).values
@@ -675,10 +683,7 @@ def _extract_anomaly_crop(
             y_min = max(0, y_max - crop_w)
 
     crop = image[:, y_min:y_max, x_min:x_max]
-    return F.interpolate(
-        crop.unsqueeze(0), size=(crop_size, crop_size),
-        mode="bilinear", align_corners=False,
-    ).squeeze(0)
+    return lanczos_resize_tensor(crop, crop_size, value_range="-11")
 
 
 # Backward compatibility alias

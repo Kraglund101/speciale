@@ -54,6 +54,9 @@ def generate_anomagic_single(
     cfg_mode: str = "text",
     guidance_schedule=None,
     inference_mode: str = "same",
+    cross_attn_mask_mode: str = "alpha",  # "alpha" = soft (default), "core_binary" = core-only binary
+    zero_t2i_band: bool = False,            # zero the T2I band input channel (ablation)
+    inpaint_mask_mode: str = "dilated",     # "dilated" (default) or "core_binary" — UNet mask channel ablation
 ):
     """Generate anomaly using IP-Adapter + text captions.
 
@@ -183,15 +186,20 @@ def generate_anomagic_single(
             core_mask_64, band_mode,
         )
 
-        mask_latents = dilated_binary_64
-        unet_mask_512 = F.interpolate(dilated_binary_64, size=mask.shape[-2:], mode='nearest')
+        # Ablation: use core-only mask for UNet inpainting channel (mask + masked_image_latents).
+        # Alpha blend (below) still uses soft alpha_map_64 — this isolates inpainting-channel effect.
+        _inpaint_mask_64 = core_mask_64 if inpaint_mask_mode == "core_binary" else dilated_binary_64
+        mask_latents = _inpaint_mask_64
+        unet_mask_512 = F.interpolate(_inpaint_mask_64, size=mask.shape[-2:], mode='nearest')
         masked_image = normal_image * (1 - unet_mask_512)
         masked_image_latents = pipeline.encode_image(masked_image)
 
         # T2I-Adapter features (constant across timesteps, computed ONCE outside loop)
         t2i_kwargs = {}
+        t2i_features_doubled = None
         if t2i_adapter is not None:
-            t2i_input = torch.cat([core_mask_64, band_mask_64], dim=1)  # [1, 2, 64, 64]
+            _band_in = torch.zeros_like(band_mask_64) if zero_t2i_band else band_mask_64
+            t2i_input = torch.cat([core_mask_64, _band_in], dim=1)  # [1, 2, 64, 64]
             t2i_features = t2i_adapter(t2i_input, mask=dilated_binary_64)
             t2i_kwargs_single = t2i_adapter.prepare_unet_kwargs(t2i_features)
             # CFG: both branches get real T2I features (visual always present)
@@ -199,6 +207,8 @@ def generate_anomagic_single(
                 k: [torch.cat([f, f]) for f in vs]
                 for k, vs in t2i_kwargs_single.items()
             }
+            if t2i_adapter.pair_injection == "all":
+                t2i_features_doubled = [torch.cat([f, f]) for f in t2i_features]
 
         # Start from normal image noised to noise_strength (not pure noise)
         pipeline.scheduler.set_timesteps(num_steps, device=device)
@@ -225,18 +235,23 @@ def generate_anomagic_single(
             combined_ip = torch.cat([uncond_ip, ip_image_embeds])
 
             cross_attn_kwargs = {"ip_adapter_image_embeds": combined_ip}
-            # Soft alpha mask for cross-attention routing (duplicated for CFG)
-            cross_attn_kwargs["ip_adapter_mask"] = torch.cat([alpha_map_64, alpha_map_64])
+            # Cross-attention spatial mask — default soft alpha, optionally core-only binary.
+            _ca_mask = core_mask_64 if cross_attn_mask_mode == "core_binary" else alpha_map_64
+            cross_attn_kwargs["ip_adapter_mask"] = torch.cat([_ca_mask, _ca_mask])
             # Multi-crop null masking (duplicated for CFG)
             if null_token_mask is not None:
                 cross_attn_kwargs["null_token_mask"] = torch.cat([null_token_mask, null_token_mask])
 
+            if t2i_features_doubled is not None:
+                t2i_adapter.set_hook_features(t2i_features_doubled)
             noise_pred = pipeline.unet(
                 model_input, t,
                 encoder_hidden_states=combined_text,
                 cross_attention_kwargs=cross_attn_kwargs,
                 **t2i_kwargs,
             ).sample.float()
+            if t2i_features_doubled is not None:
+                t2i_adapter.clear_hook_features()
 
             noise_uncond, noise_cond = noise_pred.chunk(2)
             if guidance_schedule is not None:
@@ -260,8 +275,10 @@ def generate_anomagic_single(
                 latents = latents * alpha_map_64 + noisy_normal * (1 - alpha_map_64)
 
     output = pipeline.decode_latents(latents.float())
-    # Alpha-blend at pixel level
+    # Roundtrip the canvas through the VAE so both sides of the blend share the
+    # same encoder/decoder bias — eliminates the seam from asymmetric decoding.
+    normal_decoded = pipeline.decode_latents(normal_latents.float())
     alpha_512 = F.interpolate(alpha_map_64, size=output.shape[-2:], mode='nearest')
-    output = output * alpha_512 + normal_image.float() * (1 - alpha_512)
+    output = output * alpha_512 + normal_decoded * (1 - alpha_512)
 
     return output

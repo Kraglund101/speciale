@@ -14,3 +14,7 @@
 # Keep config file
 !/requirements.txt
 !/.gitattributes
+
+# Never track compiled bytecode (re-excluded after the scripts/src whitelist)
+**/__pycache__/
+*.pyc

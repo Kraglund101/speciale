@@ -18,7 +18,41 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from scipy import ndimage
+
+
+def lanczos_resize_tensor(t: torch.Tensor, size: int, value_range: str = "01") -> torch.Tensor:
+    """Resize a [C, H, W] image tensor to (size, size) via PIL LANCZOS-3.
+
+    F.interpolate has no LANCZOS path, so we round-trip through PIL. Precision
+    loss is bounded at 1/255 (~0.4%) which is negligible for image content.
+
+    Args:
+        t: [C, H, W] float tensor (C ∈ {1, 3}). Expected range matches `value_range`.
+        size: Target H = W.
+        value_range: "01" for [0, 1] tensors, "-11" for [-1, 1] tensors.
+    """
+    if value_range == "-11":
+        x = (t + 1.0) / 2.0
+    else:
+        x = t
+    arr = (x.detach().clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().contiguous().numpy()
+    arr = np.transpose(arr, (1, 2, 0))
+    if arr.shape[2] == 1:
+        pil = Image.fromarray(arr[..., 0], mode="L")
+    else:
+        pil = Image.fromarray(arr, mode="RGB")
+    pil = pil.resize((size, size), Image.LANCZOS)
+    out_np = np.array(pil)  # copy → writable
+    if out_np.ndim == 2:
+        out = torch.from_numpy(out_np).unsqueeze(0)
+    else:
+        out = torch.from_numpy(out_np).permute(2, 0, 1).contiguous()
+    out = out.to(t.dtype) / 255.0
+    if value_range == "-11":
+        out = out * 2.0 - 1.0
+    return out
 
 
 def square_bbox(
@@ -138,7 +172,7 @@ def get_component_groups(
     img_h: int,
     img_w: int,
     max_crop: int = 224,
-    pad_frac: float = 0.10,
+    pad_frac: float = 0.0,
 ) -> List[Dict]:
     """Find connected components and group spatially overlapping ones.
 
@@ -327,6 +361,7 @@ def clip_crop_from_groups(
     crop_size: int = 224,
     clip_masks: Optional[List[torch.Tensor]] = None,
     return_crop_meta: bool = False,
+    position_constraint_mask: Optional[torch.Tensor] = None,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor],
            Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]]:
     """Pick a random group and produce a CLIP crop.
@@ -343,6 +378,10 @@ def clip_crop_from_groups(
         clip_masks: Optional list of extra [1, H, W] masks to crop through the
             same window (e.g. roundtripped dilated/core masks for CLIP alignment).
         return_crop_meta: If True, append a crop_meta dict to the return tuple.
+        position_constraint_mask: Optional [1, H, W] mask. When provided (e.g.
+            dilated mask), the direct-crop branch picks a position that also
+            contains this mask's per-group bbox. If no valid position exists,
+            falls back to the resize branch using the constraint bbox.
 
     Returns:
         Base return (depends on clip_masks):
@@ -379,8 +418,7 @@ def clip_crop_from_groups(
         left = max(0, (w - crop_size) // 2)
         img_crop = image[:, top:top + crop_size, left:left + crop_size]
         mask_crop = mask[:, top:top + crop_size, left:left + crop_size]
-        img_out = F.interpolate(img_crop.unsqueeze(0), size=(crop_size, crop_size),
-                          mode='bilinear', align_corners=False).squeeze(0)
+        img_out = lanczos_resize_tensor(img_crop, crop_size, value_range="01")
         mask_out = F.adaptive_max_pool2d(mask_crop.unsqueeze(0).float(),
                                  (crop_size, crop_size)).squeeze(0)
         extras = _crop_extra_masks(clip_masks, top, left, crop_size, crop_size, crop_size) if clip_masks else []
@@ -394,21 +432,38 @@ def clip_crop_from_groups(
     P = group['bbox_size']
     _, img_h, img_w = image.shape
 
-    if P <= crop_size:
-        # Random 224×224 position containing the full padded bbox
-        # Valid top-left range: crop must contain bbox [y0..y1, x0..x1]
-        # top ≤ y0 and top + crop_size - 1 ≥ y1 → top ∈ [y1 - crop_size + 1, y0]
-        top_min = max(0, y1 - crop_size + 1)
-        top_max = min(y0, img_h - crop_size)
-        left_min = max(0, x1 - crop_size + 1)
-        left_max = min(x0, img_w - crop_size)
+    # Compute per-group constraint bbox (dilated region belonging to this group).
+    # Expand the group's raw mask by half the crop size and intersect with
+    # the constraint mask, then take the bbox of the intersection.
+    cy0, cy1, cx0, cx1 = y0, y1, x0, x1
+    if position_constraint_mask is not None:
+        constraint_np = position_constraint_mask.squeeze(0).cpu().numpy() > 0.5
+        group_mask = group['mask'] > 0.5
+        expanded = ndimage.binary_dilation(group_mask, iterations=crop_size // 2)
+        this_group_constraint = constraint_np & expanded
+        ys_c, xs_c = np.where(this_group_constraint)
+        if len(ys_c) > 0:
+            cy0, cy1 = int(ys_c.min()), int(ys_c.max())
+            cx0, cx1 = int(xs_c.min()), int(xs_c.max())
+
+    constraint_h = cy1 - cy0 + 1
+    constraint_w = cx1 - cx0 + 1
+    constraint_max_side = max(constraint_h, constraint_w)
+
+    if P <= crop_size and constraint_max_side <= crop_size:
+        # Direct-crop branch: random 224×224 containing BOTH raw bbox and constraint bbox.
+        # top must satisfy: top ≤ cy0 and top + crop_size - 1 ≥ cy1
+        top_min = max(0, cy1 - crop_size + 1)
+        top_max = min(cy0, img_h - crop_size)
+        left_min = max(0, cx1 - crop_size + 1)
+        left_max = min(cx0, img_w - crop_size)
 
         if top_min > top_max or left_min > left_max:
-            # Bbox near image edge — center on bbox
-            cy = (y0 + y1) // 2
-            cx = (x0 + x1) // 2
-            top = max(0, min(cy - crop_size // 2, img_h - crop_size))
-            left = max(0, min(cx - crop_size // 2, img_w - crop_size))
+            # Near image edge — center on constraint bbox
+            ccy = (cy0 + cy1) // 2
+            ccx = (cx0 + cx1) // 2
+            top = max(0, min(ccy - crop_size // 2, img_h - crop_size))
+            left = max(0, min(ccx - crop_size // 2, img_w - crop_size))
         else:
             top = random.randint(top_min, top_max)
             left = random.randint(left_min, left_max)
@@ -419,20 +474,23 @@ def clip_crop_from_groups(
         meta = {"crop_top": top, "crop_left": left, "crop_h": crop_size, "crop_w": crop_size, "resized": False}
         return _pack(img_crop, mask_crop, extras, meta)
     else:
-        # Crop the square padded bbox, resize to crop_size
-        crop_h = y1 + 1 - y0
-        crop_w = x1 + 1 - x0
-        img_crop = image[:, y0:y1 + 1, x0:x1 + 1]
-        mask_crop = mask[:, y0:y1 + 1, x0:x1 + 1]
-        img_out = F.interpolate(
-            img_crop.unsqueeze(0), size=(crop_size, crop_size),
-            mode='bilinear', align_corners=False,
-        ).squeeze(0)
+        # Resize branch: use the LARGER of raw bbox and constraint bbox
+        if constraint_max_side > P:
+            # Constraint wins — square it up and use as crop region
+            sq = square_bbox((cy0, cy1, cx0, cx1), img_h, img_w)
+            ry0, ry1, rx0, rx1 = sq
+        else:
+            ry0, ry1, rx0, rx1 = y0, y1, x0, x1
+        crop_h = ry1 + 1 - ry0
+        crop_w = rx1 + 1 - rx0
+        img_crop = image[:, ry0:ry1 + 1, rx0:rx1 + 1]
+        mask_crop = mask[:, ry0:ry1 + 1, rx0:rx1 + 1]
+        img_out = lanczos_resize_tensor(img_crop, crop_size, value_range="01")
         mask_out = F.adaptive_max_pool2d(
             mask_crop.unsqueeze(0).float(), (crop_size, crop_size),
         ).squeeze(0)
-        extras = _crop_extra_masks(clip_masks, y0, x0, crop_h, crop_w, crop_size) if clip_masks else []
-        meta = {"crop_top": y0, "crop_left": x0, "crop_h": crop_h, "crop_w": crop_w, "resized": True}
+        extras = _crop_extra_masks(clip_masks, ry0, rx0, crop_h, crop_w, crop_size) if clip_masks else []
+        meta = {"crop_top": ry0, "crop_left": rx0, "crop_h": crop_h, "crop_w": crop_w, "resized": True}
         return _pack(img_out, mask_out, extras, meta)
 
 
@@ -440,9 +498,10 @@ def clip_crop(
     image: torch.Tensor,
     mask: torch.Tensor,
     crop_size: int = 224,
-    pad_frac: float = 0.10,
+    pad_frac: float = 0.0,
     clip_masks: Optional[List[torch.Tensor]] = None,
     return_crop_meta: bool = False,
+    position_constraint_mask: Optional[torch.Tensor] = None,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor],
            Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]]:
     """Full CLIP crop pipeline: group components and crop a random group.
@@ -470,6 +529,7 @@ def clip_crop(
     return clip_crop_from_groups(
         image, mask, groups, crop_size=crop_size,
         clip_masks=clip_masks, return_crop_meta=return_crop_meta,
+        position_constraint_mask=position_constraint_mask,
     )
 
 
@@ -477,10 +537,11 @@ def clip_crop_multi(
     image: torch.Tensor,
     mask: torch.Tensor,
     crop_size: int = 224,
-    pad_frac: float = 0.10,
+    pad_frac: float = 0.0,
     n_groups: int = 2,
     clip_masks: Optional[List[torch.Tensor]] = None,
     return_crop_meta: bool = False,
+    position_constraint_mask: Optional[torch.Tensor] = None,
 ) -> Union[
     Tuple[List[torch.Tensor], List[torch.Tensor], List[bool]],
     Tuple[List[torch.Tensor], List[torch.Tensor], List[bool], List[List[torch.Tensor]]],
@@ -537,6 +598,7 @@ def clip_crop_multi(
             result = clip_crop_from_groups(
                 image, mask, [selected[i]], crop_size=crop_size,
                 clip_masks=clip_masks, return_crop_meta=return_crop_meta,
+                position_constraint_mask=position_constraint_mask,
             )
             if return_crop_meta:
                 if clip_masks is not None:

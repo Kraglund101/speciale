@@ -357,18 +357,18 @@ def downsample_mask_maxpool(mask: torch.Tensor, target_size: int) -> torch.Tenso
 def create_latent_band_mask(
     core_mask: torch.Tensor,
     band_mode: int = 1,
-    core_ratio: float = 0.8,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create latent-space band masks via Chebyshev dilation (max_pool2d).
 
     Returns 4 tensors at 64×64 latent resolution:
 
     - dilated_binary: core + band = 1, bg = 0
-        Used for UNet inpainting conditional channel and T2I-Adapter mask.
+        Used for UNet inpainting conditional channel, T2I-Adapter mask,
+        and the training loss mask (uniform-weighted MSE over the dilated region).
     - alpha_map: core = 1.0, band = fractional alpha, bg = 0.0
         Used for inference blending and soft cross-attention routing.
-    - weight_map: core = 1.0, band = ratio-scaled, bg = 0.0
-        Used for training loss weighting (core_ratio controls gradient split).
+    - weight_map: identical to dilated_binary (uniform 1.0 inside, 0.0 outside).
+        Returned for backwards compatibility with callers that unpack four values.
     - band_mask: band = 1, else = 0
         Used as channel 1 in T2I-Adapter 2-channel input.
 
@@ -376,19 +376,14 @@ def create_latent_band_mask(
     - Mode 1: 1-pixel band. Alpha = 0.5.
     - Mode 2: 2-pixel band (inner + outer). Inner alpha = 2/3, outer alpha = 1/3.
 
-    Weight map uses ratio scaling so aggregate gradient is exactly
-    ``core_ratio`` for core and ``1 - core_ratio`` for band.
-
     Args:
         core_mask: Binary mask [B, 1, 64, 64] (maxpooled from image-space).
         band_mode: 1 (single 1-pixel band) or 2 (inner + outer band).
-        core_ratio: Fraction of total gradient going to core (e.g. 0.8 = 80%).
 
     Returns:
         (dilated_binary, alpha_map, weight_map, band_mask) each [B, 1, 64, 64].
     """
     assert band_mode in (1, 2), f"band_mode must be 1 or 2, got {band_mode}"
-    assert 0.0 < core_ratio < 1.0, f"core_ratio must be in (0, 1), got {core_ratio}"
 
     core = core_mask.float()
 
@@ -401,9 +396,6 @@ def create_latent_band_mask(
         dilated_binary = dilated_1
         alpha_map = core + 0.5 * band
         band_mask = band
-
-        # Weight map: ratio-scaled per sample
-        weight_map = _compute_band_weights_mode1(core, band, core_ratio)
 
     else:  # band_mode == 2
         # Two-ring Chebyshev dilation
@@ -420,82 +412,9 @@ def create_latent_band_mask(
         alpha_map = core + (2.0 / 3.0) * inner + (1.0 / 3.0) * outer
         band_mask = band
 
-        # Weight map: ratio-scaled per sample
-        weight_map = _compute_band_weights_mode2(core, inner, outer, core_ratio)
+    # Uniform weight inside dilated region (no core/band gradient split).
+    weight_map = dilated_binary
 
     return dilated_binary, alpha_map, weight_map, band_mask
 
 
-def _compute_band_weights_mode1(
-    core: torch.Tensor,
-    band: torch.Tensor,
-    core_ratio: float,
-) -> torch.Tensor:
-    """Compute per-sample ratio-scaled weight map for mode 1 (single band).
-
-    Core pixels get weight 1.0. Band pixels get a uniform weight scaled so
-    that ``sum(core_weights) / sum(all_weights) == core_ratio``.
-
-    Args:
-        core: [B, 1, H, W] binary core mask.
-        band: [B, 1, H, W] binary band mask.
-        core_ratio: Target fraction for core gradient.
-
-    Returns:
-        weight_map [B, 1, H, W]: core=1.0, band=scaled weight, bg=0.0.
-    """
-    B = core.shape[0]
-    weight_map = core.clone()
-
-    for i in range(B):
-        n_core = core[i].sum()
-        n_band = band[i].sum()
-
-        if n_core > 0 and n_band > 0:
-            # band_total_target = n_core * (1 - core_ratio) / core_ratio
-            # per_band_weight = band_total_target / n_band
-            band_w = (n_core * (1 - core_ratio) / core_ratio) / n_band
-            weight_map[i] = weight_map[i] + band[i] * band_w
-
-    return weight_map
-
-
-def _compute_band_weights_mode2(
-    core: torch.Tensor,
-    inner: torch.Tensor,
-    outer: torch.Tensor,
-    core_ratio: float,
-) -> torch.Tensor:
-    """Compute per-sample ratio-scaled weight map for mode 2 (inner + outer band).
-
-    Inner band gets 2/3 of the total band gradient budget, outer gets 1/3.
-
-    Args:
-        core: [B, 1, H, W] binary core mask.
-        inner: [B, 1, H, W] binary inner band mask.
-        outer: [B, 1, H, W] binary outer band mask.
-        core_ratio: Target fraction for core gradient.
-
-    Returns:
-        weight_map [B, 1, H, W]: core=1.0, inner/outer=scaled weights, bg=0.0.
-    """
-    B = core.shape[0]
-    weight_map = core.clone()
-
-    for i in range(B):
-        n_core = core[i].sum()
-        n_inner = inner[i].sum()
-        n_outer = outer[i].sum()
-
-        if n_core > 0:
-            band_total = n_core * (1 - core_ratio) / core_ratio
-
-            if n_inner > 0:
-                inner_w = (2.0 / 3.0 * band_total) / n_inner
-                weight_map[i] = weight_map[i] + inner[i] * inner_w
-
-            if n_outer > 0:
-                outer_w = (1.0 / 3.0 * band_total) / n_outer
-                weight_map[i] = weight_map[i] + outer[i] * outer_w
-
-    return weight_map

@@ -1,4 +1,4 @@
-"""5-Panel Reproducible Validation Suite.
+"""6-Panel Reproducible Validation Suite.
 
 Produces deterministic validation outputs across checkpoints:
   Panel A — Easy ID Sanity (texture placement)
@@ -6,6 +6,7 @@ Produces deterministic validation outputs across checkpoints:
   Panel C — ID Counterfactual Cross-Object (native vs swapped)
   Panel D — OOD Counterfactual Cross-Domain (cashew + PCB)
   Panel E — OOD Hard Deformation (cashew hard)
+  Panel F — OOD Easy Cashew (small surface defects)
 
 Two entry points:
   1. run_validation_suite()  — called from training loop
@@ -57,7 +58,7 @@ NUM_STEPS = 30
 
 # ── Seed Strategy ───────────────────────────────────────────────────────────
 
-PANEL_SEEDS = {"A": 42, "B": 142, "C": 242, "D": 342, "E": 442}
+PANEL_SEEDS = {"A": 42, "B": 142, "C": 242, "D": 342, "E": 442, "F": 542}
 
 # ── Panel Definitions ───────────────────────────────────────────────────────
 # Single source of truth for ALL example specs.
@@ -130,7 +131,7 @@ PANEL_B_EXAMPLES = [
         "id": "capsule_faulty_imprint_016",
         "image_path": "AnomVerse_data_filtered/mvtec/mvtec/capsule/test/faulty_imprint/016.png",
         "mask_path": "AnomVerse_data_filtered/mvtec/mvtec/capsule/ground_truth/faulty_imprint/016_mask.png",
-        "noise_strength": 0.7,
+        "noise_strength": 1.0,
         "needs_prep": False,
     },
 ]
@@ -220,10 +221,61 @@ PANEL_E_EXAMPLES = [
     },
 ]
 
+PANEL_F_EXAMPLES = [
+    {
+        "id": "cashew_easy_005_001",
+        "image_path": "experiment_ResNet/source/reference_anomalies/easy/imgs/001.JPG",
+        "mask_path": "experiment_ResNet/source/reference_anomalies/easy/masks/001.png",
+        "needs_prep": True,
+        "normal_dir": "Data/Images/Normal",
+        "normal_index": 5,
+        "fg_mode": "birefnet",
+        "base_dir": _CASHEW_BASE,
+        "fg_masks_dir": "birefnet_masks/Normal",
+        "fg_mask_suffix": "_binary",
+    },
+    {
+        "id": "cashew_easy_010_029",
+        "image_path": "experiment_ResNet/source/reference_anomalies/easy/imgs/029.JPG",
+        "mask_path": "experiment_ResNet/source/reference_anomalies/easy/masks/029.png",
+        "needs_prep": True,
+        "normal_dir": "Data/Images/Normal",
+        "normal_index": 10,
+        "fg_mode": "birefnet",
+        "base_dir": _CASHEW_BASE,
+        "fg_masks_dir": "birefnet_masks/Normal",
+        "fg_mask_suffix": "_binary",
+    },
+    {
+        "id": "cashew_easy_015_044",
+        "image_path": "experiment_ResNet/source/reference_anomalies/easy/imgs/044.JPG",
+        "mask_path": "experiment_ResNet/source/reference_anomalies/easy/masks/044.png",
+        "needs_prep": True,
+        "normal_dir": "Data/Images/Normal",
+        "normal_index": 15,
+        "fg_mode": "birefnet",
+        "base_dir": _CASHEW_BASE,
+        "fg_masks_dir": "birefnet_masks/Normal",
+        "fg_mask_suffix": "_binary",
+    },
+    {
+        "id": "cashew_easy_020_079",
+        "image_path": "experiment_ResNet/source/reference_anomalies/easy/imgs/079.JPG",
+        "mask_path": "experiment_ResNet/source/reference_anomalies/easy/masks/079.png",
+        "needs_prep": True,
+        "normal_dir": "Data/Images/Normal",
+        "normal_index": 20,
+        "fg_mode": "birefnet",
+        "base_dir": _CASHEW_BASE,
+        "fg_masks_dir": "birefnet_masks/Normal",
+        "fg_mask_suffix": "_binary",
+    },
+]
+
 # Flat list of every example that needs offline prep (used by prep script).
 ALL_PREP_EXAMPLES = [
     ex for panel in (PANEL_A_EXAMPLES, PANEL_B_EXAMPLES, PANEL_C_EXAMPLES,
-                     PANEL_D_EXAMPLES, PANEL_E_EXAMPLES)
+                     PANEL_D_EXAMPLES, PANEL_E_EXAMPLES, PANEL_F_EXAMPLES)
     for ex in panel if ex.get("needs_prep", False)
 ]
 
@@ -245,6 +297,11 @@ VALIDATION_CAPTIONS: Dict[str, str] = {
     # Panel E — OOD Hard Deformation
     "cashew_hard_029_096": "Cashew nut has a misshapen, multi-lobed form with an abnormal split shape.",
     "cashew_hard_293_098": "Cashew nut has multiple overlapping pieces forming an irregular stacked mass.",
+    # Panel F — OOD Easy Cashew
+    "cashew_easy_005_001": "Cashew nut has a small dark blemish on its lower curved surface.",
+    "cashew_easy_010_029": "Cashew nut has a tiny dark spot near the upper left of its surface.",
+    "cashew_easy_015_044": "Cashew nut has a discolored patch on the right side of its body.",
+    "cashew_easy_020_079": "Cashew nut has a thin diagonal scratch across its lower surface.",
 }
 
 
@@ -640,6 +697,8 @@ def _run_panel_a(
     pipeline, ip_adapter, device: str, band_mode: int, t2i_adapter,
     clip_align: bool, val_data_dir: Path, captions: Dict[str, str],
     out_dir: Path,
+    noise_strength: float = 0.7,
+    inference_mode: str = "different",
 ) -> Dict[str, Any]:
     """Panel A — Easy ID Sanity: 3 examples × 3 CFG = 9 runs."""
     panel_dir = out_dir / "panel_A_easy_id"
@@ -671,7 +730,7 @@ def _run_panel_a(
         _generate_and_save(
             pipeline, ip_adapter, canvas_t, mask_t, clip_data,
             ex["id"].split("_")[0], caption,  # anomaly_type = product name
-            noise_strength=0.7, inference_mode="same",
+            noise_strength=noise_strength, inference_mode=inference_mode,
             band_mode=band_mode, t2i_adapter=t2i_adapter,
             seed=base_seed + i, out_dir=ex_out, device=device,
         )
@@ -1044,6 +1103,61 @@ def _run_panel_e(
     return results
 
 
+def _run_panel_f(
+    pipeline, ip_adapter, device: str, band_mode: int, t2i_adapter,
+    clip_align: bool, val_data_dir: Path, captions: Dict[str, str],
+    out_dir: Path,
+) -> Dict[str, Any]:
+    """Panel F — OOD Easy Cashew: 4 easy cashew × 3 CFG = 12 runs."""
+    panel_dir = out_dir / "panel_F_ood_easy_cashew"
+    results = {"panel": "F", "examples": []}
+    base_seed = PANEL_SEEDS["F"]
+
+    for i, ex in enumerate(PANEL_F_EXAMPLES):
+        ex_prep = val_data_dir / ex["id"]
+        if not ex_prep.exists():
+            logger.warning("Panel F: %s not prepped, skipping", ex["id"])
+            results["examples"].append({"id": ex["id"], "status": "skipped"})
+            continue
+
+        random.seed(base_seed + i)
+        ex_out = panel_dir / ex["id"]
+
+        canvas_t = _load_image_tensor(ex_prep / "canvas.png", device=device)
+        mask_t = _load_mask_tensor(ex_prep / "placed_mask.png", device=device)
+
+        clip_data = _prepare_clip_crops(
+            ex_prep / "ref_image.png", ex_prep / "ref_mask.png",
+            band_mode, clip_align, device,
+        )
+
+        caption = _get_caption(captions, ex.get("image_path", ""), example_id=ex["id"])
+
+        _generate_and_save(
+            pipeline, ip_adapter, canvas_t, mask_t, clip_data,
+            "cashew", caption,
+            noise_strength=0.7, inference_mode="different",
+            band_mode=band_mode, t2i_adapter=t2i_adapter,
+            seed=base_seed + i, out_dir=ex_out, device=device,
+        )
+        results["examples"].append({"id": ex["id"], "status": "ok"})
+
+    # Panel plot
+    plot_examples = [
+        {"dir": panel_dir / ex["id"], "label": ex["id"], "is_swapped": False}
+        for ex in PANEL_F_EXAMPLES
+        if (panel_dir / ex["id"]).exists()
+    ]
+    if plot_examples:
+        _create_panel_plot(
+            "Panel F \u2014 OOD Easy Cashew", plot_examples, band_mode,
+            panel_dir / "panel_plot.png",
+        )
+
+    results["status"] = "ok"
+    return results
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Main Entry Point
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1063,7 +1177,7 @@ def run_validation_suite(
     captions_file: Path = None,
     panels: List[str] = None,
 ) -> Dict[str, Any]:
-    """Run the 5-panel validation suite.
+    """Run the 6-panel validation suite.
 
     Args:
         pipeline: Loaded SD inpainting pipeline.
@@ -1077,13 +1191,13 @@ def run_validation_suite(
         data_root: Root for training data (for Panel B image paths).
         val_data_dir: Directory with prepped validation data (for A, C).
         captions_file: Path to captions JSON.
-        panels: Which panels to run (default all: ["A","B","C","D","E"]).
+        panels: Which panels to run (default all: ["A","B","C","D","E","F"]).
 
     Returns:
         Summary dict with per-panel results.
     """
     if panels is None:
-        panels = ["A", "B", "C", "D", "E"]
+        panels = ["A", "B", "C", "D", "E", "F"]
 
     suite_dir = output_dir / "val_suite" / f"checkpoint_{step:05d}"
     suite_dir.mkdir(parents=True, exist_ok=True)
@@ -1158,6 +1272,16 @@ def run_validation_suite(
                     pipeline, ip_adapter, device, band_mode, t2i_adapter,
                     clip_align, Path(val_data_dir), captions, suite_dir,
                 )
+            elif panel == "F":
+                if val_data_dir is None:
+                    logger.warning("Panel F requires --val-data-dir, skipping")
+                    summary["panels"]["F"] = {"status": "skipped"}
+                    print("skipped (no val_data_dir)")
+                    continue
+                result = _run_panel_f(
+                    pipeline, ip_adapter, device, band_mode, t2i_adapter,
+                    clip_align, Path(val_data_dir), captions, suite_dir,
+                )
             else:
                 logger.warning("Unknown panel: %s", panel)
                 continue
@@ -1188,10 +1312,15 @@ def run_validation_suite(
 
 
 def _load_checkpoint(checkpoint_dir: Path, device: str):
-    """Load pipeline + IP-Adapter + T2I-Adapter from a training checkpoint."""
+    """Load pipeline + IP-Adapter + T2I-Adapter from a training checkpoint.
+
+    Loads EMA weights if available (training validation uses EMA).
+    T2I-Adapter weights are inside training_state.pt, not a separate file.
+    """
     from src.models.base import create_pipeline
     from src.models.ip_adapter import create_ip_adapter
     from src.models.t2i_adapter import T2IAdapter
+    from src.utils.optim_utils import build_norm_param_id_set, split_decay_no_decay
 
     # Load config from checkpoint
     config_path = checkpoint_dir / "config.json"
@@ -1223,6 +1352,19 @@ def _load_checkpoint(checkpoint_dir: Path, device: str):
     if sa_layers == 0:
         sa_layers = 3
 
+    # Detect force_gates from config or state dict
+    # Old checkpoints don't save force_gates in config.json — detect from state dict:
+    # if no gate params exist in state dict, it was forced gates
+    force_gates = config.get("force_gates", False)
+    learnable_gates = config.get("learnable_gates", True)
+    if not force_gates and "force_gates" not in config:
+        # Heuristic: check if any gate param exists in saved weights
+        has_gate_params = any("gate.gate" in k for k in state.keys())
+        if not has_gate_params:
+            force_gates = True
+            learnable_gates = False
+            print("  Detected force_gates=True (no gate params in checkpoint)")
+
     # Create IP-Adapter from config
     ip_adapter = create_ip_adapter(
         pipeline,
@@ -1234,22 +1376,87 @@ def _load_checkpoint(checkpoint_dir: Path, device: str):
         mask_visual=config.get("mask_visual", True),
         visual_mode=config.get("visual_mode", 3),
         sa_num_layers=sa_layers,
+        force_gates=force_gates,
+        learnable_gates=learnable_gates,
     )
     ip_adapter.load_state_dict(state, strict=False)
-    ip_adapter.to(device).eval()
+    ip_adapter.to(device)
 
-    # T2I-Adapter
+    # Ensure trainable modules are fp32 (matches training setup)
+    ip_adapter.masked_self_attn.float()
+    ip_adapter.image_projection.float()
+    for proc in ip_adapter.attn_processors.values():
+        proc.float()
+
+    # Load training_state.pt for T2I-Adapter + EMA
     t2i_adapter = None
-    t2i_ckpt = checkpoint_dir / "t2i_adapter.pt"
-    if t2i_ckpt.exists():
-        t2i_state = torch.load(t2i_ckpt, map_location="cpu", weights_only=True)
+    training_state_path = checkpoint_dir / "training_state.pt"
+    training_state = None
+    if training_state_path.exists():
+        training_state = torch.load(training_state_path, map_location="cpu", weights_only=False)
+
+    # T2I-Adapter: load from training_state.pt (not a separate file)
+    if training_state and "t2i_adapter" in training_state:
+        t2i_state = training_state["t2i_adapter"]
         in_ch = 2
         for k, v in t2i_state.items():
             if "conv_in" in k and v.dim() == 4:
                 in_ch = v.shape[1]
                 break
-        t2i_adapter = T2IAdapter(in_channels=in_ch).to(device)
+        t2i_adapter = T2IAdapter(in_channels=in_ch).to(device).float()
         t2i_adapter.load_state_dict(t2i_state)
+        print("  T2I-Adapter loaded from training_state.pt")
+
+    # Apply EMA weights if available (matches training validation behavior)
+    if training_state and "ema" in training_state:
+        ema_state = training_state["ema"]
+        shadow = ema_state["shadow"]
+
+        # Reconstruct trainable param list in same order as training:
+        # A_decay, A_no_decay, B_decay, B_no_decay, C_gates
+        group_a_modules = [ip_adapter.image_projection] + list(ip_adapter.attn_processors.values())
+        group_b_modules = []
+        if hasattr(ip_adapter, 'masked_self_attn'):
+            group_b_modules.append(ip_adapter.masked_self_attn)
+        if t2i_adapter is not None:
+            group_b_modules.append(t2i_adapter)
+
+        norm_ids = build_norm_param_id_set(group_a_modules + group_b_modules)
+        a_decay, a_no_decay = split_decay_no_decay(group_a_modules, norm_ids)
+
+        group_c_params = []
+        if hasattr(ip_adapter, 'masked_self_attn') and ip_adapter.masked_self_attn.learnable_gates:
+            for layer in ip_adapter.masked_self_attn.layers:
+                group_c_params.append(layer["attn_gate"].gate)
+                if "ff_gate" in layer:
+                    group_c_params.append(layer["ff_gate"].gate)
+        if t2i_adapter is not None:
+            for s in t2i_adapter.scales:
+                group_c_params.append(s)
+        group_c_ids = {id(p) for p in group_c_params}
+
+        b_decay_raw, b_no_decay_raw = split_decay_no_decay(group_b_modules, norm_ids)
+        b_decay = [p for p in b_decay_raw if id(p) not in group_c_ids]
+        b_no_decay = [p for p in b_no_decay_raw if id(p) not in group_c_ids]
+
+        trainable_params = a_decay + a_no_decay + b_decay + b_no_decay + group_c_params
+
+        if len(trainable_params) == len(shadow):
+            # Shape sanity check
+            shapes_match = all(
+                p.shape == s.shape for p, s in zip(trainable_params, shadow)
+            )
+            if shapes_match:
+                for p, s in zip(trainable_params, shadow):
+                    p.data.copy_(s.to(p.device))
+                print(f"  EMA weights applied ({len(shadow)} params, decay={ema_state.get('decay', 0):.6f})")
+            else:
+                print("  WARNING: EMA shape mismatch — using online weights")
+        else:
+            print(f"  WARNING: EMA param count mismatch: model={len(trainable_params)}, shadow={len(shadow)} — using online weights")
+
+    ip_adapter.eval()
+    if t2i_adapter is not None:
         t2i_adapter.eval()
 
     return pipeline, ip_adapter, t2i_adapter
@@ -1257,7 +1464,7 @@ def _load_checkpoint(checkpoint_dir: Path, device: str):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="5-Panel Validation Suite (standalone)")
+    parser = argparse.ArgumentParser(description="6-Panel Validation Suite (standalone)")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to checkpoint directory")
     parser.add_argument("--output-dir", type=str, required=True,
@@ -1268,7 +1475,7 @@ def main():
                         help="Prepped validation data directory (Panels A, C)")
     parser.add_argument("--captions-file", type=str, default=None,
                         help="Path to captions JSON")
-    parser.add_argument("--panels", type=str, nargs="+", default=["A", "B", "C", "D", "E"],
+    parser.add_argument("--panels", type=str, nargs="+", default=["A", "B", "C", "D", "E", "F"],
                         help="Which panels to run")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--band-mode", type=int, default=2, choices=[1, 2])

@@ -17,6 +17,8 @@ Training loop:
 """
 import gc
 import csv
+import logging
+import math
 import os
 import sys
 import json
@@ -105,13 +107,15 @@ def train_anomagic(
     splits_dir: Path,
     save_dir: Path,
     captions_file: Path,
-    n_steps: int = 10000,
+    n_steps: int = 20000,
     batch_size: int = 12,
     lr: float = 1e-4,
     lr_pretrained: float = 5e-5,
     lambda_sp: float = 0.0,
     device: str = "cuda",
     save_every: int = 5000,
+    no_early_snapshots: bool = False,
+    keep_all_checkpoints: bool = False,
     anomaly_types: list = None,
     exclude_sources: list = None,
     data_root: Path = None,
@@ -127,10 +131,21 @@ def train_anomagic(
     band_mode: int = 2,
     # Loss weighting
     loss_core_ratio: float = 0.8,
+    # Disable masked loss: weight_map becomes uniform (standard MSE over all pixels)
+    no_masked_loss: bool = False,
+    # Uniform loss inside dilated mask (no core/band split), 0 outside.
+    uniform_mask_loss: bool = True,
     # Cross-attention mask type
     binary_cross_attn_mask: bool = False,
+    # Binary IP-CA mask = core only (band gets 0). Isolates "where IP fires" without
+    # touching UNet inpainting mask / T2I band channel / loss weighting.
+    binary_cross_attn_mask_core: bool = False,
+    # Core-only training: replace all dilated spatial signals with core-only (ablation)
+    core_only: bool = False,
     # T2I-Adapter mode
     t2i_adapter_mode: str = "cascade",
+    t2i_pair_inject: str = "last",
+    t2i_decoder_inject: bool = False,
     # LoRA on UNet
     lora_rank: int = 0,
     lora_alpha: int = 16,
@@ -159,7 +174,7 @@ def train_anomagic(
     # Number of attention heads
     sa_num_heads: int = 12,
     # Multi-crop (2-group CLIP cropping)
-    multi_crop: bool = True,
+    multi_crop: bool = False,
     # CFG direction for sample generation
     cfg_mode: str = "visual",
     # Headless mode (no live viewer)
@@ -172,6 +187,9 @@ def train_anomagic(
     logit_normal_std: float = 1.0,
     # Optimizer
     optimizer_type: str = "adamw",
+    # LR scheduler
+    lr_scheduler: str = "none",       # "none" or "cosine"
+    lr_min: float = 0.0,              # min LR for cosine annealing
     # Context corruption: zero masked_image_latents with this probability
     corrupt_context: float = 0.0,
     # x0-prediction pseudo-diffusion ablation
@@ -185,6 +203,7 @@ def train_anomagic(
     diag_interval: int = 1,
     # CLIP-UNet alignment: roundtripped masks + role embeddings
     clip_align: bool = True,
+    clip_core_only: bool = False,
     # Validation suite
     val_data_dir: Path = None,
     val_panels: list = None,
@@ -217,8 +236,17 @@ def train_anomagic(
     print(f"Masked visual cross-attention: {mask_visual}")
     print(f"CLIP dilation: min_r={clip_dilation_min_r}, max_r={clip_dilation_max_r}")
     print(f"Band mode: {band_mode} (Chebyshev latent-space dilation)")
-    print(f"Loss ratio: {loss_core_ratio:.0%} core / {1-loss_core_ratio:.0%} band")
-    print(f"Cross-attn mask: {'binary' if binary_cross_attn_mask else 'soft alpha'}")
+    if no_masked_loss:
+        print(f"Loss ratio: UNIFORM (masked loss DISABLED — standard MSE over all pixels)")
+    else:
+        print(f"Loss ratio: {loss_core_ratio:.0%} core / {1-loss_core_ratio:.0%} band")
+    if binary_cross_attn_mask_core:
+        _ca_mask_str = "binary core"
+    elif binary_cross_attn_mask:
+        _ca_mask_str = "binary dilated"
+    else:
+        _ca_mask_str = "soft alpha"
+    print(f"Cross-attn mask: {_ca_mask_str}")
     print(f"T2I-Adapter: {t2i_adapter_mode}")
     print(f"LoRA: {'off' if lora_rank == 0 else f'rank={lora_rank}, alpha={lora_alpha}, mode={lora_mode}, lr={lora_lr}'}")
     print(f"Unfreeze W_Q/W_O: {unfreeze_qo + ', lr=' + str(unfreeze_qo_lr) if unfreeze_qo else 'off'}")
@@ -227,7 +255,7 @@ def train_anomagic(
     print(f"Visual mode: {visual_mode}")
     print(f"Learnable gates: {learnable_gates} (SA layers: {sa_num_layers}, heads: {sa_num_heads})")
     print(f"Multi-crop: {multi_crop}")
-    print(f"CLIP-UNet alignment: {clip_align}")
+    print(f"CLIP-UNet alignment: {clip_align} (core_only={clip_core_only})")
     print(f"Optimizer: {optimizer_type}")
     print(f"EMA: {'off' if ema_decay <= 0 else f'decay={ema_decay}'}")
     print(f"Noise offset: {noise_offset}")
@@ -267,6 +295,7 @@ def train_anomagic(
         multi_crop=multi_crop,
         band_mode=band_mode,
         clip_align=clip_align,
+        clip_core_only=clip_core_only,
     )
 
     if len(dataset) == 0:
@@ -317,9 +346,21 @@ def train_anomagic(
     t2i_adapter = None
     if t2i_adapter_mode != "off":
         from src.models.t2i_adapter import T2IAdapter
-        t2i_adapter = T2IAdapter(in_channels=2, injection_mode=t2i_adapter_mode).to(device)
+        t2i_adapter = T2IAdapter(
+            in_channels=2,
+            injection_mode=t2i_adapter_mode,
+            pair_injection=t2i_pair_inject,
+            decoder_inject=t2i_decoder_inject,
+        ).to(device)
         n_t2i = sum(p.numel() for p in t2i_adapter.parameters())
-        print(f"\nT2I-Adapter ({t2i_adapter_mode}): {n_t2i:,} params")
+        print(f"\nT2I-Adapter ({t2i_adapter_mode}, pair_inject={t2i_pair_inject}, "
+              f"decoder_inject={t2i_decoder_inject}): {n_t2i:,} params")
+        if t2i_pair_inject == "all":
+            t2i_adapter.register_dense_hooks(pipeline.unet)
+            print("  Dense pair injection hooks registered (encoder).")
+        if t2i_decoder_inject:
+            t2i_adapter.register_decoder_hooks(pipeline.unet)
+            print(f"  Decoder hooks registered (pair_inject={t2i_pair_inject}).")
 
     # =========================================
     # Initialize LoRA on UNet (optional)
@@ -328,10 +369,17 @@ def train_anomagic(
         from peft import LoraConfig
         if lora_mode == "cross":
             # Cross-attention only: attn2 layers (text/IP conditioning)
-            target_modules = [r"attn2\.(to_k|to_q|to_v|to_out\.0)"]
+            target_modules = r".*\.attn2\.(to_k|to_q|to_v|to_out\.0)"
         elif lora_mode == "mid_up":
             # All attention (attn1+attn2) in mid_block and up_blocks only
-            target_modules = [r"(mid_block|up_blocks)\.\d+\..*?(attn1|attn2)\.(to_k|to_q|to_v|to_out\.0)"]
+            # Must be a single string (not list) for PEFT to use regex matching
+            # re.fullmatch requires matching the ENTIRE key, so prefix with .*
+            target_modules = r"(mid_block|up_blocks)\..*\.(attn1|attn2)\.(to_k|to_q|to_v|to_out\.0)"
+        elif lora_mode == "mid_up_notext":
+            # mid+up blocks: full self-attention + cross-attention Q/out only (no text K/V)
+            # attn1: to_q, to_k, to_v, to_out.0 (self-attn, no text involved)
+            # attn2: to_q, to_out.0 only (skip to_k/to_v which project text embeddings)
+            target_modules = r"(mid_block|up_blocks)\..*\.(attn1\.(to_k|to_q|to_v|to_out\.0)|attn2\.(to_q|to_out\.0))"
         else:
             # All attention layers: self-attention (attn1) + cross-attention (attn2)
             target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
@@ -434,7 +482,7 @@ def train_anomagic(
 
     # Build param groups
     param_groups = [
-        {"params": a_decay,     "lr": lr_pretrained, "weight_decay": 0.0, "label": "A_decay"},
+        {"params": a_decay,     "lr": lr_pretrained, "weight_decay": 1e-4, "label": "A_decay"},
         {"params": a_no_decay,  "lr": lr_pretrained, "weight_decay": 0.0, "label": "A_no_decay"},
         {"params": b_decay,     "lr": lr,            "weight_decay": 1e-4, "label": "B_decay"},
         {"params": b_no_decay,  "lr": lr,            "weight_decay": 0.0, "label": "B_no_decay"},
@@ -446,7 +494,7 @@ def train_anomagic(
         qo_ids = {id(p) for p in qo_params}
         lora_params_clean = [p for p in lora_params if id(p) not in qo_ids]
         param_groups.append(
-            {"params": lora_params_clean, "lr": lora_lr, "weight_decay": 1e-3, "label": "D_lora"}
+            {"params": lora_params_clean, "lr": lora_lr, "weight_decay": 1e-4, "label": "D_lora"}
         )
 
     # Optional Group E: Unfrozen W_Q + W_O
@@ -504,6 +552,28 @@ def train_anomagic(
         )
     else:
         optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999), eps=1e-8)
+
+    # =========================================
+    # LR Scheduler (pretrained groups only)
+    # =========================================
+    scheduler = None
+    if lr_scheduler == "cosine":
+        from torch.optim.lr_scheduler import LambdaLR
+        # Cosine annealing on pretrained IP-Adapter groups (A) only.
+        # A: lr_pretrained → lr_min. All other groups: constant LR.
+        lr_min_ratio = lr_min / lr_pretrained
+        def _cosine_factor(step):
+            return lr_min_ratio + 0.5 * (1.0 - lr_min_ratio) * (1.0 + math.cos(math.pi * step / n_steps))
+        lambdas = []
+        for pg in param_groups:
+            if pg["label"].startswith("A_"):
+                lambdas.append(_cosine_factor)
+            else:
+                lambdas.append(lambda step: 1.0)
+        scheduler = LambdaLR(optimizer, lr_lambda=lambdas)
+        print(f"\n  LR scheduler: cosine annealing on pretrained groups (A) only")
+        print(f"    {lr_pretrained:.1e} → {lr_min:.1e} over {n_steps} steps")
+        print(f"    Scratch/gates/LoRA/QO groups: constant LR")
 
     # =========================================
     # L2-SP Regularizer (anchored to pretrained weights, before resume)
@@ -592,6 +662,11 @@ def train_anomagic(
                         loaded += 1
                 print(f"  Loaded {loaded} unfrozen W_Q/W_O tensors")
 
+            # LR scheduler
+            if scheduler is not None and "scheduler" in state:
+                scheduler.load_state_dict(state["scheduler"])
+                print(f"  Loaded LR scheduler state")
+
             # EMA state (loaded after EMA is initialized below)
             _resumed_ema_state = state.get("ema", None)
             if _resumed_ema_state is not None:
@@ -672,6 +747,8 @@ def train_anomagic(
         "ip_adapter_type": ip_adapter_type,
         "ip_adapter_k": ip_adapter_k,
         "optimizer": optimizer_type,
+        "lr_scheduler": lr_scheduler,
+        "lr_min": lr_min,
         "corrupt_context": corrupt_context,
         "x0_objective": x0_objective,
         "x0_start_ratio": x0_start_ratio,
@@ -680,7 +757,16 @@ def train_anomagic(
         "x0_warmup_frac": x0_warmup_frac,
         "x0_hold_frac": x0_hold_frac,
         "clip_align": clip_align,
+        "clip_core_only": clip_core_only,
+        "mask_visual": mask_visual,
+        "no_early_snapshots": no_early_snapshots,
+        "uniform_mask_loss": uniform_mask_loss,
+        "no_masked_loss": no_masked_loss,
+        "binary_cross_attn_mask": binary_cross_attn_mask,
+        "binary_cross_attn_mask_core": binary_cross_attn_mask_core,
         "ema_decay": ema_decay,
+        "t2i_pair_inject": t2i_pair_inject,
+        "t2i_decoder_inject": t2i_decoder_inject,
     }
     with open(config_file, "w") as cf:
         json.dump(run_config, cf, indent=2)
@@ -787,7 +873,11 @@ def train_anomagic(
             clip_dilation_max_r=clip_dilation_max_r,
             band_mode=band_mode,
             loss_core_ratio=loss_core_ratio,
+            no_masked_loss=no_masked_loss,
+            uniform_mask_loss=uniform_mask_loss,
             binary_cross_attn_mask=binary_cross_attn_mask,
+            binary_cross_attn_mask_core=binary_cross_attn_mask_core,
+            core_only=core_only,
             t2i_adapter=t2i_adapter,
             drop_image_prob=drop_image_prob,
             drop_text_prob=drop_text_prob,
@@ -830,7 +920,19 @@ def train_anomagic(
         loss.backward()
         torch.cuda.synchronize()  # TDR prevention
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item()
+
+        # Guard against NaN/inf gradients — prevents single bad backward pass
+        # from killing ALL parameters via NaN propagation through optimizer.
+        if not math.isfinite(grad_norm):
+            optimizer.zero_grad()
+            skipped_nan += 1
+            if grad_norm != grad_norm:  # NaN check
+                logging.warning(f"Step {step}: NaN gradient detected, skipping update")
+            continue
+
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         if ema is not None:
             ema.update()
 
@@ -899,7 +1001,7 @@ def train_anomagic(
         #torch.cuda.empty_cache()
 
         # Early sample snapshots (no checkpoint, just samples + loss plot)
-        if (step + 1) in (500, 1000, 2000) and (step + 1) % save_every != 0:
+        if (not no_early_snapshots) and (step + 1) in (500, 1000, 2000) and (step + 1) % save_every != 0:
             torch.cuda.empty_cache()
             if ema is not None:
                 ema.store()
@@ -935,9 +1037,10 @@ def train_anomagic(
                 losses=losses,
                 qo_params_named=qo_params_named if qo_params_named else None,
                 ema=ema,
+                scheduler=scheduler,
             )
-            # Delete previous checkpoint (keep only latest + final)
-            if prev_ckpt_dir is not None and prev_ckpt_dir.exists():
+            # Delete previous checkpoint (keep only latest + final), unless --keep-all-checkpoints
+            if not keep_all_checkpoints and prev_ckpt_dir is not None and prev_ckpt_dir.exists():
                 import shutil
                 shutil.rmtree(prev_ckpt_dir)
             prev_ckpt_dir = ckpt_dir
@@ -988,7 +1091,14 @@ def train_anomagic(
         losses=losses,
         qo_params_named=qo_params_named if qo_params_named else None,
         ema=ema,
+        scheduler=scheduler,
     )
+
+    # Only checkpoint_final is used for inference — delete the last intermediate, unless --keep-all-checkpoints.
+    if not keep_all_checkpoints and prev_ckpt_dir is not None and prev_ckpt_dir.exists():
+        import shutil
+        shutil.rmtree(prev_ckpt_dir)
+        print(f"Deleted redundant intermediate checkpoint: {prev_ckpt_dir.name}")
 
     # Final sample grid (use EMA weights)
     torch.cuda.empty_cache()
@@ -1020,7 +1130,11 @@ def compute_anomagic_loss(
     clip_dilation_max_r: int = 10,
     band_mode: int = 1,
     loss_core_ratio: float = 0.8,
+    no_masked_loss: bool = False,
+    uniform_mask_loss: bool = True,
     binary_cross_attn_mask: bool = False,
+    binary_cross_attn_mask_core: bool = False,
+    core_only: bool = False,
     t2i_adapter=None,
     drop_image_prob: float = 0.15,
     drop_text_prob: float = 0.05,
@@ -1089,9 +1203,16 @@ def compute_anomagic_loss(
 
         # Timestep sampling
         if timestep_sampling == "logit_normal":
-            # SD3-style: sample from logit-normal distribution (bell-shaped, mid-range focus)
+            # SD3-style: sample from logit-normal distribution (bell over t)
             u = torch.sigmoid(logit_normal_mean + logit_normal_std * torch.randn(batch_size, device=device))
             timesteps = (u * 1000).long().clamp(0, 999)
+        elif timestep_sampling == "logit_normal_sigma2":
+            # Bell over noise power sigma^2 (variance-preserving analog of SD3's bell-in-t).
+            # Sample u ~ logit-normal, treat u as target sigma^2, invert schedule to find t.
+            u = torch.sigmoid(logit_normal_mean + logit_normal_std * torch.randn(batch_size, device=device))
+            alphas_cumprod = pipeline.scheduler.alphas_cumprod.to(device)  # [1000], decreasing in t
+            sigma2_all = 1.0 - alphas_cumprod                              # [1000], increasing in t
+            timesteps = torch.searchsorted(sigma2_all, u).clamp(0, 999).long()
         else:
             # Uniform (standard DDPM)
             timesteps = torch.randint(0, 1000, (batch_size,), device=device, dtype=torch.long)
@@ -1111,8 +1232,16 @@ def compute_anomagic_loss(
         core_mask_64 = (core_mask_64 > 0.5).float()
 
         dilated_binary_64, alpha_map_64, weight_map_64, band_mask_64 = create_latent_band_mask(
-            core_mask_64, band_mode, core_ratio=loss_core_ratio,
+            core_mask_64, band_mode,
         )
+
+        if no_masked_loss:
+            weight_map_64 = torch.ones_like(weight_map_64)
+        elif uniform_mask_loss:
+            # Uniform inside dilated mask (core = band = 1.0), zero outside.
+            # Per-sample normalization in the loss reduction already divides by sum(weight),
+            # so this gives mean-MSE over masked pixels, no core/band bias.
+            weight_map_64 = dilated_binary_64.float()
 
         # --- Pathway 1: Text conditioning (captions only, no TI tokens) ---
         prompts = []
@@ -1184,8 +1313,10 @@ def compute_anomagic_loss(
             ip_image_embeds = ip_image_embeds * drop_image_mask  # new tensor, no in-place
 
         # --- Inpainting inputs — latent-space dilated mask defines regeneration region ---
-        mask_latents = dilated_binary_64  # binary [B, 1, 64, 64]
-        unet_mask_512 = F.interpolate(dilated_binary_64, size=images.shape[-2:], mode='nearest')
+        # Core-only ablation: swap dilated → core for mask channel + masked_image_latents.
+        _inpaint_mask_64 = core_mask_64 if core_only else dilated_binary_64
+        mask_latents = _inpaint_mask_64  # binary [B, 1, 64, 64]
+        unet_mask_512 = F.interpolate(_inpaint_mask_64, size=images.shape[-2:], mode='nearest')
         masked_image = images * (1 - unet_mask_512)
         masked_image_latents = pipeline.encode_image(masked_image)
 
@@ -1218,14 +1349,23 @@ def compute_anomagic_loss(
         # --- T2I-Adapter spatial features (AMP autocast handles dtype) ---
         t2i_kwargs = {}
         if t2i_adapter is not None:
-            t2i_input = torch.cat([core_mask_64, band_mask_64], dim=1)  # [B, 2, 64, 64]
-            t2i_features = t2i_adapter(t2i_input, mask=dilated_binary_64)
+            # Core-only: zero the band input channel and use core for the internal mask.
+            _band_in = torch.zeros_like(band_mask_64) if core_only else band_mask_64
+            _t2i_mask = core_mask_64 if core_only else dilated_binary_64
+            t2i_input = torch.cat([core_mask_64, _band_in], dim=1)  # [B, 2, 64, 64]
+            t2i_features = t2i_adapter(t2i_input, mask=_t2i_mask)
             t2i_kwargs = t2i_adapter.prepare_unet_kwargs(t2i_features)
+            if t2i_adapter.pair_injection == "all" or t2i_adapter.decoder_inject:
+                t2i_adapter.set_hook_features(t2i_features)
 
         # --- UNet forward with both pathways via cross_attention_kwargs ---
         cross_attn_kwargs = {"ip_adapter_image_embeds": ip_image_embeds}
-        # Cross-attn mask: soft alpha (default) or binary
-        if binary_cross_attn_mask:
+        # Cross-attn mask: core-only (full ablation) > binary core (IP-CA only) > binary dilated > soft alpha (default)
+        if core_only:
+            cross_attn_kwargs["ip_adapter_mask"] = core_mask_64
+        elif binary_cross_attn_mask_core:
+            cross_attn_kwargs["ip_adapter_mask"] = core_mask_64
+        elif binary_cross_attn_mask:
             cross_attn_kwargs["ip_adapter_mask"] = dilated_binary_64
         else:
             cross_attn_kwargs["ip_adapter_mask"] = alpha_map_64
@@ -1245,6 +1385,10 @@ def compute_anomagic_loss(
             cross_attention_kwargs=cross_attn_kwargs,
             **t2i_kwargs,
         ).sample.float()
+        if t2i_adapter is not None and (
+            t2i_adapter.pair_injection == "all" or t2i_adapter.decoder_inject
+        ):
+            t2i_adapter.clear_hook_features()
         torch.cuda.synchronize()  # TDR prevention
 
     # --- Loss computed OUTSIDE autocast (fp32) to avoid fp16 overflow in reductions ---
@@ -1507,20 +1651,20 @@ def save_loss_plot(losses: list, stats_file: Path, save_path: Path):
                 return np.array([]), np.array([])
             return steps_arr[nz], _ema_smooth(vals[nz], sm)
         all_ema = _ema_smooth(np.array(diff_losses), SM)
-        ax_trend.plot(s_steps, all_ema, color="black", linewidth=2.5,
-                      label=f"Overall ({all_ema[-1]:.4f})")
+        ax_trend.plot(s_steps, all_ema, color="black", linewidth=2,
+                      alpha=1.0, label=f"Overall ({all_ema[-1]:.4f})")
         k_st, k_em = _mode_ema_filtered(s_loss_keep, s_steps, SM)
         if len(k_em):
-            ax_trend.plot(k_st, k_em, color="#2196F3", linewidth=2,
-                          label=f"Keep both ({k_em[-1]:.4f})")
+            ax_trend.plot(k_st, k_em, color="blue", linewidth=2,
+                          alpha=1.0, label=f"Keep both ({k_em[-1]:.4f})")
         dv_st, dv_em = _mode_ema_filtered(s_loss_dv, s_steps, SM)
         if len(dv_em):
-            ax_trend.plot(dv_st, dv_em, color="#F44336", linewidth=2,
-                          label=f"Keep text ({dv_em[-1]:.4f})")
+            ax_trend.plot(dv_st, dv_em, color="red", linewidth=1,
+                          alpha=0.35, label=f"Keep text ({dv_em[-1]:.4f})")
         dt_st, dt_em = _mode_ema_filtered(s_loss_dt, s_steps, SM)
         if len(dt_em):
-            ax_trend.plot(dt_st, dt_em, color="#FF9800", linewidth=2,
-                          label=f"Keep visual ({dt_em[-1]:.4f})")
+            ax_trend.plot(dt_st, dt_em, color="orange", linewidth=1,
+                          alpha=0.35, label=f"Keep visual ({dt_em[-1]:.4f})")
         ax_trend.set_title(f"Loss by Conditioning Mode, EMA({SM}) -- step {len(losses)}")
     else:
         ax_trend.plot(steps, ema_slow, color="darkblue", linewidth=2.5, label=f"EMA ({SM})")
@@ -1728,6 +1872,7 @@ def save_anomagic_checkpoint(
     step: int = 0, losses: list = None,
     qo_params_named: list = None,
     ema=None,
+    scheduler=None,
 ):
     """Save IP-Adapter + T2I-Adapter + LoRA + unfrozen QO + EMA checkpoint."""
     save_dir = Path(save_dir)
@@ -1739,6 +1884,8 @@ def save_anomagic_checkpoint(
         "step": step,
         "losses": losses or [],
     }
+    if scheduler is not None:
+        state["scheduler"] = scheduler.state_dict()
     if ema is not None:
         state["ema"] = ema.state_dict()
     if t2i_adapter is not None:
@@ -1796,10 +1943,19 @@ if __name__ == "__main__":
                         help="Where to save results")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint directory to resume from (e.g. results/anomagic_training/checkpoint_8000)")
-    parser.add_argument("--steps", type=int, default=10000,
-                        help="Training steps")
+    parser.add_argument("--steps", type=int, default=20000,
+                        help="Training steps (default 20000). Overridden to 60000 by --full-run.")
+    parser.add_argument("--full-run", action="store_true",
+                        help="Full run: 60000 steps (overrides --steps).")
     parser.add_argument("--save-every", type=int, default=5000,
                         help="Save checkpoint + samples every N steps")
+    parser.add_argument("--no-early-snapshots", action="store_true",
+                        help="Disable early sample snapshots at steps 500/1000/2000 "
+                             "(use for matrix runs where only end-of-training val matters).")
+    parser.add_argument("--keep-all-checkpoints", action="store_true",
+                        help="Disable auto-deletion of intermediate checkpoints during training. "
+                             "Use when you need to evaluate at multiple step counts later "
+                             "(e.g., training-length sweep within a single run).")
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate for IP-Adapter")
     parser.add_argument("--batch-size", type=int, default=10,
@@ -1843,11 +1999,14 @@ if __name__ == "__main__":
                              "on visual baseline, 'visual' amplifies IP-Adapter on text baseline, "
                              "'both' amplifies both pathways on unconditional baseline")
     # Multi-crop (orthogonal to visual-mode)
-    parser.add_argument("--no-multi-crop", action="store_true",
-                        help="Disable 2-group CLIP cropping (enabled by default)")
+    parser.add_argument("--multi-crop", action="store_true",
+                        help="Enable 2-group CLIP cropping (disabled by default, K=1 single-crop)")
     parser.add_argument("--no-clip-align", action="store_true",
                         help="Disable CLIP-UNet roundtrip mask alignment and role embeddings. "
                              "Reverts to raw cropped masks with no anomaly/normal token distinction.")
+    parser.add_argument("--clip-core-only", action="store_true",
+                        help="CLIP attention sees only core (roundtripped, no band dilation). "
+                             "Default: CLIP sees core+band (dilated).")
     # CLIP dilation settings — currently unused (CLIP path uses cropping instead).
     # Kept for potential future use with reference_mode="full".
     # parser.add_argument("--clip-dilation-min-r", type=int, default=2,
@@ -1860,13 +2019,36 @@ if __name__ == "__main__":
     # Loss settings
     parser.add_argument("--loss-core-ratio", type=float, default=0.8,
                         help="Fraction of total gradient to core (e.g. 0.8 = 80%% core, 20%% band)")
+    parser.add_argument("--no-masked-loss", action="store_true",
+                        help="Disable masked loss: uniform MSE over all 64x64 latent pixels (standard diffusion loss)")
+    parser.add_argument("--uniform-mask-loss", action=argparse.BooleanOptionalAction, default=True,
+                        help="Uniform weight inside dilated mask (core=band=1.0), zero outside. "
+                             "Per-sample normalized — equivalent to mean MSE over masked pixels, no 80/20 bias. "
+                             "Default True; use --no-uniform-mask-loss to enable the 80/20 core/band ratio loss instead.")
     # Cross-attention mask type
     parser.add_argument("--binary-cross-attn-mask", action="store_true",
                         help="Use binary dilated mask for cross-attn instead of soft alpha_map")
+    parser.add_argument("--binary-cross-attn-mask-core", action="store_true",
+                        help="Use binary CORE mask for IP cross-attn (band=0). Isolates the IP-CA "
+                             "spatial gating; UNet inpainting mask, T2I band channel, and loss "
+                             "weighting are unchanged. Mutually exclusive with --binary-cross-attn-mask "
+                             "and --core-only (which take precedence).")
+    parser.add_argument("--core-only", action="store_true",
+                        help="Core-only training ablation: replace all dilated spatial signals "
+                             "(UNet inpainting mask, T2I band channel, T2I internal mask, "
+                             "IP-Adapter cross-attn mask) with core-only, and force loss_core_ratio→0.999.")
     # T2I-Adapter
     parser.add_argument("--t2i-adapter-mode", type=str, default="cascade",
                         choices=["cascade", "skip_only", "off"],
                         help="T2I-Adapter injection mode (cascade=encoder+decoder, skip_only=decoder, off=disabled)")
+    parser.add_argument("--t2i-pair-inject", type=str, default="last",
+                        choices=["last", "all"],
+                        help="T2I intra-block injection: last=after last pair only (default), "
+                             "all=before first pair + after every pair")
+    parser.add_argument("--t2i-decoder-inject", action="store_true",
+                        help="Also inject T2I features into decoder up-blocks via forward hooks "
+                             "(symmetric with encoder). Respects --t2i-pair-inject: 'last' hooks "
+                             "the last pair per up-block, 'all' hooks every pair.")
     # Conditioning dropout for CFG (3-category, mutually exclusive per-sample)
     parser.add_argument("--drop-image-prob", type=float, default=0.15,
                         help="Probability of zeroing IP-Adapter image embeddings per sample for CFG")
@@ -1886,7 +2068,7 @@ if __name__ == "__main__":
                         help="LoRA alpha (scaling factor)")
     parser.add_argument("--lora-lr", type=float, default=5e-5,
                         help="Learning rate for LoRA params (default 5e-5)")
-    parser.add_argument("--lora-mode", type=str, default="all", choices=["all", "cross", "mid_up"],
+    parser.add_argument("--lora-mode", type=str, default="all", choices=["all", "cross", "mid_up", "mid_up_notext"],
                         help="LoRA target: 'all' = self+cross attention, 'cross' = cross-attention only, 'mid_up' = all attention in mid+up blocks")
     parser.add_argument("--unfreeze-qo", type=str, default="",
                         choices=["", "mid_up", "all_cross", "all"],
@@ -1902,8 +2084,9 @@ if __name__ == "__main__":
     parser.add_argument("--noise-offset", type=float, default=0.05,
                         help="Noise offset for global brightness/darkness (default 0.05, 0=disabled)")
     parser.add_argument("--timestep-sampling", type=str, default="logit_normal",
-                        choices=["uniform", "logit_normal"],
-                        help="Timestep sampling: 'logit_normal' (default, SD3-style bell curve) "
+                        choices=["uniform", "logit_normal", "logit_normal_sigma2"],
+                        help="Timestep sampling: 'logit_normal' (default, SD3-style bell over t), "
+                             "'logit_normal_sigma2' (bell over noise power sigma^2, centered at 0.5), "
                              "or 'uniform' (standard DDPM)")
     parser.add_argument("--logit-normal-mean", type=float, default=0.0,
                         help="Mean for logit-normal timestep sampling (default 0.0, centers on t=500)")
@@ -1912,6 +2095,11 @@ if __name__ == "__main__":
     parser.add_argument("--optimizer", type=str, default="adamw",
                         choices=["adamw", "prodigy"],
                         help="Optimizer: 'adamw' (default) or 'prodigy' (auto-tuned LR)")
+    parser.add_argument("--lr-scheduler", type=str, default="cosine",
+                        choices=["none", "cosine"],
+                        help="LR scheduler: 'cosine' (default, cosine annealing) or 'none' (constant)")
+    parser.add_argument("--lr-min", type=float, default=5e-5,
+                        help="Minimum LR for cosine annealing on Group A (default 5e-5)")
     parser.add_argument("--corrupt-context", type=float, default=0.0,
                         help="Probability of zeroing masked_image_latents per step (0.0-1.0). "
                              "Forces UNet to rely on cross-attention instead of inpainting prior.")
@@ -1942,8 +2130,24 @@ if __name__ == "__main__":
                         help="Path to prepped validation data (from prep_validation_data.py)")
     parser.add_argument("--val-panels", type=str, nargs="+", default=None,
                         help="Which validation panels to run (default: all). Choices: A B C D E")
+    # Post-training evaluation pipeline (on by default)
+    parser.add_argument("--eval", action="store_true", default=True,
+                        help="Run full evaluation pipeline after training (default: on)")
+    parser.add_argument("--no-eval", dest="eval", action="store_false",
+                        help="Skip evaluation pipeline after training")
+    parser.add_argument("--eval-skip-uninet", action="store_true",
+                        help="Skip UniNet evaluation in eval pipeline")
+    parser.add_argument("--eval-dust", type=int, default=0,
+                        help="Dust particles for UniNet in eval pipeline (default: 0)")
+    parser.add_argument("--eval-resnet-epochs", type=int, default=30,
+                        help="ResNet epochs in eval pipeline (default: 30, matches run_eval_pipeline.py)")
+    parser.add_argument("--eval-uninet-epochs", type=int, default=30,
+                        help="UniNet epochs in eval pipeline (default: 30, matches run_eval_pipeline.py)")
 
     args = parser.parse_args()
+
+    if args.full_run:
+        args.steps = 60000
 
     project_root = Path(__file__).parent.parent
 
@@ -1963,12 +2167,16 @@ if __name__ == "__main__":
     if val_data_dir and not val_data_dir.is_absolute():
         val_data_dir = project_root / val_data_dir
 
+    save_dir = project_root / args.save_dir
+
     train_anomagic(
         splits_dir=project_root / args.splits_dir,
-        save_dir=project_root / args.save_dir,
+        save_dir=save_dir,
         captions_file=captions_file,
         n_steps=args.steps,
         save_every=args.save_every,
+        no_early_snapshots=args.no_early_snapshots,
+        keep_all_checkpoints=args.keep_all_checkpoints,
         batch_size=args.batch_size,
         lr=args.lr,
         lr_pretrained=args.lr_pretrained,
@@ -1985,9 +2193,16 @@ if __name__ == "__main__":
         clip_dilation_min_r=getattr(args, 'clip_dilation_min_r', 2),
         clip_dilation_max_r=getattr(args, 'clip_dilation_max_r', 10),
         band_mode=args.band_mode,
-        loss_core_ratio=args.loss_core_ratio,
+        # loss_core_ratio passed below (overridden by --core-only)
+        no_masked_loss=args.no_masked_loss,
         binary_cross_attn_mask=args.binary_cross_attn_mask,
+        binary_cross_attn_mask_core=args.binary_cross_attn_mask_core,
+        uniform_mask_loss=args.uniform_mask_loss,
+        core_only=args.core_only,
+        loss_core_ratio=(0.999 if args.core_only else args.loss_core_ratio),
         t2i_adapter_mode=args.t2i_adapter_mode,
+        t2i_pair_inject=args.t2i_pair_inject,
+        t2i_decoder_inject=args.t2i_decoder_inject,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_lr=args.lora_lr,
@@ -2004,7 +2219,7 @@ if __name__ == "__main__":
         force_gates=args.force_gates,
         sa_num_layers=args.sa_num_layers,
         sa_num_heads=args.sa_num_heads,
-        multi_crop=not args.no_multi_crop,
+        multi_crop=args.multi_crop,
         cfg_mode=args.cfg_mode,
         no_live_viewer=args.no_live_viewer,
         noise_offset=args.noise_offset,
@@ -2012,6 +2227,8 @@ if __name__ == "__main__":
         logit_normal_mean=args.logit_normal_mean,
         logit_normal_std=args.logit_normal_std,
         optimizer_type=args.optimizer,
+        lr_scheduler=args.lr_scheduler,
+        lr_min=args.lr_min,
         corrupt_context=args.corrupt_context,
         x0_objective=args.x0_objective,
         x0_start_ratio=args.x0_start_ratio,
@@ -2021,7 +2238,41 @@ if __name__ == "__main__":
         x0_hold_frac=args.x0_hold_frac,
         diag_interval=args.diag_interval,
         clip_align=not args.no_clip_align,
+        clip_core_only=args.clip_core_only,
         val_data_dir=val_data_dir,
         val_panels=args.val_panels,
         ema_decay=args.ema_decay,
     )
+
+    # ── Post-training evaluation pipeline ──────────────────────────────────
+    if args.eval:
+        import subprocess as _sp
+        # Release parent-process CUDA memory so child eval subprocess has headroom.
+        # Without this, PyTorch's cached allocator keeps ~8-12 GB alive in the parent
+        # (SD UNet, VAE, CLIP, IP-Adapter, T2I-Adapter, optimizer state) which combined
+        # with UniNet's ~12 GB in the child is enough to OOM a 24 GB card.
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        checkpoint_dir = save_dir / "checkpoint_final"
+        if not checkpoint_dir.exists():
+            print(f"\nWARNING: --eval requested but {checkpoint_dir} not found. Skipping eval.")
+        else:
+            print(f"\n{'='*70}")
+            print(f"  RUNNING EVAL PIPELINE")
+            print(f"{'='*70}")
+            eval_cmd = [
+                sys.executable, str(project_root / "scripts" / "run_eval_pipeline.py"),
+                "--checkpoint", str(checkpoint_dir),
+                "--output-dir", str(save_dir),
+            ]
+            if args.eval_skip_uninet:
+                eval_cmd.append("--skip-uninet")
+            if args.eval_dust > 0:
+                eval_cmd.extend(["--dust", str(args.eval_dust)])
+            eval_cmd.extend(["--resnet-epochs", str(args.eval_resnet_epochs)])
+            eval_cmd.extend(["--uninet-epochs", str(args.eval_uninet_epochs)])
+            print(f"  CMD: {' '.join(eval_cmd)}")
+            _sp.run(eval_cmd, cwd=str(project_root))
