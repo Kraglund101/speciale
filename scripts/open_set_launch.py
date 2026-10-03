@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""One launcher for the open-set experiment, for this machine and for the B200 (same code, no shell scripts):
+plan -> generate -> refine -> dtd -> cutmix -> check -> train -> tables, each step resumable (existing files and
+finished runs are skipped).
+
+  # pilot on the RTX 4090: seed 42, two folds, every arm
+  python scripts/open_set_launch.py --profile local --seeds 42 --folds holes breakage
+
+  # smoke test (any machine): 2 epochs of everything, one seed, one fold - checks the whole chain in minutes
+  python scripts/open_set_launch.py --profile b200 --smoke
+
+  # full run on the B200
+  python scripts/open_set_launch.py --profile b200 --seeds 42 123 7 99 256 11 22 33 44 55
+
+Profiles only set defaults: --gen-procs (parallel generation processes), --train-slots (trainings at once), --stagger
+(seconds between training starts; simultaneous start-ups stall each other). Checkpoints are deleted after every run
+unless --keep-checkpoints (a run writes ~1.1 GB). --stages limits what is done, e.g. --stages train tables.
+Progress: results/open_set_v2/launch.log; one log per step / run under results/open_set_v2/logs/.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "results/open_set_v2"
+STEPS = str(ROOT / "scripts/open_set_steps.py")
+PROFILES = {"local": dict(gen_procs=2, train_slots=2, stagger=90), "b200": dict(gen_procs=8, train_slots=8, stagger=45)}
+ALL = ["plan", "generate", "refine", "dtd", "cutmix", "check", "train", "tables"]
+_lock = threading.Lock()
+
+
+def log(msg: str) -> None:
+    line = f"{time.strftime('%m-%d %H:%M')}  {msg}"
+    with _lock:
+        print(line, flush=True); OUT.mkdir(parents=True, exist_ok=True)
+        with open(OUT / "launch.log", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+def run(cmd: list[str], logfile: Path, env: dict) -> int:
+    logfile.parent.mkdir(parents=True, exist_ok=True)
+    with open(logfile, "a", encoding="utf-8") as f:
+        return subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=str(ROOT))
+
+
+def done(results: Path, epochs: int) -> bool:
+    if not results.exists():
+        return False
+    try:
+        r = json.load(open(results, encoding="utf-8")); k = [k for k in r if k.startswith("Mode") and " @ " not in k]
+        return bool(k) and len(r[k[0]].get("img_aurocs", [])) >= epochs
+    except Exception:
+        return False
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--profile", choices=sorted(PROFILES), default="local")
+    ap.add_argument("--seeds", type=int, nargs="+", default=[42]); ap.add_argument("--folds", nargs="+", default=None)
+    ap.add_argument("--arms", nargs="+", default=None, help="e.g. m1 diffusion_in_s1 dtd_s3 (default: all 16)")
+    ap.add_argument("--stages", nargs="+", default=ALL, choices=ALL)
+    ap.add_argument("--gen-procs", type=int); ap.add_argument("--train-slots", type=int); ap.add_argument("--stagger", type=int)
+    ap.add_argument("--smoke", action="store_true", help="2 epochs, seed 42, fold holes: end-to-end check")
+    ap.add_argument("--keep-checkpoints", action="store_true")
+    ap.add_argument("--sets", default=None, help="only these image sets, e.g. s2 (stages 1-2) or s2,s3")
+    a = ap.parse_args(); prof = PROFILES[a.profile]
+    gen_procs = a.gen_procs or prof["gen_procs"]; slots = a.train_slots or prof["train_slots"]; stagger = prof["stagger"] if a.stagger is None else a.stagger
+    env = dict(os.environ, PYTHONIOENCODING="utf-8"); epochs = 20
+    if a.sets:
+        env["OPEN_SET_SETS"] = a.sets
+    if a.smoke:
+        a.seeds, a.folds, epochs = [42], a.folds or ["holes"], 2; env["OPEN_SET_EPOCH_LIMIT"] = "2"
+    os.environ.update({k: v for k, v in env.items() if k in ("OPEN_SET_EPOCH_LIMIT", "OPEN_SET_SETS")})
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import open_set_steps as S                                             # after the env var is set
+    folds = a.folds or S.CLASSES; fargs = ["--folds", *folds] if a.folds else []
+    arms = [(m, st) for m, st in S.ARMS if a.arms is None or S.run_name(m, st) in a.arms]
+    py = [sys.executable, "-u", STEPS]; L = OUT / "logs"
+    log(f"=== launch profile {a.profile}{' SMOKE' if a.smoke else ''}: seeds {a.seeds}, folds {folds}, {len(arms)} arms, stages {a.stages}, "
+        f"gen procs {gen_procs}, train slots {slots}")
+    for s in a.seeds:
+        sa = ["--seeds", str(s), *fargs]
+        for st in [x for x in a.stages if x in ("plan", "generate", "refine", "dtd", "cutmix", "check")]:
+            t0 = time.time(); n = gen_procs if st in ("generate", "refine") else 1
+            with ThreadPoolExecutor(n) as ex:
+                rcs = list(ex.map(lambda k: run(py + [st, *sa] + (["--shard", str(k), str(n)] if n > 1 else []), L / f"{st}_seed{s}_{k}.log", env), range(n)))
+            log(f"seed {s} {st}: rc {rcs} in {(time.time() - t0) / 60:.1f} min")
+            if any(rcs) and st != "check":
+                log(f"seed {s}: STOP, {st} failed (see {L})"); raise SystemExit(1)
+        if "train" in a.stages:
+            jobs = [(m, stp, k) for k in folds for m, stp in arms]; gate = threading.Lock()
+
+            def one(job: tuple) -> None:
+                m, stp, k = job; name = S.run_name(m, stp); out = OUT / "runs" / name / f"seed_{s}" / f"fold_{k}"
+                if done(out / "results.json", epochs):
+                    return
+                with gate:                                               # stagger the start-ups
+                    cmd = S.command(s, k, m, stp, []); time.sleep(stagger)
+                t0 = time.time(); rc = run(cmd, L / f"train_{name}_seed{s}_{k}.log", env)
+                if not a.keep_checkpoints:
+                    shutil.rmtree(out / "checkpoints", ignore_errors=True)
+                log(f"seed {s} fold {k} {name}: rc {rc}, {(time.time() - t0) / 60:.1f} min")
+
+            log(f"seed {s}: training {len(jobs)} runs, {slots} at a time")
+            with ThreadPoolExecutor(slots) as ex:
+                list(ex.map(one, jobs))
+    if "tables" in a.stages:
+        run([sys.executable, str(ROOT / "scripts/open_set_tables.py")], L / "tables.log", env)
+    log("=== launch finished")
+
+
+if __name__ == "__main__":
+    main()

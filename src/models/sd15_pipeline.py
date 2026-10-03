@@ -100,6 +100,11 @@ class SD15Pipeline(BaseSDPipeline):
 
         return embeddings
 
+    def unet_forward(self, model_input, timesteps, text_emb, cross_attention_kwargs=None, **kwargs):
+        """UNet forward used by training (SDXL overrides this to add pooled text + time ids)."""
+        return self.unet(model_input, timesteps, encoder_hidden_states=text_emb,
+                         cross_attention_kwargs=cross_attention_kwargs, **kwargs)
+
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         """Encode image to VAE latent space."""
         image = image.to(self.device, dtype=self.dtype)

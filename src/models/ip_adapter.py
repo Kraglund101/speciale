@@ -736,12 +736,14 @@ class IPAdapter(nn.Module):
                 num_heads=self.config.sa_num_heads,
             ).to(self.pipeline.device, dtype=self.pipeline.dtype)
 
-            # Official IP-Adapter Plus: 4-layer perceiver resampler
+            # Official IP-Adapter Plus: 4-layer perceiver resampler.
+            # SD 1.5 plus: dim 768 / 12 heads; SDXL plus (vit-h): dim 1280 / 20 heads, output 2048.
+            resampler_dim = 1280 if self.sd_version == SDVersion.SD_XL else self.cross_attention_dim
             self.image_projection = Resampler(
-                dim=self.cross_attention_dim,  # 768 for SD 1.5
+                dim=resampler_dim,  # 768 for SD 1.5
                 depth=4,
                 dim_head=64,
-                heads=self.cross_attention_dim // 64,  # 12 for SD 1.5
+                heads=resampler_dim // 64,  # 12 for SD 1.5
                 num_queries=self.config.num_tokens,
                 embedding_dim=clip_embed_dim,  # 1280 for ViT-H
                 output_dim=self.cross_attention_dim,
@@ -892,22 +894,11 @@ class IPAdapter(nn.Module):
             elif "up_blocks.3" in layer_name:
                 return 320
 
-        # SDXL has different architecture
+        # SDXL: read the attention width from the UNet itself (down_blocks.1 / up_blocks.1 = 640,
+        # down_blocks.2 / mid / up_blocks.0 = 1280; down_blocks.0 and up_blocks.2 have no attention)
         elif self.sd_version == SDVersion.SD_XL:
-            if "down_blocks.0" in layer_name:
-                return 640
-            elif "down_blocks.1" in layer_name:
-                return 1280
-            elif "down_blocks.2" in layer_name:
-                return 1280
-            elif "mid_block" in layer_name:
-                return 1280
-            elif "up_blocks.0" in layer_name:
-                return 1280
-            elif "up_blocks.1" in layer_name:
-                return 1280
-            elif "up_blocks.2" in layer_name:
-                return 640
+            attn = self.pipeline.unet.get_submodule(layer_name[: -len(".processor")])
+            return attn.to_k.out_features
 
         return 1280  # Default
 

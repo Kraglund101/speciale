@@ -16,6 +16,30 @@ from PIL import Image
 from scipy.ndimage import label as ndimage_label
 
 
+
+def _rotate_scale_mask(crop: np.ndarray, angle: float, scale: float) -> np.ndarray:
+    """Rotate + scale a binary footprint using ONLY the operations of the CLIP/training pipeline
+    (src/data/anomaly_dataset.py _clip_augmentation_transforms + crop_utils): rotation in exact 90-degree steps
+    (np.rot90, no resampling) and MAX-POOL when shrinking. Enlarging uses NEAREST, which only duplicates pixels.
+    The footprint therefore has exactly the shape CLIP was shown, never a resampled one: arbitrary-angle NEAREST
+    rotation + NEAREST downscale split thin holes into pieces (cashew 062: 2 pieces -> 3; 135 of 1000 transforms).
+    `angle` must be a multiple of 90. Returns float32 {0, 1}.
+    """
+    import torch
+    import torch.nn.functional as F
+    if angle % 90 != 0:
+        raise ValueError(f"footprint rotation must be a multiple of 90 degrees (CLIP pipeline), got {angle}")
+    rot = np.rot90(crop > 0.5, k=int(angle // 90) % 4)
+    h, w = rot.shape
+    new_h, new_w = max(1, int(h * scale)), max(1, int(w * scale))
+    if new_h < h or new_w < w:
+        t = torch.from_numpy(np.ascontiguousarray(rot).astype(np.float32))[None, None]
+        out = F.adaptive_max_pool2d(t, (new_h, new_w))[0, 0].numpy() > 0.5
+    else:
+        out = np.array(Image.fromarray(rot.astype(np.uint8) * 255).resize((new_w, new_h), Image.NEAREST)) > 127
+    return out.astype(np.float32)
+
+
 def load_binary_mask(path: Path) -> np.ndarray:
     """Load grayscale mask, binarize at 0.5. Returns float32 {0.0, 1.0}."""
     mask = np.array(Image.open(path).convert("L")).astype(np.float32) / 255.0
@@ -28,9 +52,11 @@ def _place_single_component(
     occupied: np.ndarray,
     rng: random.Random,
     max_attempts: int = 500,
-    scale_range: Tuple[float, float] = (0.8, 1.2),
+    scale_range: Tuple[float, float] = (0.5, 1.0),
+    record: Optional[list] = None,
 ) -> Optional[np.ndarray]:
     """Place a single bbox-cropped component inside FG, avoiding occupied pixels.
+    record: if given, the transform of the successful placement is appended (flip_v, flip_h, angle, scale, top, left).
 
     Returns placed mask [H, W] float32 {0, 1}, or None.
     """
@@ -43,22 +69,19 @@ def _place_single_component(
         return None
 
     # Random flips
-    if rng.random() < 0.5:
+    flip_v = rng.random() < 0.5
+    if flip_v:
         crop = crop[::-1, :].copy()
-    if rng.random() < 0.5:
+    flip_h = rng.random() < 0.5
+    if flip_h:
         crop = crop[:, ::-1].copy()
 
-    # Uniform rotation [0, 360]
-    angle = rng.uniform(0, 360)
-    crop_pil = Image.fromarray((crop * 255).astype(np.uint8))
-    rotated = crop_pil.rotate(angle, expand=True, resample=Image.NEAREST)
-
-    # Uniform scale
+    # Rotation in 90-degree steps only (CLIP pipeline). Same single uniform draw as before -> quadrant, so the RNG
+    # stream (scale, position) is unchanged.
+    angle = 90 * int(rng.uniform(0, 360) // 90)
+    # Uniform scale (drawn in the same order as before, so the RNG stream is unchanged)
     scale = rng.uniform(*scale_range)
-    rw, rh = rotated.size
-    new_w, new_h = max(1, int(rw * scale)), max(1, int(rh * scale))
-    scaled = rotated.resize((new_w, new_h), Image.NEAREST)
-    scaled_arr = (np.array(scaled).astype(np.float32) / 255.0 > 0.5).astype(np.float32)
+    scaled_arr = _rotate_scale_mask(crop, angle, scale)
     if scaled_arr.sum() == 0:
         return None
 
@@ -77,6 +100,9 @@ def _place_single_component(
         # No overlap with already-placed components
         if (placed * occupied).sum() > 0:
             continue
+        if record is not None:
+            record.append({"flip_v": flip_v, "flip_h": flip_h, "angle": angle, "scale": scale, "top": int(top),
+                           "left": int(left), "shape": (int(sh), int(sw))})
         return placed
     return None
 
@@ -254,8 +280,10 @@ def _get_grouped_crops(
     max_group_size: int = 224,
     pad_frac: float = 0.0,
     overlap_merge: bool = True,
-) -> List[np.ndarray]:
+    return_bboxes: bool = False,
+):
     """Get bbox-cropped masks for spatially grouped connected components.
+    return_bboxes=True returns (crops, bboxes) with bbox = (y0, y1, x0, x1) inclusive in source coordinates.
 
     Nearby components are merged into single crops preserving their relative
     spatial positions.  Uses the same 3-pass algorithm as
@@ -280,18 +308,20 @@ def _get_grouped_crops(
         components.append({'mask': comp_mask, 'bbox': bbox})
 
     if not components:
-        return []
+        return ([], []) if return_bboxes else []
 
     if len(components) == 1:
         m = components[0]['mask']
         ys, xs = np.where(m > 0.5)
-        return [m[ys.min():ys.max() + 1, xs.min():xs.max() + 1]]
+        crop = [m[ys.min():ys.max() + 1, xs.min():xs.max() + 1]]
+        return (crop, [(int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max()))]) if return_bboxes else crop
 
     group_indices = _group_components(
         components, H, W, max_group_size, pad_frac, overlap_merge=overlap_merge,
     )
 
     crops: List[np.ndarray] = []
+    bboxes: List[Tuple[int, int, int, int]] = []
     for idxs in group_indices:
         combined = np.zeros((H, W), dtype=np.float32)
         for i in idxs:
@@ -299,8 +329,12 @@ def _get_grouped_crops(
         ys, xs = np.where(combined > 0.5)
         crop = combined[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
         crops.append(crop)
+        bboxes.append((int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())))
 
-    crops.sort(key=lambda c: c.sum(), reverse=True)
+    order = sorted(range(len(crops)), key=lambda k: crops[k].sum(), reverse=True)   # stable, largest area first
+    crops = [crops[k] for k in order]
+    if return_bboxes:
+        return crops, [bboxes[k] for k in order]
     return crops
 
 
@@ -394,12 +428,14 @@ def place_easy_mask(
     anomaly_mask: np.ndarray,
     foreground_mask: np.ndarray,
     max_attempts: int = 500,
-    scale_range: Tuple[float, float] = (0.8, 1.2),
+    scale_range: Tuple[float, float] = (0.5, 1.0),
     seed: int | None = None,
     max_group_size: int = 224,
     overlap_merge: bool = False,
+    record: Optional[list] = None,
 ) -> Optional[np.ndarray]:
     """Place anomaly mask so ALL anomaly pixels are inside foreground.
+    record: optional list; each placed group appends its source bbox + transform (to paste the real pixels identically).
 
     Spatially nearby connected components are grouped (same 3-pass algorithm
     as CLIP crop grouping) and transformed as a single unit, preserving their
@@ -436,18 +472,26 @@ def place_easy_mask(
     if len(fg_ys) == 0:
         return None
 
-    group_crops = _get_grouped_crops(
-        anomaly_mask, max_group_size=max_group_size, overlap_merge=overlap_merge,
+    group_crops, group_bboxes = _get_grouped_crops(
+        anomaly_mask, max_group_size=max_group_size, overlap_merge=overlap_merge, return_bboxes=True,
     )
+    rec = [] if record is not None else None
+
+    def _done(result):
+        if record is not None and result is not None:
+            for g, b in zip(rec, group_bboxes):
+                g["src_bbox"] = b
+            record.extend(rec)
+        return result
 
     if len(group_crops) == 1:
         # Single group: original fast path (no overhead)
         crop = group_crops[0]
-        return _place_single_component(
+        return _done(_place_single_component(
             crop, foreground_mask,
             occupied=np.zeros((H, W), dtype=np.float32),
-            rng=rng, max_attempts=max_attempts, scale_range=scale_range,
-        )
+            rng=rng, max_attempts=max_attempts, scale_range=scale_range, record=rec,
+        ))
 
     # Multiple groups: place each independently
     occupied = np.zeros((H, W), dtype=np.float32)
@@ -456,14 +500,14 @@ def place_easy_mask(
     for group_crop in group_crops:
         placed = _place_single_component(
             group_crop, foreground_mask, occupied,
-            rng=rng, max_attempts=max_attempts, scale_range=scale_range,
+            rng=rng, max_attempts=max_attempts, scale_range=scale_range, record=rec,
         )
         if placed is None:
             return None  # failed to place this group
         combined = np.maximum(combined, placed)
         occupied = np.maximum(occupied, placed)
 
-    return combined
+    return _done(combined)
 
 
 def place_hard_mask(
@@ -475,7 +519,7 @@ def place_hard_mask(
 ) -> Optional[Tuple[str, np.ndarray, float, float, float]]:
     """Place mask so entire FG is inside the placed mask (100% coverage).
 
-    Exhaustive search: 4 flip combos × 72 angles × progressive scales.
+    Exhaustive search: 4 flip combos × 4 right-angle rotations (CLIP pipeline) × progressive scales.
 
     Args:
         ref_mask: [H, W] float32 binary mask to place.
@@ -508,7 +552,7 @@ def place_hard_mask(
             continue
         fg_info[cid] = (fg, fg.shape, fg_ys.mean(), fg_xs.mean(), fg.sum())
 
-    angles = list(np.linspace(0, 360, 72, endpoint=False))
+    angles = [0, 90, 180, 270]          # 90-degree steps only (CLIP pipeline); was 72 continuous angles
     flips = [(False, False), (True, False), (False, True), (True, True)]
 
     max_scale_bump = 5  # up to +0.5 above original max
@@ -527,17 +571,8 @@ def place_hard_mask(
                 crop = crop[:, ::-1].copy()
 
             for angle in angles:
-                crop_pil = Image.fromarray((crop * 255).astype(np.uint8))
-                rotated = crop_pil.rotate(angle, expand=True, resample=Image.NEAREST)
-                rw, rh = rotated.size
-
                 for scale_try in scales:
-                    new_w = max(1, int(rw * scale_try))
-                    new_h = max(1, int(rh * scale_try))
-                    scaled = rotated.resize((new_w, new_h), Image.NEAREST)
-                    scaled_arr = (
-                        np.array(scaled).astype(np.float32) / 255.0 > 0.5
-                    ).astype(np.float32)
+                    scaled_arr = _rotate_scale_mask(crop, angle, scale_try)
                     if scaled_arr.sum() == 0:
                         continue
                     sh, sw = scaled_arr.shape

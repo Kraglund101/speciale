@@ -43,6 +43,18 @@ Usage:
         --prep-dir results/cashew_100_rp/prep \
         --output-dir <run>/cashew_100_rp/refined_masks \
         --fg-dir anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/birefnet_masks/Normal
+
+Non-SD1.5 generators (e.g. FLUX.1 Kontext): the SD1.5-VAE α-blend reference is
+wrong for them. Use ``--canvas-ref raw`` to compare against the raw canvas,
+resized the way the generator resized it. ``--canvas-resize-via N`` inserts the
+generator's intermediate LANCZOS resize (canvas -> NxN -> 512), e.g. 1024 for a
+FLUX backend that works on a 1024x1024 canvas and saves a LANCZOS 512 copy:
+    python scripts/compute_refined_masks.py --canvas-ref raw --canvas-resize-via 1024 \
+        --gen-dir <run>/generated/<flux_variant> --prep-dir results/cashew_100_rp/prep \
+        --output-dir <run>/refined_masks_<flux_variant> --fg-dir <birefnet Normal dir>
+In raw mode each sample also logs ``bg_mae_255``: mean |gen - reference| (0-255)
+far outside the dilated mask. It is ~0 when the generator pastes back raw canvas
+pixels and the resize chain matches; it is clearly > 0 otherwise.
 """
 from __future__ import annotations
 
@@ -61,6 +73,7 @@ import torch.nn.functional as F
 
 from src.utils.mask_utils import create_latent_band_mask, downsample_mask_maxpool
 from src.utils.perceptual_mask_utils import (
+    drop_small_blobs,
     build_refined_mask,
     build_vgg_features,
     compute_dilated_mask_512,
@@ -262,6 +275,16 @@ def _load_lpips(device: str):
     return _compute
 
 
+def _mask_to_512(m: np.ndarray, legacy_nearest: bool = False) -> np.ndarray:
+    """Binary float mask -> TARGET_SIZE x TARGET_SIZE {0,1}. MAX-POOL by default (never drops mask pixels, same as the
+    generator); legacy_nearest reproduces the old NEAREST resize exactly."""
+    if legacy_nearest:
+        pil = Image.fromarray((m > 0.5).astype(np.uint8) * 255).resize((TARGET_SIZE, TARGET_SIZE), Image.NEAREST)
+        return (np.array(pil).astype(np.float32) / 255.0 > 0.5).astype(np.float32)
+    t = torch.from_numpy((m > 0.5).astype(np.float32))[None, None]
+    return (downsample_mask_maxpool(t, TARGET_SIZE)[0, 0].numpy() > 0.5).astype(np.float32)
+
+
 def _alpha_map_512(placed_bin_512: np.ndarray, band_mode: int = 2) -> torch.Tensor:
     """Build the same soft alpha map the generator used (from placed mask).
 
@@ -309,9 +332,19 @@ def main():
                         help="Output directory for refined masks")
     parser.add_argument("--fg-dir", type=str, required=True,
                         help="Path to birefnet Normal FG masks directory")
-    parser.add_argument("--factor", type=float, default=0.6,
+    parser.add_argument("--legacy-nearest", action="store_true",
+                        help="Reproduce pre-2026-09-25 masks byte for byte: NEAREST downsampling of the FG mask, the "
+                             "hard-case placed mask and the alpha-blend placed mask. Default is MAX-POOL (never drops "
+                             "mask pixels; matches the generator, which max-pools the placed mask).")
+    parser.add_argument("--min-blob-px", type=int, default=0,
+                        help="Drop refined-mask blobs smaller than this (8-connected). Sampler label default: 16. 0 = off.")
+    parser.add_argument("--abs-threshold", type=float, default=None,
+                        help="ABSOLUTE refinement (x100 DINO units, ring-relative): keep pixels whose distance exceeds "
+                             "the surroundings by more than this. Empty mask when nothing was painted. Calibrated on "
+                             "blank repaints (max 7.0, results/SYNTHESIS_STATE.md). Default: relative --factor rule.")
+    parser.add_argument("--factor", type=float, default=0.25,
                         help="Per-component threshold factor. "
-                             "Default 0.6 (changed 2026-04-10 from 0.65 — slightly more permissive, "
+                             "Default 0.25 (2026-09-30, mask ladder: scripts/inpaint_region_test.py; was 0.6 from 2026-04-10, before that 0.65 — "
                              "catches faint anomaly edges).")
     parser.add_argument("--sigma", type=float, default=3.0,
                         help="Gaussian blur sigma on the distance map. "
@@ -345,9 +378,21 @@ def main():
     parser.add_argument("--vae-roundtrip-canvas", action="store_true",
                         help="(Experimental) Full VAE roundtrip of canvas without alpha-blend compositing. "
                              "Not recommended — introduces asymmetric VAE bias in the background.")
+    parser.add_argument("--canvas-ref", choices=["sd15", "raw"], default="sd15",
+                        help="Canvas reference. 'sd15' (default) = SD1.5 VAE calibration controlled by "
+                             "--no-alpha-blend / --vae-roundtrip-canvas. 'raw' = generator-agnostic: raw "
+                             "canvas, no VAE (for FLUX Kontext etc.). Pair with --canvas-resize-via.")
+    parser.add_argument("--canvas-resize-via", type=int, default=0,
+                        help="(--canvas-ref raw only) Resize the canvas to NxN with LANCZOS before the "
+                             "LANCZOS resize to 512, mirroring a generator that works at NxN and saves a "
+                             "512 copy (FLUX Kontext backend: N = --flux-res). 0 = direct resize to 512.")
 
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
+    if args.canvas_ref == "raw" and (args.vae_roundtrip_canvas or args.no_alpha_blend):
+        parser.error("--canvas-ref raw already disables the VAE; drop --vae-roundtrip-canvas/--no-alpha-blend")
+    if args.canvas_resize_via and args.canvas_ref != "raw":
+        parser.error("--canvas-resize-via requires --canvas-ref raw")
 
     # Resolve backbone: default to DINOv3-CNX if no flag given
     if not (args.use_dinov3_cnx or args.use_dinov3_vit or args.use_dinov2
@@ -356,7 +401,8 @@ def main():
 
     # Resolve canvas calibration: default to α-blend unless explicitly disabled
     # or the user passed the experimental full-roundtrip flag
-    args.vae_roundtrip_alpha_blend = not args.no_alpha_blend and not args.vae_roundtrip_canvas
+    args.vae_roundtrip_alpha_blend = (args.canvas_ref == "sd15"
+                                      and not args.no_alpha_blend and not args.vae_roundtrip_canvas)
 
     project_root = Path(__file__).parent.parent
     gen_dir = Path(args.gen_dir)
@@ -432,17 +478,17 @@ def main():
         fg_mask = None
         if fg_path.exists():
             fg_raw = np.array(Image.open(fg_path).convert("L")).astype(np.float32) / 255.0
-            fg_pil = Image.fromarray((fg_raw > 0.5).astype(np.uint8) * 255)
-            fg_pil = fg_pil.resize((TARGET_SIZE, TARGET_SIZE), Image.NEAREST)
-            fg_mask = (np.array(fg_pil).astype(np.float32) / 255.0 > 0.5).astype(np.float32)
+            fg_mask = _mask_to_512((fg_raw > 0.5).astype(np.float32), args.legacy_nearest)
 
         if is_hard:
             # Hard cases: placed_mask ∩ FG (no LPIPS thresholding)
+            if not (gen_dir / f"{s}.png").exists():
+                print(f"  [{s}] SKIP — no generated image")
+                continue
             placed_path = prep_dir / s / "placed_mask.png"
-            placed = np.array(Image.open(placed_path).convert("L").resize(
-                (TARGET_SIZE, TARGET_SIZE), Image.NEAREST
-            )).astype(np.float32) / 255.0
-            placed_bin = (placed > 0.5).astype(np.float32)
+            placed_bin = _mask_to_512(
+                (np.array(Image.open(placed_path).convert("L")).astype(np.float32) / 255.0 > 0.5).astype(np.float32),
+                args.legacy_nearest)
             if fg_mask is not None:
                 refined = placed_bin * fg_mask
             else:
@@ -460,7 +506,11 @@ def main():
 
             # Load images as [1,3,S,S] in [0,1]
             gen_pil = Image.open(gen_path).convert("RGB").resize((TARGET_SIZE, TARGET_SIZE), Image.LANCZOS)
-            canvas_pil = Image.open(canvas_path).convert("RGB").resize((TARGET_SIZE, TARGET_SIZE), Image.LANCZOS)
+            canvas_pil = Image.open(canvas_path).convert("RGB")
+            if args.canvas_resize_via:
+                via = args.canvas_resize_via
+                canvas_pil = canvas_pil.resize((via, via), Image.LANCZOS)
+            canvas_pil = canvas_pil.resize((TARGET_SIZE, TARGET_SIZE), Image.LANCZOS)
             gen_t = torch.from_numpy(np.array(gen_pil).astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
             canvas_t = torch.from_numpy(np.array(canvas_pil).astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
 
@@ -470,11 +520,8 @@ def main():
 
             if args.vae_roundtrip_alpha_blend:
                 canvas_rt = _vae_roundtrip(vae, canvas_t, device)
-                # Build 512 version of placed mask (NEAREST) for alpha map
-                placed_512_pil = Image.open(placed_path).convert("L").resize(
-                    (TARGET_SIZE, TARGET_SIZE), Image.NEAREST
-                )
-                placed_512 = (np.array(placed_512_pil).astype(np.float32) / 255.0 > 0.5).astype(np.float32)
+                # 512 version of the placed mask for the alpha map (max-pool, as the generator; --legacy-nearest = old NEAREST)
+                placed_512 = _mask_to_512(placed_bin, args.legacy_nearest)
                 alpha_512 = _alpha_map_512(placed_512, band_mode=BAND_MODE)
                 canvas_t = canvas_rt * alpha_512 + canvas_t * (1.0 - alpha_512)
             elif args.vae_roundtrip_canvas:
@@ -498,7 +545,17 @@ def main():
             dilated = compute_dilated_mask_512(placed_bin, band_mode=BAND_MODE, target_size=TARGET_SIZE)
 
             # Per-component refinement
-            refined, stats = build_refined_mask(dist, dilated, factor=args.factor, fg_mask=fg_mask)
+            refined, stats = build_refined_mask(dist, dilated, factor=args.factor, fg_mask=fg_mask,
+                                                 abs_threshold=None if args.abs_threshold is None else args.abs_threshold / 100.0)
+            refined = drop_small_blobs(refined, args.min_blob_px)
+
+            if args.canvas_ref == "raw":
+                # Sanity check of the reference: far from the dilated mask a generator that
+                # pastes back raw canvas pixels must reproduce the reference (up to resampling).
+                from scipy import ndimage as _nd
+                far = ~_nd.binary_dilation(dilated > 0.5, iterations=16)
+                diff = (gen_t - canvas_t).abs().mean(dim=1)[0].numpy() * 255.0
+                stats["bg_mae_255"] = float(diff[far].mean()) if far.any() else None
 
         # Save
         refined_uint8 = (refined * 255).astype(np.uint8)
@@ -508,7 +565,8 @@ def main():
 
         kind = "hard" if is_hard else "easy"
         n_px = int(refined.sum())
-        print(f"  [{s}] {kind:4s} — {n_px:5d} px refined")
+        bg = f"  bg_mae_255={stats['bg_mae_255']:.2f}" if stats.get("bg_mae_255") is not None else ""
+        print(f"  [{s}] {kind:4s} — {n_px:5d} px refined{bg}")
 
     # Save summary
     backbone = (
@@ -523,6 +581,8 @@ def main():
         "sigma": args.sigma,
         "band_mode": BAND_MODE,
         "backbone": backbone,
+        "canvas_ref": args.canvas_ref,
+        "canvas_resize_via": args.canvas_resize_via,
         "vae_roundtrip_canvas": bool(args.vae_roundtrip_canvas),
         "vae_roundtrip_alpha_blend": bool(args.vae_roundtrip_alpha_blend),
         "use_lpips": bool(args.use_lpips),

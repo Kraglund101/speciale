@@ -35,6 +35,13 @@ def _dilate_clip_mask_16(mask: torch.Tensor) -> torch.Tensor:
     return F.interpolate(mask_16_dilated, size=(h, w), mode="nearest")
 
 
+def _cat_text(a, b):
+    """Concatenate text conditioning along the batch (tensor for SD 1.5, SDXLTextCond for SDXL)."""
+    if torch.is_tensor(a):
+        return torch.cat([a, b])
+    return type(a)(torch.cat([a.embeds, b.embeds]), torch.cat([a.pooled, b.pooled]))
+
+
 def generate_anomagic_single(
     pipeline, ip_adapter, normal_image, mask, reference,
     anomaly_type, caption,
@@ -51,12 +58,15 @@ def generate_anomagic_single(
     clip_core_mask_2: torch.Tensor = None,
     group_valid: torch.Tensor = None,
     dilate_clip_mask: bool = False,
-    cfg_mode: str = "text",
+    cfg_mode: str = "visual",
     guidance_schedule=None,
     inference_mode: str = "same",
     cross_attn_mask_mode: str = "alpha",  # "alpha" = soft (default), "core_binary" = core-only binary
     zero_t2i_band: bool = False,            # zero the T2I band input channel (ablation)
     inpaint_mask_mode: str = "dilated",     # "dilated" (default) or "core_binary" — UNet mask channel ablation
+    raw_background: bool = False,            # blend the paint band into the RAW canvas instead of the decoded one
+    context_latents: torch.Tensor = None,   # latent-carry multi-edit: previous pass's state latent
+    return_latents: bool = False,           # also return this pass's state latent (for the next pass)
 ):
     """Generate anomaly using IP-Adapter + text captions.
 
@@ -78,8 +88,9 @@ def generate_anomagic_single(
         group_valid: Optional [1, 2] validity flags per crop group.
         dilate_clip_mask: If True, expand CLIP mask by +1px at 16x16 grid
             before self-attention. Use for hard/deformation anomalies.
-        cfg_mode: CFG direction. "text" (default) = amplify text on visual
-            baseline. "visual" = amplify visual on text baseline.
+        cfg_mode: CFG direction. "visual" (default, the trained/thesis setting) = amplify the reference image on a
+            text baseline: uncond = (real text, zero IP). "text" = amplify the caption only: uncond = (empty text,
+            real IP) -- the reference image is then NEVER amplified. "both" = uncond = (empty text, zero IP).
         guidance_schedule: Optional callable mapping t_normalized [B, 1] to
             s [B, 1]. When provided, overrides ``guidance_scale`` with a
             per-timestep learned scale (used by CFG configs E/F).
@@ -88,6 +99,17 @@ def generate_anomagic_single(
             "different" = reference is from a different image (core-only CLIP
             mask, no dilation — avoids contamination from wrong surface).
             UNet inpainting (band_mode) is unaffected by this setting.
+        context_latents: Latent-carry multi-edit. When given, ``normal_image`` must be the PREVIOUS pass's
+            output pixels and ``context_latents`` the previous pass's state latent. The pass then starts from and
+            blends against that latent (no re-encode) and pixel-blends against those pixels (no re-decode), so the
+            background is decoded exactly once however many passes run. ``normal_image`` is only encoded for the
+            inpainting conditioning channel (masked image), never for output pixels. None = unchanged behaviour.
+        raw_background: Option R. Final pixel blend uses the RAW canvas (``normal_image``) outside/in the band instead
+            of its VAE round-trip, so the background is the untouched photo (no global VAE fingerprint). The matching
+            refiner reference is compute_refined_masks' default alpha-blend (decoded in the band, raw outside).
+            Default False = Option D (decoded canvas, seamless, VAE fingerprint everywhere).
+        return_latents: If True, return ``(output, state_latent)`` where state_latent = alpha-composite of this
+            pass's latent over the context latent - the context for the next pass.
     """
     device = normal_image.device
 
@@ -171,13 +193,13 @@ def generate_anomagic_single(
             uncond_text = pipeline.encode_text([""], enable_grad=False)
             uncond_ip = torch.zeros_like(ip_image_embeds)
         else:
-            # Amplify text (default): uncond = (empty_text, real_IP)
+            # Amplify text: uncond = (empty_text, real_IP) -- reference image never amplified
             # pred = visual_only + scale * (text+visual - visual_only)
             uncond_text = pipeline.encode_text([""], enable_grad=False)
             uncond_ip = ip_image_embeds
 
         # Inpainting setup — latent-space band dilation
-        normal_latents = pipeline.encode_image(normal_image)
+        normal_latents = pipeline.encode_image(normal_image) if context_latents is None else context_latents
         kernel = mask.shape[-1] // normal_latents.shape[-1]
         core_mask_64 = F.max_pool2d(mask, kernel_size=kernel)
         core_mask_64 = (core_mask_64 > 0.5).float()
@@ -191,7 +213,8 @@ def generate_anomagic_single(
         _inpaint_mask_64 = core_mask_64 if inpaint_mask_mode == "core_binary" else dilated_binary_64
         mask_latents = _inpaint_mask_64
         unet_mask_512 = F.interpolate(_inpaint_mask_64, size=mask.shape[-2:], mode='nearest')
-        masked_image = normal_image * (1 - unet_mask_512)
+        _cond_img = normal_image if context_latents is None else normal_image.clamp(-1, 1)
+        masked_image = _cond_img * (1 - unet_mask_512)
         masked_image_latents = pipeline.encode_image(masked_image)
 
         # T2I-Adapter features (constant across timesteps, computed ONCE outside loop)
@@ -231,7 +254,7 @@ def generate_anomagic_single(
 
             model_input = torch.cat([latent_input, mask_input, masked_input], dim=1)
 
-            combined_text = torch.cat([uncond_text, text_emb])
+            combined_text = _cat_text(uncond_text, text_emb)
             combined_ip = torch.cat([uncond_ip, ip_image_embeds])
 
             cross_attn_kwargs = {"ip_adapter_image_embeds": combined_ip}
@@ -244,9 +267,9 @@ def generate_anomagic_single(
 
             if t2i_features_doubled is not None:
                 t2i_adapter.set_hook_features(t2i_features_doubled)
-            noise_pred = pipeline.unet(
+            noise_pred = pipeline.unet_forward(
                 model_input, t,
-                encoder_hidden_states=combined_text,
+                combined_text,
                 cross_attention_kwargs=cross_attn_kwargs,
                 **t2i_kwargs,
             ).sample.float()
@@ -277,8 +300,15 @@ def generate_anomagic_single(
     output = pipeline.decode_latents(latents.float())
     # Roundtrip the canvas through the VAE so both sides of the blend share the
     # same encoder/decoder bias — eliminates the seam from asymmetric decoding.
-    normal_decoded = pipeline.decode_latents(normal_latents.float())
+    # Latent carry: the previous pass's output pixels are already that decode — reuse them, never decode twice.
+    if raw_background:
+        normal_decoded = normal_image.float()      # Option R: the untouched canvas pixels
+    else:
+        normal_decoded = pipeline.decode_latents(normal_latents.float()) if context_latents is None else normal_image.float()
     alpha_512 = F.interpolate(alpha_map_64, size=output.shape[-2:], mode='nearest')
     output = output * alpha_512 + normal_decoded * (1 - alpha_512)
 
+    if return_latents:
+        state = latents.float() * alpha_map_64 + normal_latents.float() * (1 - alpha_map_64)
+        return output, state
     return output

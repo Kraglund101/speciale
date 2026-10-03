@@ -426,7 +426,7 @@ class AnomalyDataset(Dataset):
                     if self.clip_align:
                         # UNet-roundtripped masks for CLIP alignment.
                         # Group on the roundtripped mask (core or dilated per clip_core_only).
-                        core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
+                        core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode, image_size=self.image_size)
                         attn_mask = core_native if self.clip_core_only else dil_native
                         mc_result = clip_crop_multi(
                             img_t, attn_mask, crop_size=self.reference_crop_size,
@@ -477,7 +477,7 @@ class AnomalyDataset(Dataset):
                         )
                     if self.clip_align:
                         # Group on the roundtripped mask (core or dilated per clip_core_only).
-                        core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
+                        core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode, image_size=self.image_size)
                         attn_mask = core_native if self.clip_core_only else dil_native
                         sc_result = clip_crop(
                             img_t, attn_mask, crop_size=self.reference_crop_size,
@@ -533,7 +533,7 @@ class AnomalyDataset(Dataset):
                     if self.clip_align:
                         # UNet-roundtripped masks for CLIP alignment.
                         # Group on the roundtripped mask (core or dilated per clip_core_only).
-                        core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
+                        core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode, image_size=self.image_size)
                         attn_mask = core_native if self.clip_core_only else dil_native
                         mc_result = clip_crop_multi(
                             img_t, attn_mask, crop_size=self.reference_crop_size,
@@ -580,7 +580,7 @@ class AnomalyDataset(Dataset):
                     mask_t = (mask_t > 0.5).float()
                     if self.clip_align:
                         # Group on the roundtripped mask (core or dilated per clip_core_only).
-                        core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode)
+                        core_native, dil_native = unet_roundtrip_masks(mask_t, self.band_mode, image_size=self.image_size)
                         attn_mask = core_native if self.clip_core_only else dil_native
                         sc_result = clip_crop(
                             img_t, attn_mask, crop_size=self.reference_crop_size,

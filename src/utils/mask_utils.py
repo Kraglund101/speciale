@@ -244,6 +244,7 @@ def compute_ratio_loss_mask(
 def unet_roundtrip_masks(
     mask: torch.Tensor,
     band_mode: int = 2,
+    image_size: int = 512,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute UNet-resolution masks roundtripped to original resolution.
 
@@ -256,6 +257,7 @@ def unet_roundtrip_masks(
     Args:
         mask: Binary mask [1, H, W] in {0, 1}
         band_mode: 1 = 1px Chebyshev dilation, 2 = 2px (default 2)
+        image_size: UNet input resolution (512 for SD 1.5, 1024 for SDXL); latent = image_size // 8
 
     Returns:
         (core_native, dilated_native) both [1, H, W] binary float tensors.
@@ -264,11 +266,12 @@ def unet_roundtrip_masks(
     """
     _, H, W = mask.shape
 
-    # Down to 512 (SD 1.5 input resolution)
-    mask_512 = downsample_mask_maxpool(mask, 512)  # [1, 512, 512]
+    latent_size = image_size // 8
+    # Down to the UNet input resolution (512 for SD 1.5)
+    mask_512 = downsample_mask_maxpool(mask, image_size)  # [1, 512, 512]
 
-    # Down to 64 (latent resolution) — this is where UNet operates
-    core_64 = downsample_mask_maxpool(mask_512.unsqueeze(0), 64)  # [1, 1, 64, 64]
+    # Down to the latent resolution (64 for SD 1.5) — this is where UNet operates
+    core_64 = downsample_mask_maxpool(mask_512.unsqueeze(0), latent_size)  # [1, 1, 64, 64]
 
     # Chebyshev dilation at latent resolution (same as create_latent_band_mask)
     dilated_64 = core_64
@@ -278,8 +281,8 @@ def unet_roundtrip_masks(
     core_64 = (core_64 > 0.5).float()
 
     # Nearest upsample back: 64 → 512 → (H, W)
-    core_512 = F.interpolate(core_64, size=(512, 512), mode='nearest')
-    dilated_512 = F.interpolate(dilated_64, size=(512, 512), mode='nearest')
+    core_512 = F.interpolate(core_64, size=(image_size, image_size), mode='nearest')
+    dilated_512 = F.interpolate(dilated_64, size=(image_size, image_size), mode='nearest')
 
     core_native = F.interpolate(core_512, size=(H, W), mode='nearest').squeeze(0)  # [1, H, W]
     dilated_native = F.interpolate(dilated_512, size=(H, W), mode='nearest').squeeze(0)  # [1, H, W]
@@ -378,16 +381,22 @@ def create_latent_band_mask(
 
     Args:
         core_mask: Binary mask [B, 1, 64, 64] (maxpooled from image-space).
-        band_mode: 1 (single 1-pixel band) or 2 (inner + outer band).
+        band_mode: 0 (no band), 1 (single 1-pixel band) or 2 (inner + outer band).
 
     Returns:
         (dilated_binary, alpha_map, weight_map, band_mask) each [B, 1, 64, 64].
     """
-    assert band_mode in (1, 2), f"band_mode must be 1 or 2, got {band_mode}"
+    assert band_mode in (0, 1, 2), f"band_mode must be 0, 1 or 2, got {band_mode}"
 
     core = core_mask.float()
 
-    if band_mode == 1:
+    if band_mode == 0:
+        # No band: paint region = core only, hard alpha edge
+        dilated_binary = core
+        alpha_map = core.clone()
+        band_mask = torch.zeros_like(core)
+
+    elif band_mode == 1:
         # Single 1-pixel Chebyshev dilation
         dilated_1 = F.max_pool2d(core, kernel_size=3, stride=1, padding=1)
         dilated_1 = (dilated_1 > 0.5).float()

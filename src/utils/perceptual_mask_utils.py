@@ -164,11 +164,24 @@ def compute_dilated_mask_512(
     return dilated_up[0, 0].numpy()
 
 
+def drop_small_blobs(mask: np.ndarray, min_px: int) -> np.ndarray:
+    """Remove 8-connected blobs smaller than min_px from a binary mask (min_px <= 0: unchanged)."""
+    m = mask > 0.5
+    if min_px <= 0 or not m.any():
+        return m.astype(np.float32)
+    lab, n = ndimage.label(m, structure=np.ones((3, 3)))
+    sizes = ndimage.sum(m, lab, range(1, n + 1))
+    return np.isin(lab, [j + 1 for j, v in enumerate(sizes) if v >= min_px]).astype(np.float32)
+
+
 def build_refined_mask(
     dist: np.ndarray,
     dilated: np.ndarray,
     factor: float = THRESHOLD_FACTOR,
     fg_mask: Optional[np.ndarray] = None,
+    abs_threshold: Optional[float] = None,
+    level_mask: Optional[np.ndarray] = None,
+    percentile: float = 90.0,
 ) -> Tuple[np.ndarray, dict]:
     """Build refined binary mask using per-component p90 thresholding.
 
@@ -184,6 +197,10 @@ def build_refined_mask(
         dilated: [S, S] binary dilated mask (0/1 float).
         factor: Threshold factor applied to p90 (default 0.65).
         fg_mask: Optional [S, S] binary foreground mask (0/1 float).
+        level_mask: Optional [S, S] binary mask (e.g. the footprint). If given, p90 is taken over
+            component & level_mask only (falls back to the whole component if that is empty); the threshold is
+            still applied over the whole component.
+        percentile: which percentile the relative level uses (default 90 = p90).
 
     Returns:
         (refined_mask, stats) where refined_mask is [S, S] binary float,
@@ -205,8 +222,20 @@ def build_refined_mask(
         if len(comp_dists) == 0:
             continue
 
-        p90 = np.percentile(comp_dists, 90)
-        thresh = factor * p90
+        level_px = comp_mask & (level_mask > 0.5) if level_mask is not None else None
+        p90 = np.percentile(dist[level_px] if level_px is not None and level_px.any() else comp_dists, percentile)
+        if abs_threshold is None:
+            # RELATIVE (default): the most-changed part of this region - always non-empty, also when nothing
+            # was painted
+            thresh = factor * p90
+        else:
+            # ABSOLUTE: keep pixels whose distance exceeds the surroundings' typical distance by more than
+            # abs_threshold (calibrated on blank repaints). Empty when nothing was painted.
+            ring = ndimage.binary_dilation(comp_mask, iterations=24) & ~ndimage.binary_dilation(dilated_bin > 0.5, iterations=4)
+            if fg_mask is not None and fg_mask.shape == ring.shape:
+                ring &= fg_mask > 0.5
+            ring_med = float(np.median(dist[ring])) if ring.sum() >= 20 else float(np.median(dist[dilated_bin < 0.5]))
+            thresh = ring_med + abs_threshold
 
         comp_refined = (dist >= thresh) & comp_mask
         refined[comp_refined] = 1.0
@@ -224,10 +253,15 @@ def build_refined_mask(
         fg_bin = (fg_mask > 0.5).astype(np.float32)
         # Resize fg_mask if needed
         if fg_bin.shape != refined.shape:
-            from PIL import Image
-            fg_pil = Image.fromarray((fg_bin * 255).astype(np.uint8))
-            fg_pil = fg_pil.resize((refined.shape[1], refined.shape[0]), Image.NEAREST)
-            fg_bin = (np.array(fg_pil).astype(np.float32) / 255.0 > 0.5).astype(np.float32)
+            import torch
+            import torch.nn.functional as F
+            # MAX-POOL when shrinking (never drop FG pixels); NEAREST only when enlarging
+            if fg_bin.shape[0] > refined.shape[0] or fg_bin.shape[1] > refined.shape[1]:
+                fg_bin = (F.adaptive_max_pool2d(torch.from_numpy(fg_bin)[None, None], refined.shape)[0, 0].numpy() > 0.5).astype(np.float32)
+            else:
+                from PIL import Image
+                fg_pil = Image.fromarray((fg_bin * 255).astype(np.uint8)).resize((refined.shape[1], refined.shape[0]), Image.NEAREST)
+                fg_bin = (np.array(fg_pil).astype(np.float32) / 255.0 > 0.5).astype(np.float32)
         refined = refined * fg_bin
 
     stats = {
@@ -235,6 +269,7 @@ def build_refined_mask(
         "components": component_stats,
         "n_refined_total": int(refined.sum()),
         "factor": factor,
+        "abs_threshold": abs_threshold,
     }
 
     return refined, stats
