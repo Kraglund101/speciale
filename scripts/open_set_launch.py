@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -68,6 +69,19 @@ def done(results: Path, epochs: int) -> bool:
         return False
 
 
+def detect_gpus() -> tuple[list[str], bool]:
+    """(device ids, is_mig) from `nvidia-smi -L`. MIG slices -> their MIG-... UUIDs (a process can use only one slice);
+    several whole GPUs -> their indices; one GPU or no nvidia-smi -> ["0"]."""
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        return ["0"], False
+    mig = re.findall(r"UUID:\s*(MIG-[0-9A-Za-z/-]+)", out)
+    if mig:
+        return mig, True
+    return [str(i) for i in range(max(1, len(re.findall(r"^GPU \d+:", out, flags=re.M))))], False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--profile", choices=sorted(PROFILES), default="local")
@@ -78,15 +92,19 @@ def main() -> None:
     ap.add_argument("--smoke", action="store_true", help="2 epochs, seed 42, fold holes: end-to-end check")
     ap.add_argument("--keep-checkpoints", action="store_true")
     ap.add_argument("--sets", default=None, help="only these image sets, e.g. s2 (stages 1-2) or s2,s3")
-    ap.add_argument("--gpus", type=int, default=1, help="number of GPUs; processes are spread over them with CUDA_VISIBLE_DEVICES "
+    ap.add_argument("--gpus", type=int, default=0, help="number of GPUs (default 0 = detect with nvidia-smi: slices of a split GPU "
+                                                        "and several GPUs are used like multi-GPU, one GPU runs as before); processes are spread over them with CUDA_VISIBLE_DEVICES "
                                                         "(the profile's process counts are per GPU)")
     ap.add_argument("--gpu-ids", nargs="+", default=None, help="explicit device ids instead of 0..N-1, e.g. the MIG-... UUIDs "
                                                                "that `nvidia-smi -L` lists when a GPU is split into slices")
     a = ap.parse_args(); prof = PROFILES[a.profile]
-    ids = a.gpu_ids or [str(i) for i in range(a.gpus)]; a.gpus = len(ids)
-    gen_procs = a.gen_procs or prof["gen_procs"] * a.gpus; slots = a.train_slots or prof["train_slots"] * a.gpus
+    found, mig = detect_gpus() if not (a.gpu_ids or a.gpus) else ([], False)
+    ids = a.gpu_ids or ([str(i) for i in range(a.gpus)] if a.gpus else found); a.gpus = len(ids)
+    pin = a.gpus > 1 or bool(a.gpu_ids) or mig                 # one whole GPU: environment untouched
+    per = 2 if mig else None                                   # a slice is small: 2 processes per slice unless told otherwise
+    gen_procs = a.gen_procs or (per or prof["gen_procs"]) * a.gpus; slots = a.train_slots or (per or prof["train_slots"]) * a.gpus
     stagger = prof["stagger"] if a.stagger is None else a.stagger
-    gpu_env = lambda g: dict(env, CUDA_VISIBLE_DEVICES=ids[g]) if (a.gpus > 1 or a.gpu_ids) else env      # one GPU: leave the environment alone
+    gpu_env = lambda g: dict(env, CUDA_VISIBLE_DEVICES=ids[g]) if pin else env      # one GPU: leave the environment alone
     free_gpus: queue.Queue = queue.Queue()
     for i in range(slots):
         free_gpus.put(i % a.gpus)
@@ -102,7 +120,7 @@ def main() -> None:
     arms = [(m, st) for m, st in S.ARMS if a.arms is None or S.run_name(m, st) in a.arms]
     py = [sys.executable, "-u", STEPS]; L = OUT / "logs"
     log(f"=== launch profile {a.profile}{' SMOKE' if a.smoke else ''}: seeds {a.seeds}, folds {folds}, {len(arms)} arms, stages {a.stages}, "
-        f"gen procs {gen_procs}, train slots {slots}, gpus {a.gpus}")
+        f"gen procs {gen_procs}, train slots {slots}, gpus {a.gpus}{' (MIG slices)' if mig else ''}{' pinned: ' + ' '.join(ids) if pin else ''}")
     for s in a.seeds:
         sa = ["--seeds", str(s), *fargs]
         for st in [x for x in a.stages if x in ("plan", "generate", "refine", "dtd", "cutmix", "check")]:
