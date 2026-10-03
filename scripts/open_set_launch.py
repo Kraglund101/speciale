@@ -12,6 +12,10 @@ finished runs are skipped).
   # full run on the B200
   python scripts/open_set_launch.py --profile b200 --seeds 42 123 7 99 256 11 22 33 44 55
 
+Several GPUs: --gpus N spreads the generation processes and the trainings over GPU 0..N-1 (CUDA_VISIBLE_DEVICES per
+process); the profile's counts are then per GPU (b200: 8 generation processes and 8 trainings per GPU). Untested on
+more than one GPU (2026-10-03).
+
 Profiles only set defaults: --gen-procs (parallel generation processes), --train-slots (trainings at once), --stagger
 (seconds between training starts; simultaneous start-ups stall each other). Checkpoints are deleted after every run
 unless --keep-checkpoints (a run writes ~1.1 GB). --stages limits what is done, e.g. --stages train tables.
@@ -22,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -72,8 +77,15 @@ def main() -> None:
     ap.add_argument("--smoke", action="store_true", help="2 epochs, seed 42, fold holes: end-to-end check")
     ap.add_argument("--keep-checkpoints", action="store_true")
     ap.add_argument("--sets", default=None, help="only these image sets, e.g. s2 (stages 1-2) or s2,s3")
+    ap.add_argument("--gpus", type=int, default=1, help="number of GPUs; processes are spread over them with CUDA_VISIBLE_DEVICES "
+                                                        "(the profile's process counts are per GPU)")
     a = ap.parse_args(); prof = PROFILES[a.profile]
-    gen_procs = a.gen_procs or prof["gen_procs"]; slots = a.train_slots or prof["train_slots"]; stagger = prof["stagger"] if a.stagger is None else a.stagger
+    gen_procs = a.gen_procs or prof["gen_procs"] * a.gpus; slots = a.train_slots or prof["train_slots"] * a.gpus
+    stagger = prof["stagger"] if a.stagger is None else a.stagger
+    gpu_env = lambda g: dict(env, CUDA_VISIBLE_DEVICES=str(g)) if a.gpus > 1 else env      # one GPU: leave the environment alone
+    free_gpus: queue.Queue = queue.Queue()
+    for i in range(slots):
+        free_gpus.put(i % a.gpus)
     env = dict(os.environ, PYTHONIOENCODING="utf-8"); epochs = 20
     if a.sets:
         env["OPEN_SET_SETS"] = a.sets
@@ -86,13 +98,14 @@ def main() -> None:
     arms = [(m, st) for m, st in S.ARMS if a.arms is None or S.run_name(m, st) in a.arms]
     py = [sys.executable, "-u", STEPS]; L = OUT / "logs"
     log(f"=== launch profile {a.profile}{' SMOKE' if a.smoke else ''}: seeds {a.seeds}, folds {folds}, {len(arms)} arms, stages {a.stages}, "
-        f"gen procs {gen_procs}, train slots {slots}")
+        f"gen procs {gen_procs}, train slots {slots}, gpus {a.gpus}")
     for s in a.seeds:
         sa = ["--seeds", str(s), *fargs]
         for st in [x for x in a.stages if x in ("plan", "generate", "refine", "dtd", "cutmix", "check")]:
             t0 = time.time(); n = gen_procs if st in ("generate", "refine") else 1
             with ThreadPoolExecutor(n) as ex:
-                rcs = list(ex.map(lambda k: run(py + [st, *sa] + (["--shard", str(k), str(n)] if n > 1 else []), L / f"{st}_seed{s}_{k}.log", env), range(n)))
+                rcs = list(ex.map(lambda k: run(py + [st, *sa] + (["--shard", str(k), str(n)] if n > 1 else []), L / f"{st}_seed{s}_{k}.log",
+                                                gpu_env(k % a.gpus)), range(n)))
             log(f"seed {s} {st}: rc {rcs} in {(time.time() - t0) / 60:.1f} min")
             if any(rcs) and st != "check":
                 log(f"seed {s}: STOP, {st} failed (see {L})"); raise SystemExit(1)
@@ -105,7 +118,11 @@ def main() -> None:
                     return
                 with gate:                                               # stagger the start-ups
                     cmd = S.command(s, k, m, stp, []); time.sleep(stagger)
-                t0 = time.time(); rc = run(cmd, L / f"train_{name}_seed{s}_{k}.log", env)
+                g = free_gpus.get()
+                try:
+                    t0 = time.time(); rc = run(cmd, L / f"train_{name}_seed{s}_{k}.log", gpu_env(g))
+                finally:
+                    free_gpus.put(g)
                 if not a.keep_checkpoints:
                     shutil.rmtree(out / "checkpoints", ignore_errors=True)
                 log(f"seed {s} fold {k} {name}: rc {rc}, {(time.time() - t0) / 60:.1f} min")
