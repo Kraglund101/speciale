@@ -14,7 +14,8 @@ finished runs are skipped).
 
 Several GPUs: --gpus N spreads the generation processes and the trainings over GPU 0..N-1 (CUDA_VISIBLE_DEVICES per
 process); the profile's counts are then per GPU (b200: 8 generation processes and 8 trainings per GPU). Untested on
-more than one GPU (2026-10-03).
+more than one GPU (2026-10-03). A GPU split into slices (MIG): a process can use only one slice, so pass the slice
+UUIDs from `nvidia-smi -L` with --gpu-ids MIG-... MIG-... and set --gen-procs / --train-slots to what the slices hold.
 
 Profiles only set defaults: --gen-procs (parallel generation processes), --train-slots (trainings at once), --stagger
 (seconds between training starts; simultaneous start-ups stall each other). Checkpoints are deleted after every run
@@ -79,10 +80,13 @@ def main() -> None:
     ap.add_argument("--sets", default=None, help="only these image sets, e.g. s2 (stages 1-2) or s2,s3")
     ap.add_argument("--gpus", type=int, default=1, help="number of GPUs; processes are spread over them with CUDA_VISIBLE_DEVICES "
                                                         "(the profile's process counts are per GPU)")
+    ap.add_argument("--gpu-ids", nargs="+", default=None, help="explicit device ids instead of 0..N-1, e.g. the MIG-... UUIDs "
+                                                               "that `nvidia-smi -L` lists when a GPU is split into slices")
     a = ap.parse_args(); prof = PROFILES[a.profile]
+    ids = a.gpu_ids or [str(i) for i in range(a.gpus)]; a.gpus = len(ids)
     gen_procs = a.gen_procs or prof["gen_procs"] * a.gpus; slots = a.train_slots or prof["train_slots"] * a.gpus
     stagger = prof["stagger"] if a.stagger is None else a.stagger
-    gpu_env = lambda g: dict(env, CUDA_VISIBLE_DEVICES=str(g)) if a.gpus > 1 else env      # one GPU: leave the environment alone
+    gpu_env = lambda g: dict(env, CUDA_VISIBLE_DEVICES=ids[g]) if (a.gpus > 1 or a.gpu_ids) else env      # one GPU: leave the environment alone
     free_gpus: queue.Queue = queue.Queue()
     for i in range(slots):
         free_gpus.put(i % a.gpus)
