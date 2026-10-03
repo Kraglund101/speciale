@@ -90,7 +90,8 @@ def main() -> int:
     ap.add_argument("--output-dir", type=Path, default=None,
                     help="default: results/uninet/<hero>/seed_<seed>")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--gpu", type=int, default=0)
+    ap.add_argument("--gpu", type=int, default=None,
+                    help="GPU index; default: keep the inherited CUDA_VISIBLE_DEVICES (launchers pin MIG slices), else 0")
     ap.add_argument("--placement", default="rp", choices=["rp", "mo"])
     ap.add_argument("--cfg-variant", default="cfg7_vis")
     ap.add_argument("--no-photometric", action="store_true",
@@ -141,7 +142,7 @@ def main() -> int:
     print(f"hero      : {args.hero}  —  {hero['desc']}")
     print(f"photometric: {'OFF' if args.no_photometric else 'ON (cj .1 / blur .5 / noise .005)'}")
     print(f"output    : {out}")
-    print(f"gpu       : {args.gpu}\n")
+    print(f"gpu       : {args.gpu if args.gpu is not None else os.environ.get('CUDA_VISIBLE_DEVICES', '0')}\n")
     print("command:")
     print("  " + " ".join(f'"{c}"' if " " in c else c for c in cmd) + "\n")
 
@@ -162,7 +163,8 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(args.gpu), SPECIALE_ROOT=str(ROOT))
+    gpu = str(args.gpu) if args.gpu is not None else os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu, SPECIALE_ROOT=str(ROOT))
     out.mkdir(parents=True, exist_ok=True)
     return subprocess.call(cmd, cwd=str(ROOT), env=env)
 
