@@ -83,7 +83,18 @@ per device via `CUDA_VISIBLE_DEVICES` (2 processes per slice by default, 8 per w
 (`results/open_set_v2/runs/<arm>/seed_<s>/fold_<k>/results.json`), and a list of every code change you made (commit
 them on the `b200-open-set` branch and push, so the Windows side can pull them).
 
-## Not part of this run
+## ORDER (decided 2026-10-03 evening; overrides "How to run" above)
 
-A noise-strength test (does the generator's noise strength matter downstream) is being trained on the Windows PC from
-`results/noise_strength_test/`; it is not in the zip and not for the B200.
+The open-set experiment must NOT be started yet: its generator setting (noise strength, now 0.7 / 35 steps) is not
+decided. First and only job for now is the **noise-strength test**:
+
+```bash
+python scripts/noise_strength_thesis_sets.py --fixed-steps 50 --strengths 0.025 0.05 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9
+python scripts/noise_strength_thesis_sets.py --strengths 1.0
+nohup python scripts/noise_strength_train.py > noise_train.out 2>&1 &     # 14 arms x 5 seeds = 70 runs
+```
+
+Thesis split (44 fixed training synthetics), final model. Arms: 12 noise strengths with 50 denoising steps, `mix`
+(random strength per synthetic and epoch), `base` (the pipeline's own 0.7 / 35-step set). Result:
+`results/noise_strength_test/TABLES.md`. After that: stop and wait. The open-set pilot (seed 42, folds holes +
+breakage) and the full run come only after Frederik has chosen the noise strength and said go.
