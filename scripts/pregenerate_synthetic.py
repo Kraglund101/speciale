@@ -68,7 +68,11 @@ SCALE = (0.5, 1.0)
 MAX_PLACEMENT_TRIES = 50
 # raw_background=True = B (thesis as written): the decoded generation is blended into the RAW canvas, a*G + (1-a)*raw
 # (user 2026-09-27: all seeds regenerated this way). Masks are refined against the MATCHED reference (stage_refine).
-GEN = dict(noise_strength=0.7, num_steps=50, guidance_scale=7.0, band_mode=2, cfg_mode="visual", raw_background=True)
+# Noise strength 0.4 with 50 evenly spaced denoising steps from its start timestep (381): chosen by the user 2026-10-04
+# after the noise-strength test (results/noise_strength_test/TABLES.md: flat from 0.2-0.4 up, worse below).
+# Until then: noise_strength 0.7 on the stock 50-step grid (= 35 steps, even_steps False) = GEN_070.
+GEN = dict(noise_strength=0.4, num_steps=50, even_steps=True, guidance_scale=7.0, band_mode=2, cfg_mode="visual", raw_background=True)
+GEN_070 = dict(GEN, noise_strength=0.7, even_steps=False)
 MASK_FACTOR = 0.25  # refined label = factor x p90; 0.25 chosen 2026-09-30 (mask ladder: scripts/inpaint_region_test.py)
 CKPT = "clean-20k"   # 2026-09-30: clean generator (was "core-50k @20k")
 FG_DIR = gc.CASHEW_ROOT / "birefnet_masks" / "Normal"

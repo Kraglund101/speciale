@@ -75,7 +75,7 @@ def main() -> None:
                                   device="cuda", layout="A", ref_img_override=Path(img_ref), ref_mask_override=Path(mask_ref),
                                   placed_mask_override=prep / "placed_mask.png", save_raw=True,
                                   canvas_override=P.NORMAL_DIR / f"{st['canvas']}.JPG", caption_override=" ",
-                                  **{**P.GEN, "noise_strength": ns})
+                                  **{**P.GEN_070, "noise_strength": ns})
                 shutil.copy(P.gc.EXP / "anomaly/imgs/easy" / f"{rid}.png", dst)
             sheet.paste(crop(np.array(Image.open(dst).convert("RGB")), b), (LABW + (2 + c) * TILE, y))
         print(f"{cls}: done", flush=True)

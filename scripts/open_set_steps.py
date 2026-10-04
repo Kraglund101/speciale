@@ -270,8 +270,26 @@ def stage_plan(seeds: list[int], folds: list[str] | None) -> None:
 
 
 # ---------------------------------------------------------------- images
+def generator_stamp() -> None:
+    """Never mix images of different generator settings: the settings the existing diffusion images were made with are
+    kept in OUT/generator_settings.json; a mismatch (or images without a stamp) stops generation."""
+    cur = {"ckpt": P.CKPT, "mask_factor": P.MASK_FACTOR, **P.GEN}; f = OUT / "generator_settings.json"
+    have = any(d.is_dir() and any(d.rglob("*.png")) for d in (OUT / "diffusion_in", OUT / "diffusion_cross"))
+    if f.exists():
+        old = json.loads(f.read_text())
+        if old != cur:
+            raise SystemExit(f"STOP: {OUT} holds images made with {old}, current settings are {cur}. Move the old "
+                             f"diffusion_in / diffusion_cross / runs folders away (e.g. to _superseded_...) and delete {f.name}.")
+    elif have:
+        raise SystemExit(f"STOP: {OUT} holds diffusion images without {f.name} (made before 2026-10-04, noise strength 0.7). "
+                         f"Move diffusion_in / diffusion_cross / runs away before generating with {cur}.")
+    else:
+        OUT.mkdir(parents=True, exist_ok=True); f.write_text(json.dumps(cur, indent=1))
+
+
 def stage_generate(seeds: list[int], folds: list[str] | None, shard: tuple[int, int]) -> None:
     refs = load_refs(); byid = {r["id"]: r for k in refs for r in refs[k]}
+    generator_stamp()
     P.gc.setup_experiment("ResNet")
     pipe, ip, t2i = P.gc.load_models(P.h.CKPTS[P.CKPT]); P.gc.EXP = Path(tempfile.mkdtemp(prefix="os2gen_"))
     import noise_strength_thesis_sets as NS

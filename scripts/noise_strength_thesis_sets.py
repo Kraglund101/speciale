@@ -30,6 +30,7 @@ OUT = ROOT / "results/noise_strength_test"
 DEFAULT = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 0.9, 1.0]
 
 
+BASE_GEN = P.GEN_070       # this test varies the strength itself, on the stock grid or with its own fixed-step scheduler
 FULL = False     # --every-timestep: same start noise as the 50-step run, but every timestep below it is denoised
 
 
@@ -37,11 +38,11 @@ def gen_kw(ns: float) -> dict:
     """Generation settings for strength ns. FULL: the 1000-step DDIM schedule (timesteps 1000..1), started at the SAME
     timestep the 50-step run starts at (981 - 20 * int(50 * (1 - ns))), i.e. 81 / 41 / 21 steps for 0.1 / 0.05 / 0.025."""
     if S35:                                                       # the custom scheduler holds exactly the steps to run
-        return {**P.GEN, "num_steps": NSTEPS, "noise_strength": 1.0}
+        return {**BASE_GEN, "num_steps": NSTEPS, "noise_strength": 1.0}
     if not FULL:
-        return {**P.GEN, "noise_strength": ns}
+        return {**BASE_GEN, "noise_strength": ns}
     t = 981 - 20 * int(50 * (1 - ns))
-    return {**P.GEN, "num_steps": 1000, "noise_strength": (t - 0.5) / 1000}
+    return {**BASE_GEN, "num_steps": 1000, "noise_strength": (t - 0.5) / 1000}
 
 
 S35 = False      # --fixed-steps N: same start noise, but always N denoising steps (user 2026-10-03: 50)
@@ -94,7 +95,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(); ap.add_argument("--strengths", type=float, nargs="+", default=DEFAULT)
     ap.add_argument("--every-timestep", action="store_true"); ap.add_argument("--fixed-steps", type=int, default=0); a = ap.parse_args()
     global FULL, S35, NSTEPS; FULL, S35 = a.every_timestep, a.fixed_steps > 0; NSTEPS = a.fixed_steps or NSTEPS
-    assert P.GEN["noise_strength"] == 0.7 and P.CKPT == "clean-20k" and P.MASK_FACTOR == 0.25, "baseline settings changed"
+    assert P.CKPT == "clean-20k" and P.MASK_FACTOR == 0.25, "baseline settings changed"
     cases = [p for p in sorted(PREP.iterdir()) if p.is_dir() and not json.loads((p / "meta.json").read_text())["is_hard"]]
     fixes = sorted(p for p in (BASE / "leak_fix").iterdir() if p.is_dir()) if (BASE / "leak_fix").is_dir() else []
     jobs = []                                                   # (strength, prep folder, canvas id, output image)
@@ -137,7 +138,7 @@ def main() -> None:
     for ns in a.strengths:
         d = set_dir(ns); cov = [(np.array(Image.open(f).convert("L")) > 127).mean() * 100 for f in sorted((d / "refined_masks_f025").glob("*.png"))]
         (d / "SOURCE.txt").write_text(f"baseline set {BASE} re-rendered with noise_strength {ns} (settings {gen_kw(ns)}{', timesteps ' + str(s35_timesteps(ns)) if S35 else ''}); everything else identical "
-                                      f"(GEN {P.GEN}, ckpt {P.CKPT}, masks {P.MASK_FACTOR} x p90 thesis_reference)\n")
+                                      f"(GEN {BASE_GEN}, ckpt {P.CKPT}, masks {P.MASK_FACTOR} x p90 thesis_reference)\n")
         print(f"noise {ns:.1f}: {len(cov)} images + {len(fixes)} leak fix | mask area median {np.median(cov):.2f}% of image", flush=True)
     print("SETS DONE", flush=True)
 

@@ -11,6 +11,31 @@ import torch.nn.functional as F
 from src.utils.mask_utils import create_latent_band_mask
 
 
+class EvenStepDDIM:
+    """Deterministic DDIM (eta 0, epsilon prediction) on an explicit, evenly spaced timestep list.
+
+    The stock scheduler can only start part-way into its fixed grid, so a noise strength s < 1 runs just s * num_steps
+    steps. This runs `num_steps` steps from the SAME start timestep down to 1 (fewer only when the start timestep is
+    smaller than num_steps: then every timestep). On the stock grid it reproduces DDIMScheduler.step (checked 2026-10-03).
+    """
+
+    def __init__(self, base, t0: int, num_steps: int, device) -> None:
+        n = min(num_steps, t0)
+        ts = [int(round(t0 + (1 - t0) * k / max(n - 1, 1))) for k in range(n)]
+        assert len(set(ts)) == n and ts[0] == t0 and ts[-1] == 1, ts
+        self.base, self.custom = base, ts
+        self.timesteps = torch.tensor(ts, dtype=torch.long, device=device)
+
+    def add_noise(self, *a, **k):
+        return self.base.add_noise(*a, **k)
+
+    def step(self, model_output, timestep, sample):
+        i = self.custom.index(int(timestep)); a_t = float(self.base.alphas_cumprod[self.custom[i]])
+        a_p = float(self.base.alphas_cumprod[self.custom[i + 1]]) if i + 1 < len(self.custom) else float(self.base.final_alpha_cumprod)
+        x0 = (sample - (1 - a_t) ** 0.5 * model_output) / a_t ** 0.5
+        return type("Out", (), {"prev_sample": a_p ** 0.5 * x0 + (1 - a_p) ** 0.5 * model_output})()
+
+
 def _dilate_clip_mask_16(mask: torch.Tensor) -> torch.Tensor:
     """Dilate CLIP mask by +1px at 16x16 grid, then upscale back.
 
@@ -67,6 +92,7 @@ def generate_anomagic_single(
     raw_background: bool = False,            # blend the paint band into the RAW canvas instead of the decoded one
     context_latents: torch.Tensor = None,   # latent-carry multi-edit: previous pass's state latent
     return_latents: bool = False,           # also return this pass's state latent (for the next pass)
+    even_steps: bool = False,               # run num_steps evenly spaced steps from the start timestep (EvenStepDDIM)
 ):
     """Generate anomaly using IP-Adapter + text captions.
 
@@ -239,13 +265,18 @@ def generate_anomagic_single(
         # Find the starting timestep: noise_strength=0.7 → start at 70% through schedule
         start_step = max(0, int(len(all_timesteps) * (1 - noise_strength)))
         start_timestep = all_timesteps[start_step]
+        sched = pipeline.scheduler
+        if even_steps:                                   # same start noise, num_steps steps instead of the grid's remainder
+            sched = EvenStepDDIM(pipeline.scheduler, int(start_timestep), num_steps, device)
+            all_timesteps, start_step = sched.timesteps, 0
+            start_timestep = all_timesteps[0]
 
         if seed is not None:
             gen = torch.Generator(device=device).manual_seed(seed)
             noise = torch.randn(normal_latents.shape, generator=gen, device=device, dtype=normal_latents.dtype)
         else:
             noise = torch.randn_like(normal_latents)
-        latents = pipeline.scheduler.add_noise(normal_latents, noise, start_timestep.unsqueeze(0))
+        latents = sched.add_noise(normal_latents, noise, start_timestep.unsqueeze(0))
 
         for i, t in enumerate(all_timesteps[start_step:]):
             latent_input = torch.cat([latents] * 2)
@@ -286,7 +317,7 @@ def generate_anomagic_single(
             else:
                 noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 
-            latents = pipeline.scheduler.step(noise_pred, t, latents).prev_sample
+            latents = sched.step(noise_pred, t, latents).prev_sample
 
             # Alpha-blended diffusion: blend generated x_{t-1} with correctly-noised normal
             # Normal side: noise from clean x_0 at the next timestep (exact forward process)
@@ -294,7 +325,7 @@ def generate_anomagic_single(
             remaining = len(all_timesteps) - (start_step + i + 1)
             if remaining > 0:
                 next_t = all_timesteps[start_step + i + 1]
-                noisy_normal = pipeline.scheduler.add_noise(normal_latents, noise, next_t.unsqueeze(0))
+                noisy_normal = sched.add_noise(normal_latents, noise, next_t.unsqueeze(0))
                 latents = latents * alpha_map_64 + noisy_normal * (1 - alpha_map_64)
 
     output = pipeline.decode_latents(latents.float())

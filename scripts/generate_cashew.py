@@ -340,6 +340,7 @@ def generate_one(
     cfg_mode: str = "visual",
     clip_align: str = "raw",
     caption_override: str | None = None,
+    even_steps: bool = False,
 ) -> Path | None:
     """Generate one synthetic anomaly and save comparison panel.
 
@@ -494,6 +495,7 @@ def generate_one(
             inference_mode="same" if clip_align == "ring" else "different",
             context_latents=None if context is None else context["latents"],
             raw_background=raw_background,
+            even_steps=even_steps,
             return_latents=True,
             cfg_mode=cfg_mode,
         )

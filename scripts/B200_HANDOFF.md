@@ -107,3 +107,18 @@ The thesis-split set is now 94 correct synthetics with no `leak_fix` side folder
 `results/noise_strength_test/ns_*` sets in place. All scripts point at the new folders. Training input is byte-identical
 to before (checked on the Windows side for the 44 training synthetics of all 14 sets), so finished runs stay valid; the
 runner now prints `LEAK GUARD: replaced [] ... dropped []`.
+
+## Generator setting decided (2026-10-04): noise strength 0.4, 50 even steps
+
+Result of the noise-strength test: detector results are flat from strength 0.2-0.4 up to 1.0 and worse below; Frederik
+chose **0.4 with 50 denoising steps**. It is now the pipeline default: `pregenerate_synthetic.GEN` (`noise_strength=0.4,
+num_steps=50, even_steps=True`); `even_steps` = `EvenStepDDIM` in `src/inference/generate.py` (50 evenly spaced steps
+from the start timestep 381 down to 1). Checked on the Windows side: reproduces the tested `ns_040_s50` images (max
+pixel difference 2 of 255). The old setting is kept as `GEN_070` (used only by the noise-strength scripts).
+This supersedes "noise strength 0.7" in the Rules section above.
+
+`open_set_steps.py generate` refuses to run if `results/open_set_v2` already holds diffusion images made with other
+settings (stamp file `generator_settings.json`): move old `diffusion_in/`, `diffusion_cross/`, `runs/` away first.
+
+**Next (only on Frederik's go):** open-set smoke test, then the pilot
+`python scripts/open_set_launch.py --profile b200 --seeds 42 --folds holes breakage`, then stop for his review.
