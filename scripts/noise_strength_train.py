@@ -9,6 +9,8 @@ Arms = the image sets of results/noise_strength_test made by noise_strength_thes
                                        (same defect, canvas and placement; image + its own refined mask), via
                                        --synthetic-epochs. The draw is seeded by the training seed.
   base                                 the pipeline's own setting, 0.7 / 35 steps = results/thesis_set_clean20k_B (reference)
+  070                                  the same setting re-rendered on this machine (removes the machine difference between
+                                       "base" and the other arms):  noise_strength_thesis_sets.py --strengths 0.7  then  --arms 070
 The image sets are made first with:
   python scripts/noise_strength_thesis_sets.py --fixed-steps 50 --strengths 0.025 0.05 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9
   python scripts/noise_strength_thesis_sets.py --strengths 1.0
@@ -116,7 +118,8 @@ def metrics(f: Path) -> dict | None:
 
 def table(seeds: list[int]) -> None:
     rows = [(LABEL.get(t, f"0.{t[1:3]} (50 steps)"), T / "runs" / f"ns_{t}") for t in SETS] + [(LABEL["mix"], T / "runs" / "mix"),
-            ("0.7 pipeline setting (35 steps) = the thesis-split baseline set", T / "runs" / "base")]
+            ("0.7 pipeline setting (35 steps), rendered on this machine", T / "runs" / "ns_070"),
+            ("0.7 pipeline setting (35 steps), shipped baseline set (rendered on the RTX 4090)", T / "runs" / "base")]
     cols = None; out = ["# Noise-strength test (image AUROC, thesis split, mean ± std over seeds)", ""]
     for lab, d in rows:
         ms = [m for m in (metrics(d / f"seed_{s}" / "results.json") for s in seeds) if m]
