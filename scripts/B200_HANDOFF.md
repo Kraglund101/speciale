@@ -98,3 +98,12 @@ Thesis split (44 fixed training synthetics), final model. Arms: 12 noise strengt
 (random strength per synthetic and epoch), `base` (the pipeline's own 0.7 / 35-step set). Result:
 `results/noise_strength_test/TABLES.md`. After that: stop and wait. The open-set pilot (seed 42, folds holes +
 breakage) and the full run come only after Frederik has chosen the noise strength and said go.
+
+## Leak-free thesis-split layout (2026-10-04)
+
+The thesis-split set is now 94 correct synthetics with no `leak_fix` side folder: run once
+`python scripts/make_leakfree_thesis_set.py` (idempotent). It writes `results/cashew_100_leakfree/prep` and
+`results/thesis_set_clean20k_leakfree` (067 = its re-synthesis on a clean canvas) and converts existing
+`results/noise_strength_test/ns_*` sets in place. All scripts point at the new folders. Training input is byte-identical
+to before (checked on the Windows side for the 44 training synthetics of all 14 sets), so finished runs stay valid; the
+runner now prints `LEAK GUARD: replaced [] ... dropped []`.

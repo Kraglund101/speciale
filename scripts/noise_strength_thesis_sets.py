@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Noise-strength test on the thesis split (user 2026-10-03): the baseline synthetic set (results/thesis_set_clean20k_B:
-94 easy placements of results/cashew_100_rp/prep, clean-20k, visual CFG 7, 50 steps, no caption, raw-canvas blend,
+"""Noise-strength test on the thesis split (user 2026-10-03): the baseline synthetic set (results/thesis_set_clean20k_leakfree:
+94 easy placements of results/cashew_100_leakfree/prep, clean-20k, visual CFG 7, 50 steps, no caption, raw-canvas blend,
 masks 0.25 x p90 matched reference, leak-fixed 067) re-rendered with ONLY the noise strength changed.
 Same canvas, placed mask, reference and seed per image as the baseline. 0.7 is the existing baseline set (not redone).
 
-  <out>/ns_XX/generated/cfg7_vis/NNN.png, <out>/ns_XX/refined_masks_f025/NNN.png, <out>/ns_XX/leak_fix/067/...
+  <out>/ns_XX/generated/cfg7_vis/NNN.png, <out>/ns_XX/refined_masks_f025/NNN.png   (94 images; 067 is the leak-free re-synthesis)
 
   python scripts/noise_strength_thesis_sets.py [--strengths 0.1 0.2 ...]
 """
@@ -24,8 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "scripts"))
 import pregenerate_synthetic as P  # noqa: E402
 
-PREP = ROOT / "results/cashew_100_rp/prep"
-BASE = ROOT / "results/thesis_set_clean20k_B"
+PREP = ROOT / "results/cashew_100_leakfree/prep"      # leak-free layout (make_leakfree_thesis_set.py): 067 already on its clean canvas
+BASE = ROOT / "results/thesis_set_clean20k_leakfree"
 OUT = ROOT / "results/noise_strength_test"
 DEFAULT = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 0.9, 1.0]
 
@@ -96,7 +96,7 @@ def main() -> None:
     global FULL, S35, NSTEPS; FULL, S35 = a.every_timestep, a.fixed_steps > 0; NSTEPS = a.fixed_steps or NSTEPS
     assert P.GEN["noise_strength"] == 0.7 and P.CKPT == "clean-20k" and P.MASK_FACTOR == 0.25, "baseline settings changed"
     cases = [p for p in sorted(PREP.iterdir()) if p.is_dir() and not json.loads((p / "meta.json").read_text())["is_hard"]]
-    fixes = sorted(p for p in (BASE / "leak_fix").iterdir() if p.is_dir())
+    fixes = sorted(p for p in (BASE / "leak_fix").iterdir() if p.is_dir()) if (BASE / "leak_fix").is_dir() else []
     jobs = []                                                   # (strength, prep folder, canvas id, output image)
     for ns in a.strengths:
         d = set_dir(ns); (d / "generated/cfg7_vis").mkdir(parents=True, exist_ok=True); (d / "refined_masks_f025").mkdir(exist_ok=True)

@@ -54,7 +54,8 @@ CASHEW = P.gc.CASHEW_ROOT
 ARMS = [("m1", 0)] + [(m, st) for st in (1, 2, 3) for m in ("diffusion_in", "diffusion_cross", "dtd", "cutmix")] \
     + [("diffusion_in", 4), ("diffusion_cross", 4), ("diffusion_cross", 5)]
 SET_OF_STEP = {1: "s2", 2: "s2", 3: "s3", 4: "s4", 5: "s4"}
-THESIS = dict(set="results/thesis_set_clean20k_B", prep="results/cashew_100_rp/prep", masks="results/thesis_set_clean20k_B/refined_masks_f025")
+# leak-free layout (scripts/make_leakfree_thesis_set.py): 067 is the re-synthesis on a clean canvas, no leak_fix indirection
+THESIS = dict(set="results/thesis_set_clean20k_leakfree", prep="results/cashew_100_leakfree/prep", masks="results/thesis_set_clean20k_leakfree/refined_masks_f025")
 # stage-5 donor pools: the matched pools + exactly the additions the user accepted on 2026-10-03 (PLAN.md section 8)
 APPROVED = {"scratches": ["fryum", "macaroni1", "macaroni2"], "colour_same": ["macaroni1", "macaroni2"], "colour_diff": ["macaroni2"],
             "burnt": ["fryum"]}

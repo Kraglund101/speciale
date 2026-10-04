@@ -8,7 +8,7 @@ Arms = the image sets of results/noise_strength_test made by noise_strength_thes
   mix                                  per epoch, each of the 44 synthetics is drawn uniformly from its 12 versions above
                                        (same defect, canvas and placement; image + its own refined mask), via
                                        --synthetic-epochs. The draw is seeded by the training seed.
-  base                                 the pipeline's own setting, 0.7 / 35 steps = results/thesis_set_clean20k_B (reference)
+  base                                 the pipeline's own setting, 0.7 / 35 steps = results/thesis_set_clean20k_leakfree (reference)
   070                                  the same setting re-rendered on this machine (removes the machine difference between
                                        "base" and the other arms):  noise_strength_thesis_sets.py --strengths 0.7  then  --arms 070
 The image sets are made first with:
@@ -43,8 +43,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import open_set_launch as L  # noqa: E402  (detect_gpus, run, done)
 
 T = ROOT / "results/noise_strength_test"
-PREP = ROOT / "results/cashew_100_rp/prep"
-BASE = ROOT / "results/thesis_set_clean20k_B"                     # arm "base": the pipeline's own 0.7 / 35-step set
+PREP = ROOT / "results/cashew_100_leakfree/prep"
+BASE = ROOT / "results/thesis_set_clean20k_leakfree"                     # arm "base": the pipeline's own 0.7 / 35-step set
 RUNNER = (ROOT / "anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/experiment_UniNet"
           / "temp_uninet_experiment/run_uninet_cashew.py")
 SETS = ["0025_s50", "005_s50", "010_s50", "020_s50", "030_s50", "040_s50", "050_s50", "060_s50", "070_s50", "080_s50", "090_s50", "100"]

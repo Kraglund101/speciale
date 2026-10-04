@@ -33,7 +33,7 @@ ITEMS = [  # project-relative files / folders
     "datasets/dtd",
     "results/generator_nocashew_20k_constlr/checkpoint_20000",
     "results/masked_patch_knn/pairing_constrained.json",
-    "results/thesis_set_clean20k_B", "results/cashew_100_rp/prep",
+    "results/thesis_set_clean20k_leakfree", "results/cashew_100_leakfree/prep",
     "results/open_set_v2/PLAN.md", "results/open_set_v2/GENERATION_PLAN.md", "results/open_set_v2/anomaly_plan_b3.json",
 ]
 HF = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface")) / "hub"
