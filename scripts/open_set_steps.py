@@ -335,15 +335,15 @@ def stage_refine(seeds: list[int], folds: list[str] | None, shard: tuple[int, in
         print(f"refine seed {s} shard {shard[0]}/{shard[1]}: done", flush=True)
 
 
-def stage_dtd(seeds: list[int], folds: list[str] | None) -> None:
+def stage_dtd(seeds: list[int], folds: list[str] | None, shard: tuple[int, int] = (0, 1)) -> None:
     """DRAEM blend into the placed GT mask (= label); stages 1-3 only (sets s2, s3)."""
     files = sorted(str(p) for p in P.DTD_DIR.glob("*/*") if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
     assert len(files) > 5000, f"DTD incomplete at {P.DTD_DIR}"
     for s in seeds:
         man = manifest(s)
-        for tag, cls, i, ref, canvas in entries(man, folds, sets=("s2", "s3")):
+        for n, (tag, cls, i, ref, canvas) in enumerate(entries(man, folds, sets=("s2", "s3"))):
             dst = ipath("dtd", s, tag, cls, i)
-            if dst.exists():
+            if n % shard[1] != shard[0] or dst.exists():       # each item is seeded on its own: sharding changes nothing
                 continue
             sd = P.method_seed(s, f"{tag}/{cls}", i, "dtd"); rng = np.random.default_rng(sd)
             tex = files[int(rng.integers(len(files)))]; beta = float(rng.uniform(0.2, 1.0)); aug, _ = P._draem_augmenter(sd)
@@ -352,10 +352,10 @@ def stage_dtd(seeds: list[int], folds: list[str] | None) -> None:
             m = M[..., None].astype(np.float32); y = (1 - m) * x + m * ((1 - beta) * x + beta * t)
             dst.parent.mkdir(parents=True, exist_ok=True); md = ipath("dtd", s, tag, cls, i, "masks"); md.parent.mkdir(parents=True, exist_ok=True)
             Image.fromarray(np.clip(y, 0, 255).round().astype(np.uint8)).save(dst); Image.fromarray(M.astype(np.uint8) * 255).save(md)
-        print(f"dtd seed {s}: done", flush=True)
+        print(f"dtd seed {s} shard {shard[0]}/{shard[1]}: done", flush=True)
 
 
-def stage_cutmix(seeds: list[int], folds: list[str] | None) -> None:
+def stage_cutmix(seeds: list[int], folds: list[str] | None, shard: tuple[int, int] = (0, 1)) -> None:
     """Per fold: patch from another canvas of the fold's 45 (report: 'resampled from the fixed target-domain canvas pool,
     excluding the current canvas'), cut at the centroid-aligned position nearest to 'fully on the donor cashew', pasted
     into the placed GT mask (= label). Stages 1-3 (sets s2, s3)."""
@@ -368,6 +368,7 @@ def stage_cutmix(seeds: list[int], folds: list[str] | None) -> None:
             fgc[c] = mask_resize(np.array(Image.open(P.FG_DIR / f"{c}_binary.png").convert("L")) > 127, 512)
         return fgc[c]
 
+    n = -1
     for s in seeds:
         man = manifest(s)
         for fold in (folds or CLASSES):
@@ -377,8 +378,8 @@ def stage_cutmix(seeds: list[int], folds: list[str] | None) -> None:
                     for st in man["sets"][name][t]:
                         if "alias" in st or st["epoch"] >= EPOCH_LIMIT:
                             continue
-                        i = st["i"]; dst = cmpath(s, fold, name, t, i)
-                        if dst.exists():
+                        i = st["i"]; dst = cmpath(s, fold, name, t, i); n += 1
+                        if n % shard[1] != shard[0] or dst.exists():   # each item is seeded on its own: sharding changes nothing
                             continue
                         tag, canvas, _ = resolve(man, name, fold, t, st); others = [c for c in Pk if c != canvas]
                         donor = others[int(np.random.default_rng(P.method_seed(s, f"{fold}/{name}/{t}", i, "cutmix-donor")).integers(len(others)))]
@@ -497,9 +498,9 @@ def main() -> None:
     elif a.stage == "refine":
         stage_refine(a.seeds, a.folds, sh)
     elif a.stage == "dtd":
-        stage_dtd(a.seeds, a.folds)
+        stage_dtd(a.seeds, a.folds, sh)
     elif a.stage == "cutmix":
-        stage_cutmix(a.seeds, a.folds)
+        stage_cutmix(a.seeds, a.folds, sh)
     elif a.stage == "check":
         stage_check(a.seeds, a.folds)
     elif a.stage == "arms":

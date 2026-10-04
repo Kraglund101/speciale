@@ -91,6 +91,7 @@ def main() -> None:
     ap.add_argument("--gen-procs", type=int); ap.add_argument("--train-slots", type=int); ap.add_argument("--stagger", type=int)
     ap.add_argument("--smoke", action="store_true", help="2 epochs, seed 42, fold holes: end-to-end check")
     ap.add_argument("--keep-checkpoints", action="store_true")
+    ap.add_argument("--cpu-procs", type=int, default=12, help="parallel processes for the CPU stages dtd / cutmix (outputs identical)")
     ap.add_argument("--sets", default=None, help="only these image sets, e.g. s2 (stages 1-2) or s2,s3")
     ap.add_argument("--gpus", type=int, default=0, help="number of GPUs (default 0 = detect with nvidia-smi: slices of a split GPU "
                                                         "and several GPUs are used like multi-GPU, one GPU runs as before); processes are spread over them with CUDA_VISIBLE_DEVICES "
@@ -124,7 +125,7 @@ def main() -> None:
     for s in a.seeds:
         sa = ["--seeds", str(s), *fargs]
         for st in [x for x in a.stages if x in ("plan", "generate", "refine", "dtd", "cutmix", "check")]:
-            t0 = time.time(); n = gen_procs if st in ("generate", "refine") else 1
+            t0 = time.time(); n = gen_procs if st in ("generate", "refine") else a.cpu_procs if st in ("dtd", "cutmix") else 1
             with ThreadPoolExecutor(n) as ex:
                 rcs = list(ex.map(lambda k: run(py + [st, *sa] + (["--shard", str(k), str(n)] if n > 1 else []), L / f"{st}_seed{s}_{k}.log",
                                                 gpu_env(k % a.gpus)), range(n)))
