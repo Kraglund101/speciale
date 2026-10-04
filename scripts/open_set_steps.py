@@ -46,6 +46,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts")); sys.path.insert(0, str(ROOT))
 import pregenerate_synthetic as P  # noqa: E402
 
+# Generator setting (user 2026-10-04, from results/noise_strength_test/TABLES.md): noise strength 0.4 with 50 denoising
+# steps, exactly as the noise-strength test arm ns_040_s50 (noise_strength_thesis_sets.py --fixed-steps 50): DDIM on the
+# explicit timestep list from the 50-step run's start timestep for 0.4 down to 1. Everything else is P.GEN.
+NOISE_STRENGTH, DENOISE_STEPS = 0.4, 50
+
 OUT = ROOT / "results/open_set_v2"
 CLASSES, K, E, BUDGET = P.CLASSES, 9, 20, 3
 assert K % BUDGET == 0
@@ -269,6 +274,12 @@ def stage_generate(seeds: list[int], folds: list[str] | None, shard: tuple[int, 
     refs = load_refs(); byid = {r["id"]: r for k in refs for r in refs[k]}
     P.gc.setup_experiment("ResNet")
     pipe, ip, t2i = P.gc.load_models(P.h.CKPTS[P.CKPT]); P.gc.EXP = Path(tempfile.mkdtemp(prefix="os2gen_"))
+    import noise_strength_thesis_sets as NS
+    NS.NSTEPS = DENOISE_STEPS; pipe.scheduler = NS.fixed_scheduler(pipe.scheduler.config)
+    pipe.scheduler.custom = NS.s35_timesteps(NOISE_STRENGTH)
+    gen = {**P.GEN, "num_steps": DENOISE_STEPS, "noise_strength": 1.0}   # the custom scheduler holds exactly the steps to run
+    print(f"generator: noise strength {NOISE_STRENGTH}, timesteps {pipe.scheduler.custom[0]}..{pipe.scheduler.custom[-1]} "
+          f"({len(pipe.scheduler.custom)} steps), {gen}", flush=True)
     for s in seeds:
         man = manifest(s)
         for n, (tag, cls, i, ref, canvas) in enumerate(entries(man, folds)):
@@ -284,7 +295,7 @@ def stage_generate(seeds: list[int], folds: list[str] | None, shard: tuple[int, 
                 P.gc.generate_one(pipe, ip, t2i, canvas_id=canvas, ref_id=rid, difficulty="easy", defect_map={rid: "defect"}, seed=seed,
                                   device="cuda", layout="A", ref_img_override=Path(img), ref_mask_override=Path(mask),
                                   placed_mask_override=prep / "placed_mask.png", save_raw=True,
-                                  canvas_override=P.NORMAL_DIR / f"{canvas}.JPG", caption_override=" ", **P.GEN)
+                                  canvas_override=P.NORMAL_DIR / f"{canvas}.JPG", caption_override=" ", **gen)
                 shutil.copy(P.gc.EXP / "anomaly/imgs/easy" / f"{rid}.png", dst)
             if n % 500 == 0:
                 print(f"  generate seed {s} shard {shard[0]}/{shard[1]}: entry {n}", flush=True)
