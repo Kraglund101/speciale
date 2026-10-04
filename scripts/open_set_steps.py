@@ -46,10 +46,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts")); sys.path.insert(0, str(ROOT))
 import pregenerate_synthetic as P  # noqa: E402
 
-# Generator setting (user 2026-10-04, from results/noise_strength_test/TABLES.md): noise strength 0.4 with 50 denoising
-# steps, exactly as the noise-strength test arm ns_040_s50 (noise_strength_thesis_sets.py --fixed-steps 50): DDIM on the
-# explicit timestep list from the 50-step run's start timestep for 0.4 down to 1. Everything else is P.GEN.
-NOISE_STRENGTH, DENOISE_STEPS = 0.4, 50
+# Generator setting: pregenerate_synthetic.GEN (since 2026-10-04: noise strength 0.4, 50 even denoising steps = the
+# noise-strength test arm ns_040_s50; the sampler lives in src/inference/generate.py, EvenStepDDIM).
 
 OUT = ROOT / "results/open_set_v2"
 CLASSES, K, E, BUDGET = P.CLASSES, 9, 20, 3
@@ -280,11 +278,13 @@ def generator_stamp() -> None:
         if old != cur:
             raise SystemExit(f"STOP: {OUT} holds images made with {old}, current settings are {cur}. Move the old "
                              f"diffusion_in / diffusion_cross / runs folders away (e.g. to _superseded_...) and delete {f.name}.")
-    elif have:
+    elif have and os.environ.get("OPEN_SET_ACCEPT_EXISTING") != "1":   # =1: I know the existing images were made with cur
         raise SystemExit(f"STOP: {OUT} holds diffusion images without {f.name} (made before 2026-10-04, noise strength 0.7). "
-                         f"Move diffusion_in / diffusion_cross / runs away before generating with {cur}.")
+                         f"Move diffusion_in / diffusion_cross / runs away before generating with {cur} "
+                         f"(or, if they WERE made with exactly these settings, set OPEN_SET_ACCEPT_EXISTING=1 once).")
     else:
-        OUT.mkdir(parents=True, exist_ok=True); f.write_text(json.dumps(cur, indent=1))
+        OUT.mkdir(parents=True, exist_ok=True); tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(cur, indent=1)); os.replace(tmp, f)       # atomic: parallel shards start together
 
 
 def stage_generate(seeds: list[int], folds: list[str] | None, shard: tuple[int, int]) -> None:
@@ -292,12 +292,8 @@ def stage_generate(seeds: list[int], folds: list[str] | None, shard: tuple[int, 
     generator_stamp()
     P.gc.setup_experiment("ResNet")
     pipe, ip, t2i = P.gc.load_models(P.h.CKPTS[P.CKPT]); P.gc.EXP = Path(tempfile.mkdtemp(prefix="os2gen_"))
-    import noise_strength_thesis_sets as NS
-    NS.NSTEPS = DENOISE_STEPS; pipe.scheduler = NS.fixed_scheduler(pipe.scheduler.config)
-    pipe.scheduler.custom = NS.s35_timesteps(NOISE_STRENGTH)
-    gen = {**P.GEN, "num_steps": DENOISE_STEPS, "noise_strength": 1.0}   # the custom scheduler holds exactly the steps to run
-    print(f"generator: noise strength {NOISE_STRENGTH}, timesteps {pipe.scheduler.custom[0]}..{pipe.scheduler.custom[-1]} "
-          f"({len(pipe.scheduler.custom)} steps), {gen}", flush=True)
+    gen = P.GEN
+    print(f"generator: {gen}", flush=True)
     for s in seeds:
         man = manifest(s)
         for n, (tag, cls, i, ref, canvas) in enumerate(entries(man, folds)):
