@@ -49,7 +49,9 @@ per device via `CUDA_VISIBLE_DEVICES` (2 processes per slice by default, 8 per w
   `scripts/build_b200_package.py` - tell Frederik which path is missing rather than working around it.
 - GPU detection: parsed from a MIG listing written from memory, not from real output. Check the first log line.
 - The process counts of the `b200` profile (8 + 8 per GPU) are guesses. CPU cores for data loading are the likely limit.
-- Local package versions: python 3.11, torch 2.5.1+cu121, torchvision 0.20.1, diffusers 0.32.2, transformers 4.44.2,
+- Local package versions: python 3.11, torch 2.5.1+cu121, torchvision 0.20.1, **anomalib 2.2.0 (the M1 arm is built from
+  anomalib.models.image.uninet; the server had 2.6.2 and its M1 collapsed to AUROC 0.6-0.7 while the same run gives 0.99
+  here - pin anomalib==2.2.0)**, diffusers 0.32.2, transformers 4.44.2,
   timm 1.0.29, safetensors 0.4.5, numpy 1.26.4, scipy 1.11.4, pillow 10.2.0, scikit-learn 1.2.2, opencv 4.9.
   Known local issue: flash / mem-efficient SDPA segfaulted on PyTorch 2.3.0+cu121 (Windows); do not disable the math
   SDP kernel if you see that workaround in the code.
