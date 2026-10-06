@@ -1,9 +1,8 @@
-# B200 status 2026-10-06 23:20
+# B200 status 2026-10-07 01:22
 
-Complete seeds: 7 42 99 123 256
+Complete seeds: 7 11 42 99 123 256
 
 ```
-10-06 14:56  seed 99: training 96 runs, 8 at a time
 10-06 16:55  seed 256 plan: rc [0] in 3.9 min
 10-06 18:40  seed 256 generate: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 104.6 min
 10-06 18:47  seed 256 refine: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 7.1 min
@@ -18,7 +17,8 @@ Complete seeds: 7 42 99 123 256
 10-06 22:41  seed 11 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 2.3 min
 10-06 22:42  seed 11 check: rc [0] in 1.6 min
 10-06 22:42  seed 11: training 96 runs, 8 at a time
-finished runs in last 2 h: 373
+10-07 00:45  seed 22 plan: rc [0] in 3.7 min
+finished runs in last 2 h: 39
 10-05 00:45  seed 42: STOP, dtd failed (see /work/Jobs/data/other/speciale/results/open_set_v2/logs)
-NVIDIA B200, 80 %, 62433 MiB
+NVIDIA B200, 100 %, 102505 MiB
 ```
