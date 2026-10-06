@@ -1,0 +1,216 @@
+10-04 19:31  === launch profile b200: seeds [42, 123, 7, 99, 256, 11, 22, 33, 44, 55], folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'], 16 arms, stages ['plan', 'generate', 'refine', 'dtd', 'cutmix', 'check', 'train', 'tables'], gen procs 8, train slots 8, gpus 4 (MIG slices) pinned: MIG-743ed09f-d8fe-52d8-a4aa-9aaf93d243d3 MIG-7d21c460-9c64-5f2a-9226-1ff58813e009 MIG-299ec16f-ba68-5df8-b196-656d302a2d36 MIG-d4df41c7-ec65-5c1c-bcea-2bcc3432e8b8
+10-04 19:32  === launch profile b200: seeds [42, 123, 7, 99, 256, 11, 22, 33, 44, 55], folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'], 16 arms, stages ['plan', 'generate', 'refine', 'dtd', 'cutmix', 'check', 'train', 'tables'], gen procs 8, train slots 8, gpus 4 (MIG slices) pinned: MIG-743ed09f-d8fe-52d8-a4aa-9aaf93d243d3 MIG-7d21c460-9c64-5f2a-9226-1ff58813e009 MIG-299ec16f-ba68-5df8-b196-656d302a2d36 MIG-d4df41c7-ec65-5c1c-bcea-2bcc3432e8b8
+10-04 19:33  seed 42 plan: rc [0] in 0.7 min
+10-04 21:17  seed 42 generate: rc [0, 0, 0, 0, 0, 0, 0, 0] in 104.0 min
+10-05 00:44  seed 42 refine: rc [0, 0, 0, 0, 0, 0, 0, 0] in 207.6 min
+10-05 00:45  seed 42 dtd: rc [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] in 0.1 min
+10-05 00:45  seed 42: STOP, dtd failed (see /work/Jobs/data/other/speciale/results/open_set_v2/logs)
+Mon Oct  5 00:45:02 CEST 2026 full run exited rc 0
+10-05 07:54  === launch profile b200: seeds [42, 123, 7, 99, 256, 11, 22, 33, 44, 55], folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'], 16 arms, stages ['plan', 'generate', 'refine', 'dtd', 'cutmix', 'check', 'train', 'tables'], gen procs 8, train slots 8, gpus 4 (MIG slices) pinned: MIG-743ed09f-d8fe-52d8-a4aa-9aaf93d243d3 MIG-7d21c460-9c64-5f2a-9226-1ff58813e009 MIG-299ec16f-ba68-5df8-b196-656d302a2d36 MIG-d4df41c7-ec65-5c1c-bcea-2bcc3432e8b8
+10-05 07:55  seed 42 plan: rc [0] in 0.1 min
+10-05 07:59  seed 42 generate: rc [0, 0, 0, 0, 0, 0, 0, 0] in 4.5 min
+10-05 07:59  seed 42 refine: rc [0, 0, 0, 0, 0, 0, 0, 0] in 0.1 min
+10-05 08:00  seed 42 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.9 min
+10-05 08:03  seed 42 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 3.0 min
+10-05 08:04  seed 42 check: rc [0] in 1.2 min
+10-05 08:04  seed 42: training 96 runs, 8 at a time
+10-05 08:13  seed 42 fold holes m1: rc 0, 7.4 min
+10-05 08:19  seed 42 fold holes diffusion_in_s1: rc 0, 13.1 min
+10-05 08:20  seed 42 fold holes diffusion_cross_s1: rc 0, 13.1 min
+10-05 08:21  seed 42 fold holes dtd_s1: rc 0, 13.6 min
+10-05 08:23  seed 42 fold holes diffusion_in_s2: rc 0, 14.5 min
+10-05 08:24  seed 42 fold holes cutmix_s1: rc 0, 16.0 min
+10-05 08:25  seed 42 fold holes diffusion_cross_s2: rc 0, 15.3 min
+10-05 08:26  seed 42 fold holes dtd_s2: rc 0, 15.5 min
+10-05 08:30  seed 42 fold holes cutmix_s2: rc 0, 16.2 min
+10-05 08:36  seed 42 fold holes diffusion_cross_s3: rc 0, 15.3 min
+10-05 08:37  seed 42 fold holes diffusion_in_s3: rc 0, 17.3 min
+10-05 08:37  seed 42 fold holes dtd_s3: rc 0, 15.7 min
+10-05 08:40  seed 42 fold breakage m1: rc 0, 10.0 min
+10-05 08:41  seed 42 fold holes diffusion_cross_s4: rc 0, 15.2 min
+10-05 08:42  seed 42 fold holes diffusion_in_s4: rc 0, 17.2 min
+10-05 08:43  seed 42 fold holes cutmix_s3: rc 0, 18.3 min
+10-05 08:44  seed 42 fold holes diffusion_cross_s5: rc 0, 16.8 min
+10-05 08:54  seed 42 fold breakage diffusion_in_s1: rc 0, 17.7 min
+10-05 08:55  seed 42 fold breakage dtd_s1: rc 0, 16.2 min
+10-05 08:57  seed 42 fold breakage diffusion_cross_s1: rc 0, 18.7 min
+10-05 08:59  seed 42 fold breakage diffusion_in_s2: rc 0, 17.0 min
+10-05 09:00  seed 42 fold breakage cutmix_s1: rc 0, 19.1 min
+10-05 09:02  seed 42 fold breakage cutmix_s2: rc 0, 17.4 min
+10-05 09:03  seed 42 fold breakage dtd_s2: rc 0, 19.0 min
+10-05 09:03  seed 42 fold breakage diffusion_cross_s2: rc 0, 19.8 min
+10-05 09:11  seed 42 fold burnt m1: rc 0, 7.0 min
+10-05 09:12  seed 42 fold breakage diffusion_in_s3: rc 0, 17.0 min
+10-05 09:13  seed 42 fold breakage diffusion_cross_s3: rc 0, 17.0 min
+10-05 09:17  seed 42 fold breakage dtd_s3: rc 0, 20.0 min
+10-05 09:18  seed 42 fold breakage cutmix_s3: rc 0, 18.1 min
+10-05 09:20  seed 42 fold breakage diffusion_in_s4: rc 0, 19.4 min
+10-05 09:21  seed 42 fold breakage diffusion_cross_s4: rc 0, 18.0 min
+10-05 09:24  seed 42 fold breakage diffusion_cross_s5: rc 0, 20.3 min
+10-05 09:30  seed 42 fold burnt diffusion_in_s1: rc 0, 17.8 min
+10-05 09:31  seed 42 fold burnt diffusion_cross_s1: rc 0, 18.1 min
+10-05 09:32  seed 42 fold burnt dtd_s1: rc 0, 18.2 min
+10-05 09:36  seed 42 fold burnt cutmix_s1: rc 0, 18.2 min
+10-05 09:37  seed 42 fold burnt diffusion_in_s2: rc 0, 17.7 min
+10-05 09:40  seed 42 fold burnt diffusion_cross_s2: rc 0, 18.6 min
+10-05 09:40  seed 42 fold burnt dtd_s2: rc 0, 18.0 min
+10-05 09:43  seed 42 fold burnt cutmix_s2: rc 0, 18.8 min
+10-05 09:49  seed 42 fold burnt diffusion_in_s3: rc 0, 18.4 min
+10-05 09:50  seed 42 fold burnt diffusion_cross_s3: rc 0, 17.8 min
+10-05 09:51  seed 42 fold burnt dtd_s3: rc 0, 18.1 min
+10-05 09:54  seed 42 fold colour_diff m1: rc 0, 10.2 min
+10-05 09:55  seed 42 fold burnt cutmix_s3: rc 0, 17.8 min
+10-05 09:55  seed 42 fold burnt diffusion_in_s4: rc 0, 17.4 min
+10-05 09:59  seed 42 fold burnt diffusion_cross_s4: rc 0, 18.5 min
+10-05 10:00  seed 42 fold burnt diffusion_cross_s5: rc 0, 18.4 min
+10-05 10:06  seed 42 fold colour_diff diffusion_in_s1: rc 0, 16.7 min
+10-05 10:08  seed 42 fold colour_diff diffusion_cross_s1: rc 0, 17.1 min
+10-05 10:08  seed 42 fold colour_diff dtd_s1: rc 0, 16.7 min
+10-05 10:13  seed 42 fold colour_diff diffusion_cross_s2: rc 0, 16.6 min
+10-05 10:14  seed 42 fold colour_diff cutmix_s1: rc 0, 18.6 min
+10-05 10:14  seed 42 fold colour_diff diffusion_in_s2: rc 0, 18.2 min
+10-05 10:18  seed 42 fold colour_diff dtd_s2: rc 0, 18.3 min
+10-05 10:19  seed 42 fold colour_diff cutmix_s2: rc 0, 18.0 min
+10-05 10:25  seed 42 fold colour_diff diffusion_in_s3: rc 0, 17.5 min
+10-05 10:27  seed 42 fold colour_diff diffusion_cross_s3: rc 0, 18.4 min
+10-05 10:27  seed 42 fold colour_diff dtd_s3: rc 0, 17.8 min
+10-05 10:29  seed 42 fold colour_same m1: rc 0, 9.0 min
+10-05 10:31  seed 42 fold colour_diff cutmix_s3: rc 0, 16.8 min
+10-05 10:35  seed 42 fold colour_diff diffusion_in_s4: rc 0, 19.7 min
+10-05 10:35  seed 42 fold colour_diff diffusion_cross_s5: rc 0, 16.1 min
+10-05 10:35  seed 42 fold colour_diff diffusion_cross_s4: rc 0, 19.3 min
+10-05 10:42  seed 42 fold colour_same diffusion_in_s1: rc 0, 16.1 min
+10-05 10:44  seed 42 fold colour_same diffusion_cross_s1: rc 0, 16.1 min
+10-05 10:45  seed 42 fold colour_same dtd_s1: rc 0, 16.2 min
+10-05 10:46  seed 42 fold colour_same cutmix_s1: rc 0, 16.6 min
+10-05 10:48  seed 42 fold colour_same diffusion_in_s2: rc 0, 16.3 min
+10-05 10:52  seed 42 fold colour_same dtd_s2: rc 0, 16.4 min
+10-05 10:53  seed 42 fold colour_same diffusion_cross_s2: rc 0, 17.9 min
+10-05 10:55  seed 42 fold colour_same cutmix_s2: rc 0, 18.4 min
+10-05 10:59  seed 42 fold colour_same diffusion_in_s3: rc 0, 16.6 min
+10-05 11:01  seed 42 fold colour_same diffusion_cross_s3: rc 0, 16.2 min
+10-05 11:03  seed 42 fold colour_same dtd_s3: rc 0, 17.8 min
+10-05 11:05  seed 42 fold colour_same cutmix_s3: rc 0, 18.4 min
+10-05 11:07  seed 42 fold colour_same diffusion_in_s4: rc 0, 18.0 min
+10-05 11:08  seed 42 fold scratches m1: rc 0, 11.5 min
+10-05 11:11  seed 42 fold colour_same diffusion_cross_s4: rc 0, 17.8 min
+10-05 11:12  seed 42 fold colour_same diffusion_cross_s5: rc 0, 17.5 min
+10-05 11:19  seed 42 fold scratches diffusion_in_s1: rc 0, 19.2 min
+10-05 11:20  seed 42 fold scratches diffusion_cross_s1: rc 0, 18.3 min
+10-05 11:23  seed 42 fold scratches dtd_s1: rc 0, 19.3 min
+10-05 11:26  seed 42 fold scratches cutmix_s1: rc 0, 19.5 min
+10-05 11:28  seed 42 fold scratches diffusion_in_s2: rc 0, 20.1 min
+10-05 11:28  seed 42 fold scratches diffusion_cross_s2: rc 0, 19.3 min
+10-05 11:32  seed 42 fold scratches cutmix_s2: rc 0, 19.5 min
+10-05 11:32  seed 42 fold scratches dtd_s2: rc 0, 20.3 min
+10-05 11:39  seed 42 fold scratches diffusion_in_s3: rc 0, 18.8 min
+10-05 11:39  seed 42 fold scratches diffusion_cross_s3: rc 0, 19.0 min
+10-05 11:43  seed 42 fold scratches dtd_s3: rc 0, 19.2 min
+10-05 11:46  seed 42 fold scratches cutmix_s3: rc 0, 19.5 min
+10-05 11:46  seed 42 fold scratches diffusion_in_s4: rc 0, 17.8 min
+10-05 11:47  seed 42 fold scratches diffusion_cross_s4: rc 0, 17.4 min
+10-05 11:49  seed 42 fold scratches diffusion_cross_s5: rc 0, 16.1 min
+10-05 11:52  seed 123 plan: rc [0] in 3.2 min
+10-05 17:17  seed 123 generate: rc [0, 0, 0, 0, 0, 0, 0, 0] in 324.7 min
+10-05 20:55  seed 123 refine: rc [0, 0, 0, 0, 0, 0, 0, 0] in 218.1 min
+10-05 20:56  seed 123 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.6 min
+10-05 20:58  seed 123 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 2.0 min
+10-05 20:59  seed 123 check: rc [0] in 1.3 min
+10-05 20:59  seed 123: training 96 runs, 8 at a time
+10-05 21:13  seed 123 fold holes m1: rc 0, 7.5 min
+10-05 21:15  seed 123 fold holes dtd_s1: rc 0, 15.6 min
+10-05 21:15  seed 123 fold holes diffusion_in_s2: rc 0, 14.3 min
+10-05 21:16  seed 123 fold holes diffusion_in_s1: rc 0, 15.4 min
+10-05 21:19  seed 123 fold holes diffusion_cross_s1: rc 0, 16.0 min
+10-05 21:20  seed 123 fold holes cutmix_s1: rc 0, 17.8 min
+10-05 21:20  seed 123 fold holes diffusion_cross_s2: rc 0, 17.5 min
+10-05 21:21  seed 123 fold holes dtd_s2: rc 0, 16.7 min
+10-05 21:29  seed 123 fold holes cutmix_s2: rc 0, 16.1 min
+10-05 21:33  seed 123 fold holes diffusion_in_s3: rc 0, 17.3 min
+10-05 21:34  seed 123 fold holes diffusion_cross_s3: rc 0, 17.5 min
+10-05 21:35  seed 123 fold holes dtd_s3: rc 0, 17.3 min
+10-05 21:36  seed 123 fold holes diffusion_in_s4: rc 0, 15.0 min
+10-05 21:37  seed 123 fold holes diffusion_cross_s4: rc 0, 15.7 min
+10-05 21:38  seed 123 fold holes cutmix_s3: rc 0, 17.4 min
+10-05 21:38  seed 123 fold holes diffusion_cross_s5: rc 0, 15.5 min
+10-05 21:40  seed 123 fold breakage m1: rc 0, 10.2 min
+10-05 21:51  seed 123 fold breakage diffusion_cross_s1: rc 0, 15.5 min
+10-05 21:52  seed 123 fold breakage diffusion_in_s1: rc 0, 17.7 min
+10-05 21:54  seed 123 fold breakage cutmix_s1: rc 0, 17.5 min
+10-05 21:55  seed 123 fold breakage dtd_s1: rc 0, 19.0 min
+10-05 21:57  seed 123 fold breakage diffusion_in_s2: rc 0, 18.6 min
+10-05 21:57  seed 123 fold breakage dtd_s2: rc 0, 17.5 min
+10-05 21:58  seed 123 fold breakage diffusion_cross_s2: rc 0, 18.5 min
+10-05 21:59  seed 123 fold breakage cutmix_s2: rc 0, 17.5 min
+10-05 22:06  seed 123 fold burnt m1: rc 0, 6.5 min
+10-05 22:09  seed 123 fold breakage diffusion_in_s3: rc 0, 17.5 min
+10-05 22:10  seed 123 fold breakage diffusion_cross_s3: rc 0, 16.9 min
+10-05 22:12  seed 123 fold breakage cutmix_s3: rc 0, 16.2 min
+10-05 22:13  seed 123 fold breakage dtd_s3: rc 0, 18.0 min
+10-05 22:15  seed 123 fold breakage diffusion_cross_s4: rc 0, 17.0 min
+10-05 22:16  seed 123 fold breakage diffusion_in_s4: rc 0, 18.0 min
+10-05 22:16  seed 123 fold breakage diffusion_cross_s5: rc 0, 16.6 min
+10-05 22:23  seed 123 fold burnt diffusion_in_s1: rc 0, 15.6 min
+10-05 22:23  seed 123 fold burnt diffusion_cross_s1: rc 0, 13.8 min
+10-05 22:26  seed 123 fold burnt dtd_s1: rc 0, 15.4 min
+10-05 22:28  seed 123 fold burnt diffusion_in_s2: rc 0, 14.1 min
+10-05 22:28  seed 123 fold burnt cutmix_s1: rc 0, 15.3 min
+10-05 22:31  seed 123 fold burnt diffusion_cross_s2: rc 0, 14.6 min
+10-05 22:31  seed 123 fold burnt dtd_s2: rc 0, 14.0 min
+10-05 22:32  seed 123 fold burnt cutmix_s2: rc 0, 14.4 min
+10-05 22:38  seed 123 fold burnt diffusion_in_s3: rc 0, 14.4 min
+10-05 22:38  seed 123 fold burnt diffusion_cross_s3: rc 0, 14.1 min
+10-05 22:40  seed 123 fold colour_diff m1: rc 0, 6.7 min
+10-05 22:41  seed 123 fold burnt dtd_s3: rc 0, 14.6 min
+10-05 22:43  seed 123 fold burnt cutmix_s3: rc 0, 14.2 min
+10-05 22:44  seed 123 fold burnt diffusion_in_s4: rc 0, 14.9 min
+10-05 22:46  seed 123 fold burnt diffusion_cross_s4: rc 0, 14.8 min
+10-05 22:46  seed 123 fold burnt diffusion_cross_s5: rc 0, 14.2 min
+10-05 22:52  seed 123 fold colour_diff diffusion_in_s1: rc 0, 13.5 min
+10-05 22:54  seed 123 fold colour_diff diffusion_cross_s1: rc 0, 14.9 min
+10-05 22:56  seed 123 fold colour_diff dtd_s1: rc 0, 15.2 min
+10-05 22:56  seed 123 fold colour_diff cutmix_s1: rc 0, 14.4 min
+10-05 22:57  seed 123 fold colour_diff diffusion_in_s2: rc 0, 13.0 min
+10-05 22:59  seed 123 fold colour_diff diffusion_cross_s2: rc 0, 13.8 min
+10-05 23:00  seed 123 fold colour_diff dtd_s2: rc 0, 13.4 min
+10-05 23:01  seed 123 fold colour_diff cutmix_s2: rc 0, 12.8 min
+10-05 23:06  seed 123 fold colour_diff diffusion_in_s3: rc 0, 13.3 min
+10-05 23:09  seed 123 fold colour_diff diffusion_cross_s3: rc 0, 13.6 min
+10-05 23:10  seed 123 fold colour_same m1: rc 0, 7.6 min
+10-05 23:10  seed 123 fold colour_diff dtd_s3: rc 0, 13.9 min
+10-05 23:12  seed 123 fold colour_diff diffusion_in_s4: rc 0, 13.8 min
+10-05 23:12  seed 123 fold colour_diff cutmix_s3: rc 0, 14.8 min
+10-05 23:15  seed 123 fold colour_diff diffusion_cross_s4: rc 0, 15.2 min
+10-05 23:15  seed 123 fold colour_diff diffusion_cross_s5: rc 0, 13.8 min
+10-05 23:21  seed 123 fold colour_same diffusion_in_s1: rc 0, 13.9 min
+10-05 23:24  seed 123 fold colour_same diffusion_cross_s1: rc 0, 15.1 min
+10-05 23:25  seed 123 fold colour_same dtd_s1: rc 0, 14.3 min
+10-05 23:26  seed 123 fold colour_same cutmix_s1: rc 0, 14.9 min
+10-05 23:28  seed 123 fold colour_same diffusion_in_s2: rc 0, 15.1 min
+10-05 23:29  seed 123 fold colour_same diffusion_cross_s2: rc 0, 15.2 min
+10-05 23:31  seed 123 fold colour_same cutmix_s2: rc 0, 14.1 min
+10-05 23:31  seed 123 fold colour_same dtd_s2: rc 0, 15.4 min
+10-05 23:36  seed 123 fold colour_same diffusion_in_s3: rc 0, 13.9 min
+10-05 23:39  seed 123 fold colour_same dtd_s3: rc 0, 13.1 min
+10-05 23:40  seed 123 fold scratches m1: rc 0, 8.2 min
+10-05 23:42  seed 123 fold colour_same diffusion_cross_s3: rc 0, 17.0 min
+10-05 23:44  seed 123 fold colour_same diffusion_in_s4: rc 0, 15.4 min
+10-05 23:44  seed 123 fold colour_same cutmix_s3: rc 0, 17.3 min
+10-05 23:45  seed 123 fold colour_same diffusion_cross_s4: rc 0, 15.4 min
+10-05 23:47  seed 123 fold colour_same diffusion_cross_s5: rc 0, 15.5 min
+10-05 23:52  seed 123 fold scratches diffusion_in_s1: rc 0, 16.1 min
+10-05 23:56  seed 123 fold scratches dtd_s1: rc 0, 14.5 min
+10-05 23:57  seed 123 fold scratches diffusion_cross_s1: rc 0, 17.6 min
+10-05 23:59  seed 123 fold scratches cutmix_s1: rc 0, 16.3 min
+10-06 00:01  seed 123 fold scratches dtd_s2: rc 0, 15.2 min
+10-06 00:02  seed 123 fold scratches diffusion_in_s2: rc 0, 17.7 min
+10-06 00:03  seed 123 fold scratches diffusion_cross_s2: rc 0, 17.9 min
+10-06 00:04  seed 123 fold scratches cutmix_s2: rc 0, 16.4 min
+10-06 00:08  seed 123 fold scratches diffusion_in_s3: rc 0, 15.2 min
+10-06 00:12  seed 123 fold scratches diffusion_cross_s3: rc 0, 15.7 min
+10-06 00:14  seed 123 fold scratches dtd_s3: rc 0, 15.7 min
+10-06 00:15  seed 123 fold scratches cutmix_s3: rc 0, 15.3 min
+10-06 00:16  seed 123 fold scratches diffusion_in_s4: rc 0, 13.8 min
+10-06 00:17  seed 123 fold scratches diffusion_cross_s4: rc 0, 13.7 min
+10-06 00:17  seed 123 fold scratches diffusion_cross_s5: rc 0, 13.3 min
+10-06 00:21  seed 7 plan: rc [0] in 3.4 min
