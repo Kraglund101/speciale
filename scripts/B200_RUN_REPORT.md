@@ -105,3 +105,27 @@ existing PNGs were opened with PIL (0 broken) before resuming; the launcher skip
 - `results/open_set_v2/lists/seed_<s>/fold_<k>/` (the exact train / test / synthetic lists every run used)
 - `results/open_set_v2/runs/<arm>/seed_<s>/fold_<k>/results.json`
 - `results/open_set_v2/IMAGE_PROVENANCE.md`, `images_made_with_ffe1fea_scheduler.txt`, `generator_settings.json`
+
+## 7. Addendum 2026-10-06: M1 teacher weights (D7) — M1 rerun
+
+**Cause of the near-chance M1:** anomalib 2.6.2 (installed on the server, D1) builds the UniNet teacher with
+`torchvision.models.get_model_weights(backbone).DEFAULT`, which in torchvision 0.22 is Wide-ResNet-50-2 **IMAGENET1K_V2**
+(`wide_resnet50_2-9ba9bcbe.pth`, silently downloaded 2026-10-03 22:10 — HF_HUB_OFFLINE does not block torchvision).
+anomalib 2.1.0 / 2.2.0 / 2.3.0 (and the Windows side, 2.2.0) use `wide_resnet50_2(pretrained=True)` = **IMAGENET1K_V1**
+(`95faca4d`, the file shipped in the zip). Diffing the wheels: in `anomalib/models/image/uninet/` this line is the ONLY
+difference between 2.2.0 and 2.6.2.
+
+**Scope:** only M1. The CAAO arms build the same anomalib model and then `_swap_to_convnext()` replaces teachers,
+bottleneck, student, DFS and head, so the WRN teacher is discarded. The 180 non-M1 runs are unaffected by this.
+
+**Fix:** server venv now anomalib **2.2.0** (rest of `_cache/venv_freeze.txt` unchanged: numpy 1.26.4, opencv-python-headless
+4.9.0; anomalib 2.2.0 pulls opencv-python and numpy 2 as dependencies — both removed / reverted). Teacher call verified:
+`getattr(torchvision.models, backbone)(pretrained=True)`.
+
+**Diagnostic (seed 42, fold holes, same command):** old V2 teacher composite-late 0.518 / clean-late 0.671 -> V1 teacher
+0.814 / 0.998.
+
+**Rerun:** all 12 M1 runs (seeds 42, 123 x 6 folds), `open_set_launch.py --seeds 42 123 --arms m1 --stages train tables`,
+on one whole B200 (6 at a time), 2026-10-06 08:36-09:00. Old M1 runs kept in `results/open_set_v2/runs_superseded_v2teacher/m1`
+(logs in `logs_superseded_v2teacher/`, old table in `TABLES_v2teacher_m1.md`). `TABLES.md` and everything in `b200_results/`
+now use the V1 M1. The noise-strength test used only CAAO runs (no M1), so it is unaffected.

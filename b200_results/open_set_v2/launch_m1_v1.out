@@ -1,0 +1,17 @@
+10-06 08:36  === launch profile b200: seeds [42, 123], folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'], 1 arms, stages ['train', 'tables'], gen procs 8, train slots 6, gpus 1
+10-06 08:36  seed 42: training 6 runs, 6 at a time
+10-06 08:47  seed 42 fold burnt m1: rc 0, 9.4 min
+10-06 08:47  seed 42 fold colour_diff m1: rc 0, 9.7 min
+10-06 08:48  seed 42 fold holes m1: rc 0, 10.9 min
+10-06 08:48  seed 42 fold colour_same m1: rc 0, 9.6 min
+10-06 08:48  seed 42 fold breakage m1: rc 0, 11.0 min
+10-06 08:48  seed 42 fold scratches m1: rc 0, 10.0 min
+10-06 08:48  seed 123: training 6 runs, 6 at a time
+10-06 08:57  seed 123 fold colour_diff m1: rc 0, 7.1 min
+10-06 08:57  seed 123 fold burnt m1: rc 0, 7.5 min
+10-06 08:58  seed 123 fold holes m1: rc 0, 9.1 min
+10-06 08:58  seed 123 fold colour_same m1: rc 0, 7.7 min
+10-06 08:58  seed 123 fold breakage m1: rc 0, 9.3 min
+10-06 08:59  seed 123 fold scratches m1: rc 0, 8.5 min
+10-06 08:59  === launch finished
+Tue Oct  6 08:59:36 CEST 2026 m1 rerun exited rc 0

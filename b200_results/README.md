@@ -9,3 +9,7 @@ Copied here (outside `results/`) so a pull cannot collide with local result fold
   `launch.log`, `launch_full.out`, `generator_settings.json`, `IMAGE_PROVENANCE.md` + `images_made_with_ffe1fea_scheduler.txt`.
 - `noise_strength_test/`: 75 runs (14 arms x 5 seeds + arm 070 x 5). `TABLES.md`, `progress.log`, `per_epoch_aurocs.csv`,
   `results_json.tar.xz` (unpacks to results/noise_strength_test/runs/...).
+
+**2026-10-06:** M1 rerun with the V1 Wide-ResNet teacher (anomalib 2.2.0); see `scripts/B200_RUN_REPORT.md` section 7.
+`open_set_v2/TABLES.md`, `results_json.tar.xz` and `per_epoch_aurocs.csv` now contain the V1 M1. The superseded V2-teacher
+M1 runs: `results_json_m1_superseded_v2teacher.tar.xz`, table `TABLES_v2teacher_m1.md`. M1 rerun log: `launch_m1_v1.out`.
