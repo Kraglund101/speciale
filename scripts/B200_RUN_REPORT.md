@@ -129,3 +129,35 @@ bottleneck, student, DFS and head, so the WRN teacher is discarded. The 180 non-
 on one whole B200 (6 at a time), 2026-10-06 08:36-09:00. Old M1 runs kept in `results/open_set_v2/runs_superseded_v2teacher/m1`
 (logs in `logs_superseded_v2teacher/`, old table in `TABLES_v2teacher_m1.md`). `TABLES.md` and everything in `b200_results/`
 now use the V1 M1. The noise-strength test used only CAAO runs (no M1), so it is unaffected.
+
+## 8. Addendum 2026-10-07: seeds 7, 99, 256, 11, 22, 33, 44, 55 (whole B200)
+
+**Hardware:** one whole NVIDIA B200 (no MIG), UCloud job j-12412980, 48-core CPU quota. Same venv as section 7
+(anomalib 2.2.0, V1 WRN teacher for M1), same code (no code change since 540aa2d; Windows commits up to e421549 pulled).
+
+**Command** (`os_8seeds.sh` in the project root, tmux `os8`):
+```
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_pipe CUDA_MPS_LOG_DIRECTORY=/tmp/mps_log; nvidia-cuda-mps-control -d
+OPEN_SET_ACCEPT_EXISTING=1 python scripts/open_set_launch.py --profile b200 --gen-procs 12 --seeds 7 99 256 11 22 33 44 55
+```
+
+**Process settings changed during the run (D8, no effect on settings, seeds, sampling or masks):**
+- `OMP_NUM_THREADS=4 MKL_NUM_THREADS=4`: torch started 192 CPU threads per process; with 8-12 processes on a 48-core quota the
+  job was CPU-throttled in 50 % of scheduler periods. After the cap: 0 throttled periods.
+- NVIDIA MPS: kernels of the parallel processes run concurrently instead of time-sliced. Same kernels; outputs expected to
+  be identical, **not verified by a byte comparison**.
+- `--gen-procs 12` (was 8): generation / refine sharding only; every item has its own seed.
+- Effect: generation 55 -> 114 images/min; mask refinement 218 min (MIG) -> 7 min per seed (it was dominated by the same
+  thread thrashing). Refined masks checked on seed 7: all 11,829 present, 0 empty in a 300-sample, area distribution
+  matching seed 123 (median 0.72 % vs 0.77 %).
+- Seed 7: 2,371 of its images had been generated on the MIG job before (2026-10-06, EvenStepDDIM, same settings).
+- The launcher was restarted twice at the start of seed 7's generation (09:28, 09:35) to apply the above; images written
+  in the minutes before each stop were opened with PIL (0 broken) and generation resumed (existing images skipped).
+
+**Result:** 768 runs (8 seeds x 6 folds x 16 arms), all rc 0, 20 epochs each; launcher `=== launch finished`
+2026-10-07 16:03; no failed stage or run since 2026-10-06 (`b200_results/ALL_SEEDS_DONE.md`). Per seed on the whole B200:
+generate ~105 min, refine ~7 min, dtd + cutmix ~3 min, 96 trainings ~115 min (8 at a time).
+
+**Totals now:** 10 seeds x 6 folds x 16 arms = 960 runs in `b200_results/open_set_v2/` (TABLES.md, per_epoch_aurocs.csv,
+results_json.tar.xz, lists.tar.xz). The M1-vs-rest backbone / mode confound from section 5.1 still applies.
