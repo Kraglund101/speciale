@@ -124,3 +124,39 @@ settings (stamp file `generator_settings.json`): move old `diffusion_in/`, `diff
 
 **Next (only on Frederik's go):** open-set smoke test, then the pilot
 `python scripts/open_set_launch.py --profile b200 --seeds 42 --folds holes breakage`, then stop for his review.
+
+## ORDER 2026-10-09: add DTD and CutMix at stage 4 (two missing arms, 120 runs)
+
+**The problem.** Stage 4 ("all real anomalies of the type, 9-20 instead of the budget of 3") was run for the diffusion
+arms only. That was an oversight in the design: DTD and CutMix never see the real anomaly's appearance, but they DO
+fill the placed GT mask of the same prep step the diffusion arms use, and those masks come from the real anomalies. So
+the budget axis (stage 3 -> 4) applies to them as well (3 real shapes vs all), and the report's stage table has a gap.
+Code is already changed and pushed on `b200-open-set` (commit "open-set: DTD and CutMix at stage 4"): `ARMS` now holds
+`dtd 4` and `cutmix 4`; `stage_dtd` / `stage_cutmix` also process the `s4` sets (incl. `s4_fold_k` re-paints).
+Verified on Windows for seed 42, fold holes: 1080 DTD + 900 CutMix stage-4 images, run lists 20 epochs, 0 missing files.
+
+**What to run** (needs NO diffusion generation: only CPU image synthesis + 2 arms x 6 folds x 10 seeds = 120 trainings,
+~8 min each with 8 in parallel on a whole B200, so about 2 hours):
+
+```bash
+git pull                                      # branch b200-open-set
+ls results/open_set_v2/manifest | wc -l       # must be 10 (seed_*.json); ls results/open_set_v2/prep/seed_55/  must show s4 + s4_fold_* folders
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+OPEN_SET_ACCEPT_EXISTING=1 nohup python scripts/open_set_launch.py --profile b200 --seeds 42 123 7 99 256 11 22 33 44 55 \
+    --arms dtd_s4 cutmix_s4 --stages plan dtd cutmix check train tables > launch_s4_dtd_cutmix.out 2>&1 &
+```
+
+- `plan` only fills missing preps (existing `meta.json` are skipped); `dtd` / `cutmix` only make the missing s4 images
+  (s2/s3 exist and are skipped); `train` skips finished 20-epoch runs, so only the 120 new runs are trained.
+- **Do NOT rebuild manifests.** If `results/open_set_v2/manifest/` does not hold all 10 seed files, or `prep/` is gone,
+  STOP and tell Frederik: a rebuild on another machine reproduces the canvases, groups, budget and placements but NOT
+  the donor pairing (`pairing`, `s5_donor` differ - checked on Windows against your archived seeds 42/123/7), and the
+  new arms must share the exact placed masks the stage-4 diffusion arms were trained on.
+- `dtd` once failed with rc 1 on seed 42 (imgaug import race) and passed on rerun; just rerun that stage if it happens.
+- Keep the thread cap / MPS setup of section 8 of `B200_RUN_REPORT.md` if you use it; it changes nothing in the results.
+
+**When finished:** `scripts/open_set_tables.py` output in `results/open_set_v2/TABLES.md` must show rows "DTD | 4" and
+"CutMix | 4" with 60 runs each. Then update `b200_results/open_set_v2/results_json.tar.xz` so it contains ALL runs
+(the 960 old + 120 new `runs/<arm>/seed_<s>/fold_<k>/results.json`), copy the new TABLES.md and launch log into
+`b200_results/open_set_v2/`, add a section 9 to `scripts/B200_RUN_REPORT.md` (what ran, failures with the log line,
+any code change), commit on `b200-open-set` and **push**. Frederik will pull on the Windows side.

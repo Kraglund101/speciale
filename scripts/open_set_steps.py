@@ -9,14 +9,14 @@ P_k = union of G_t, t != k (9 per type), 20 epochs; test = 50 test normals + the
   stage 1  the 3 budget anomalies of each type (3 uses each) on the type's 9 canvases, ONE set repeated every epoch
   stage 2  same anomalies, same canvases, re-rendered every epoch (new placement + noise, re-paired within the group)
   stage 3  same anomalies, re-rendered, on ANY of the fold's 45 canvases (re-dealt among its 5 types every epoch)
-  stage 4  ALL cashew anomalies of the type (9-20), donors matched 1-to-1, canvases as stage 3      (diffusion arms)
+  stage 4  ALL cashew anomalies of the type (9-20), donors matched 1-to-1, canvases as stage 3 (DTD / CutMix use their masks)
   stage 5  cross-object only: stage 4's canvases, masks and seeds, donor drawn from the UNRESTRICTED pool (ext_pools)
 Image sets ("tags"): s2 (stages 1-2; shared by all folds; stage 1 = its epoch 0); s3, s4 (one deal of the 54 canvases
 per epoch, shared by the folds) + s3_fold_k / s4_fold_k: the ~1 in 6 synthetics of a deal that sit on a canvas of G_k
 are re-painted for fold k on the free canvases of P_k -> every fold sees exactly its own 45 canvases, each once per
 epoch; s5 / s5_fold_k = s4's placements with the stage-5 donor. s3 epoch 0 is stage 1's set (alias of s2).
-Methods: m1 (100 train normals + P_k clean); diffusion_in, diffusion_cross, dtd, cutmix at stages 1-3; diffusion_in,
-diffusion_cross at stage 4; diffusion_cross at stage 5. CutMix is generated per fold (donor = another canvas of P_k).
+Methods: m1 (100 train normals + P_k clean); diffusion_in, diffusion_cross, dtd, cutmix at stages 1-4 (dtd / cutmix at
+stage 4 added 2026-10-09: the budget also sets the MASKS they fill); diffusion_cross at stage 5. CutMix is generated per fold (donor = another canvas of P_k).
 Model: train_uninet.py --hero caao (lambda 0.2, no SG) / m1, no photometric, fixed test shifts.
 
   python scripts/open_set_steps.py plan     --seeds 42 [--folds holes breakage]
@@ -54,8 +54,8 @@ CLASSES, K, E, BUDGET = P.CLASSES, 9, 20, 3
 assert K % BUDGET == 0
 SEEDS10 = [42, 123, 7, 99, 256, 11, 22, 33, 44, 55]
 CASHEW = P.gc.CASHEW_ROOT
-ARMS = [("m1", 0)] + [(m, st) for st in (1, 2, 3) for m in ("diffusion_in", "diffusion_cross", "dtd", "cutmix")] \
-    + [("diffusion_in", 4), ("diffusion_cross", 4), ("diffusion_cross", 5)]
+ARMS = [("m1", 0)] + [(m, st) for st in (1, 2, 3, 4) for m in ("diffusion_in", "diffusion_cross", "dtd", "cutmix")] \
+    + [("diffusion_cross", 5)]
 SET_OF_STEP = {1: "s2", 2: "s2", 3: "s3", 4: "s4", 5: "s4"}
 # leak-free layout (scripts/make_leakfree_thesis_set.py): 067 is the re-synthesis on a clean canvas, no leak_fix indirection
 THESIS = dict(set="results/thesis_set_clean20k_leakfree", prep="results/cashew_100_leakfree/prep", masks="results/thesis_set_clean20k_leakfree/refined_masks_f025")
@@ -336,12 +336,12 @@ def stage_refine(seeds: list[int], folds: list[str] | None, shard: tuple[int, in
 
 
 def stage_dtd(seeds: list[int], folds: list[str] | None, shard: tuple[int, int] = (0, 1)) -> None:
-    """DRAEM blend into the placed GT mask (= label); stages 1-3 only (sets s2, s3)."""
+    """DRAEM blend into the placed GT mask (= label); stages 1-4 (sets s2, s3, s4)."""
     files = sorted(str(p) for p in P.DTD_DIR.glob("*/*") if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
     assert len(files) > 5000, f"DTD incomplete at {P.DTD_DIR}"
     for s in seeds:
         man = manifest(s)
-        for n, (tag, cls, i, ref, canvas) in enumerate(entries(man, folds, sets=("s2", "s3"))):
+        for n, (tag, cls, i, ref, canvas) in enumerate(entries(man, folds, sets=("s2", "s3", "s4"))):
             dst = ipath("dtd", s, tag, cls, i)
             if n % shard[1] != shard[0] or dst.exists():       # each item is seeded on its own: sharding changes nothing
                 continue
@@ -358,7 +358,7 @@ def stage_dtd(seeds: list[int], folds: list[str] | None, shard: tuple[int, int] 
 def stage_cutmix(seeds: list[int], folds: list[str] | None, shard: tuple[int, int] = (0, 1)) -> None:
     """Per fold: patch from another canvas of the fold's 45 (report: 'resampled from the fixed target-domain canvas pool,
     excluding the current canvas'), cut at the centroid-aligned position nearest to 'fully on the donor cashew', pasted
-    into the placed GT mask (= label). Stages 1-3 (sets s2, s3)."""
+    into the placed GT mask (= label). Stages 1-4 (sets s2, s3, s4)."""
     from scipy.signal import fftconvolve
     from sheet_utils import mask_resize
     fgc: dict[str, np.ndarray] = {}
@@ -373,7 +373,7 @@ def stage_cutmix(seeds: list[int], folds: list[str] | None, shard: tuple[int, in
         man = manifest(s)
         for fold in (folds or CLASSES):
             types = [t for t in CLASSES if t != fold]; Pk = sorted(c for t in types for c in man["groups"][t])
-            for name in (x for x in ("s2", "s3") if x in ONLY_SETS):
+            for name in (x for x in ("s2", "s3", "s4") if x in ONLY_SETS):
                 for t in types:
                     for st in man["sets"][name][t]:
                         if "alias" in st or st["epoch"] >= EPOCH_LIMIT:
