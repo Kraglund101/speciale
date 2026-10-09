@@ -1,0 +1,177 @@
+10-09 14:05  === launch profile b200: seeds [42, 123, 7, 99, 256, 11, 22, 33, 44, 55], folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'], 2 arms, stages ['plan', 'dtd', 'cutmix', 'check', 'train', 'tables'], gen procs 8, train slots 8, gpus 1
+10-09 14:05  seed 42 plan: rc [0] in 0.1 min
+10-09 14:07  seed 42 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.3 min
+10-09 14:08  seed 42 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.1 min
+10-09 14:08  === launch profile b200: seeds [42, 123, 7, 99, 256, 11, 22, 33, 44, 55], folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'], 2 arms, stages ['plan', 'dtd', 'cutmix', 'check', 'train', 'tables'], gen procs 8, train slots 12, gpus 1
+10-09 14:08  seed 42 plan: rc [0] in 0.1 min
+10-09 14:08  seed 42 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.1 min
+10-09 14:08  seed 42 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.1 min
+10-09 14:10  seed 42 check: rc [0] in 1.4 min
+10-09 14:10  seed 42: training 12 runs, 12 at a time
+10-09 14:20  seed 42 fold burnt dtd_s4: rc 0, 9.8 min
+10-09 14:21  seed 42 fold burnt cutmix_s4: rc 0, 9.8 min
+10-09 14:21  seed 42 fold colour_diff dtd_s4: rc 0, 9.7 min
+10-09 14:21  seed 42 fold colour_diff cutmix_s4: rc 0, 9.7 min
+10-09 14:21  seed 42 fold holes dtd_s4: rc 0, 11.3 min
+10-09 14:21  seed 42 fold holes cutmix_s4: rc 0, 11.6 min
+10-09 14:22  seed 42 fold colour_same cutmix_s4: rc 0, 10.1 min
+10-09 14:22  seed 42 fold colour_same dtd_s4: rc 0, 10.3 min
+10-09 14:22  seed 42 fold breakage cutmix_s4: rc 0, 11.4 min
+10-09 14:22  seed 42 fold breakage dtd_s4: rc 0, 11.6 min
+10-09 14:22  seed 42 fold scratches dtd_s4: rc 0, 10.4 min
+10-09 14:22  seed 42 fold scratches cutmix_s4: rc 0, 10.5 min
+10-09 14:23  seed 123 plan: rc [0] in 0.1 min
+10-09 14:23  seed 123 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.6 min
+10-09 14:24  seed 123 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.0 min
+10-09 14:26  seed 123 check: rc [0] in 1.4 min
+10-09 14:26  seed 123: training 12 runs, 12 at a time
+10-09 14:36  seed 123 fold burnt cutmix_s4: rc 0, 9.8 min
+10-09 14:37  seed 123 fold breakage cutmix_s4: rc 0, 11.0 min
+10-09 14:37  seed 123 fold holes cutmix_s4: rc 0, 11.0 min
+10-09 14:37  seed 123 fold colour_same dtd_s4: rc 0, 10.0 min
+10-09 14:37  seed 123 fold breakage dtd_s4: rc 0, 10.9 min
+10-09 14:37  seed 123 fold colour_diff cutmix_s4: rc 0, 9.9 min
+10-09 14:37  seed 123 fold scratches cutmix_s4: rc 0, 10.5 min
+10-09 14:37  seed 123 fold colour_diff dtd_s4: rc 0, 9.7 min
+10-09 14:37  seed 123 fold scratches dtd_s4: rc 0, 10.5 min
+10-09 14:37  seed 123 fold holes dtd_s4: rc 0, 11.0 min
+10-09 14:37  seed 123 fold burnt dtd_s4: rc 0, 10.0 min
+10-09 14:38  seed 123 fold colour_same cutmix_s4: rc 0, 10.0 min
+10-09 14:38  seed 7 plan: rc [0] in 0.1 min
+10-09 14:38  seed 7 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.5 min
+10-09 14:39  seed 7 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.0 min
+10-09 14:41  seed 7 check: rc [0] in 1.4 min
+10-09 14:41  seed 7: training 12 runs, 12 at a time
+10-09 14:51  seed 7 fold burnt cutmix_s4: rc 0, 10.0 min
+10-09 14:52  seed 7 fold burnt dtd_s4: rc 0, 9.8 min
+10-09 14:52  seed 7 fold colour_diff dtd_s4: rc 0, 9.7 min
+10-09 14:52  seed 7 fold holes cutmix_s4: rc 0, 11.2 min
+10-09 14:52  seed 7 fold colour_diff cutmix_s4: rc 0, 9.9 min
+10-09 14:52  seed 7 fold breakage dtd_s4: rc 0, 11.3 min
+10-09 14:52  seed 7 fold holes dtd_s4: rc 0, 11.2 min
+10-09 14:52  seed 7 fold colour_same dtd_s4: rc 0, 10.1 min
+10-09 14:53  seed 7 fold breakage cutmix_s4: rc 0, 11.3 min
+10-09 14:53  seed 7 fold colour_same cutmix_s4: rc 0, 10.2 min
+10-09 14:53  seed 7 fold scratches dtd_s4: rc 0, 10.4 min
+10-09 14:53  seed 7 fold scratches cutmix_s4: rc 0, 10.5 min
+10-09 14:53  seed 99 plan: rc [0] in 0.1 min
+10-09 14:54  seed 99 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.5 min
+10-09 14:55  seed 99 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.2 min
+10-09 14:57  seed 99 check: rc [0] in 1.6 min
+10-09 14:57  seed 99: training 12 runs, 12 at a time
+10-09 15:07  seed 99 fold burnt dtd_s4: rc 0, 9.9 min
+10-09 15:08  seed 99 fold burnt cutmix_s4: rc 0, 10.0 min
+10-09 15:08  seed 99 fold colour_diff dtd_s4: rc 0, 9.9 min
+10-09 15:08  seed 99 fold colour_diff cutmix_s4: rc 0, 10.1 min
+10-09 15:08  seed 99 fold holes cutmix_s4: rc 0, 11.2 min
+10-09 15:08  seed 99 fold breakage dtd_s4: rc 0, 11.4 min
+10-09 15:08  seed 99 fold colour_same dtd_s4: rc 0, 10.1 min
+10-09 15:09  seed 99 fold colour_same cutmix_s4: rc 0, 10.1 min
+10-09 15:09  seed 99 fold breakage cutmix_s4: rc 0, 11.6 min
+10-09 15:09  seed 99 fold holes dtd_s4: rc 0, 11.5 min
+10-09 15:09  seed 99 fold scratches dtd_s4: rc 0, 10.5 min
+10-09 15:10  seed 99 fold scratches cutmix_s4: rc 0, 10.7 min
+10-09 15:10  seed 256 plan: rc [0] in 0.1 min
+10-09 15:10  seed 256 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.6 min
+10-09 15:11  seed 256 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.1 min
+10-09 15:13  seed 256 check: rc [0] in 1.6 min
+10-09 15:13  seed 256: training 12 runs, 12 at a time
+10-09 15:23  seed 256 fold colour_diff cutmix_s4: rc 0, 9.1 min
+10-09 15:23  seed 256 fold burnt cutmix_s4: rc 0, 9.8 min
+10-09 15:24  seed 256 fold burnt dtd_s4: rc 0, 10.0 min
+10-09 15:24  seed 256 fold colour_diff dtd_s4: rc 0, 9.9 min
+10-09 15:24  seed 256 fold holes cutmix_s4: rc 0, 11.0 min
+10-09 15:25  seed 256 fold colour_same cutmix_s4: rc 0, 9.8 min
+10-09 15:25  seed 256 fold breakage cutmix_s4: rc 0, 11.4 min
+10-09 15:25  seed 256 fold colour_same dtd_s4: rc 0, 10.1 min
+10-09 15:25  seed 256 fold holes dtd_s4: rc 0, 11.3 min
+10-09 15:25  seed 256 fold scratches dtd_s4: rc 0, 10.5 min
+10-09 15:25  seed 256 fold scratches cutmix_s4: rc 0, 10.3 min
+10-09 15:26  seed 256 fold breakage dtd_s4: rc 0, 11.6 min
+10-09 15:26  seed 11 plan: rc [0] in 0.1 min
+10-09 15:27  seed 11 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.5 min
+10-09 15:28  seed 11 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.1 min
+10-09 15:29  seed 11 check: rc [0] in 1.6 min
+10-09 15:29  seed 11: training 12 runs, 12 at a time
+10-09 15:39  seed 11 fold colour_diff dtd_s4: rc 0, 9.0 min
+10-09 15:39  seed 11 fold burnt dtd_s4: rc 0, 9.9 min
+10-09 15:40  seed 11 fold burnt cutmix_s4: rc 0, 9.8 min
+10-09 15:40  seed 11 fold colour_diff cutmix_s4: rc 0, 9.5 min
+10-09 15:41  seed 11 fold colour_same dtd_s4: rc 0, 9.6 min
+10-09 15:41  seed 11 fold colour_same cutmix_s4: rc 0, 9.7 min
+10-09 15:41  seed 11 fold breakage dtd_s4: rc 0, 11.0 min
+10-09 15:41  seed 11 fold holes dtd_s4: rc 0, 11.4 min
+10-09 15:41  seed 11 fold scratches dtd_s4: rc 0, 10.2 min
+10-09 15:42  seed 11 fold holes cutmix_s4: rc 0, 11.3 min
+10-09 15:42  seed 11 fold breakage cutmix_s4: rc 0, 11.2 min
+10-09 15:42  seed 11 fold scratches cutmix_s4: rc 0, 10.4 min
+10-09 15:42  seed 22 plan: rc [0] in 0.1 min
+10-09 15:42  seed 22 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.5 min
+10-09 15:44  seed 22 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.1 min
+10-09 15:45  seed 22 check: rc [0] in 1.6 min
+10-09 15:45  seed 22: training 12 runs, 12 at a time
+10-09 15:56  seed 22 fold colour_diff dtd_s4: rc 0, 9.7 min
+10-09 15:56  seed 22 fold burnt dtd_s4: rc 0, 10.2 min
+10-09 15:56  seed 22 fold colour_diff cutmix_s4: rc 0, 9.8 min
+10-09 15:56  seed 22 fold holes cutmix_s4: rc 0, 11.2 min
+10-09 15:57  seed 22 fold burnt cutmix_s4: rc 0, 10.4 min
+10-09 15:57  seed 22 fold breakage cutmix_s4: rc 0, 11.2 min
+10-09 15:57  seed 22 fold colour_same dtd_s4: rc 0, 10.0 min
+10-09 15:57  seed 22 fold holes dtd_s4: rc 0, 11.2 min
+10-09 15:57  seed 22 fold colour_same cutmix_s4: rc 0, 10.0 min
+10-09 15:57  seed 22 fold breakage dtd_s4: rc 0, 11.3 min
+10-09 15:58  seed 22 fold scratches dtd_s4: rc 0, 10.5 min
+10-09 15:58  seed 22 fold scratches cutmix_s4: rc 0, 10.4 min
+10-09 15:58  seed 33 plan: rc [0] in 0.1 min
+10-09 15:58  seed 33 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.4 min
+10-09 15:59  seed 33 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.2 min
+10-09 16:01  seed 33 check: rc [0] in 1.6 min
+10-09 16:01  seed 33: training 12 runs, 12 at a time
+10-09 16:12  seed 33 fold burnt dtd_s4: rc 0, 10.1 min
+10-09 16:12  seed 33 fold holes dtd_s4: rc 0, 10.9 min
+10-09 16:12  seed 33 fold burnt cutmix_s4: rc 0, 10.1 min
+10-09 16:12  seed 33 fold colour_diff dtd_s4: rc 0, 10.0 min
+10-09 16:13  seed 33 fold colour_diff cutmix_s4: rc 0, 10.1 min
+10-09 16:13  seed 33 fold colour_same dtd_s4: rc 0, 10.1 min
+10-09 16:13  seed 33 fold breakage dtd_s4: rc 0, 11.6 min
+10-09 16:13  seed 33 fold colour_same cutmix_s4: rc 0, 10.2 min
+10-09 16:13  seed 33 fold breakage cutmix_s4: rc 0, 11.3 min
+10-09 16:13  seed 33 fold holes cutmix_s4: rc 0, 11.7 min
+10-09 16:14  seed 33 fold scratches dtd_s4: rc 0, 10.7 min
+10-09 16:14  seed 33 fold scratches cutmix_s4: rc 0, 10.6 min
+10-09 16:14  seed 44 plan: rc [0] in 0.1 min
+10-09 16:15  seed 44 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 0.9 min
+10-09 16:16  seed 44 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.1 min
+10-09 16:18  seed 44 check: rc [0] in 1.6 min
+10-09 16:18  seed 44: training 12 runs, 12 at a time
+10-09 16:28  seed 44 fold burnt dtd_s4: rc 0, 9.9 min
+10-09 16:28  seed 44 fold burnt cutmix_s4: rc 0, 9.7 min
+10-09 16:29  seed 44 fold colour_diff dtd_s4: rc 0, 9.8 min
+10-09 16:29  seed 44 fold colour_diff cutmix_s4: rc 0, 9.7 min
+10-09 16:29  seed 44 fold colour_same dtd_s4: rc 0, 10.1 min
+10-09 16:29  seed 44 fold holes cutmix_s4: rc 0, 11.4 min
+10-09 16:30  seed 44 fold colour_same cutmix_s4: rc 0, 10.1 min
+10-09 16:30  seed 44 fold breakage dtd_s4: rc 0, 11.5 min
+10-09 16:30  seed 44 fold holes dtd_s4: rc 0, 12.2 min
+10-09 16:30  seed 44 fold scratches dtd_s4: rc 0, 10.5 min
+10-09 16:31  seed 44 fold scratches cutmix_s4: rc 0, 10.8 min
+10-09 16:31  seed 44 fold breakage cutmix_s4: rc 0, 12.4 min
+10-09 16:31  seed 55 plan: rc [0] in 0.1 min
+10-09 16:32  seed 55 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.0 min
+10-09 16:33  seed 55 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 1.2 min
+10-09 16:35  seed 55 check: rc [0] in 1.7 min
+10-09 16:35  seed 55: training 12 runs, 12 at a time
+10-09 16:45  seed 55 fold burnt dtd_s4: rc 0, 9.6 min
+10-09 16:46  seed 55 fold burnt cutmix_s4: rc 0, 9.9 min
+10-09 16:46  seed 55 fold colour_diff cutmix_s4: rc 0, 9.8 min
+10-09 16:46  seed 55 fold colour_same cutmix_s4: rc 0, 9.8 min
+10-09 16:46  seed 55 fold colour_diff dtd_s4: rc 0, 9.8 min
+10-09 16:47  seed 55 fold holes dtd_s4: rc 0, 11.4 min
+10-09 16:47  seed 55 fold colour_same dtd_s4: rc 0, 9.9 min
+10-09 16:47  seed 55 fold scratches cutmix_s4: rc 0, 10.8 min
+10-09 16:47  seed 55 fold breakage cutmix_s4: rc 0, 11.5 min
+10-09 16:47  seed 55 fold scratches dtd_s4: rc 0, 10.6 min
+10-09 16:48  seed 55 fold holes cutmix_s4: rc 0, 12.9 min
+10-09 16:48  seed 55 fold breakage dtd_s4: rc 0, 12.8 min
+10-09 16:48  === launch finished
+Fri Oct  9 16:48:54 CEST 2026 s4 dtd/cutmix run exited rc 0

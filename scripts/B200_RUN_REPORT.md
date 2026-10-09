@@ -161,3 +161,35 @@ generate ~105 min, refine ~7 min, dtd + cutmix ~3 min, 96 trainings ~115 min (8 
 
 **Totals now:** 10 seeds x 6 folds x 16 arms = 960 runs in `b200_results/open_set_v2/` (TABLES.md, per_epoch_aurocs.csv,
 results_json.tar.xz, lists.tar.xz). The M1-vs-rest backbone / mode confound from section 5.1 still applies.
+
+## 9. Addendum 2026-10-09: DTD and CutMix at stage 4 (120 runs)
+
+Order: `scripts/B200_HANDOFF.md`, section "ORDER 2026-10-09". Code: commit e34faa3 (Windows side; ARMS += dtd 4,
+cutmix 4; stage_dtd / stage_cutmix also process the s4 sets). **No code change on the server.**
+
+Machine: one whole B200 (UCloud job j-12417651), same venv as sections 7-8 (anomalib 2.2.0).
+Command (`os_s4.sh`): OMP_NUM_THREADS=4, MKL_NUM_THREADS=4, NVIDIA MPS, then
+```
+OPEN_SET_ACCEPT_EXISTING=1 python scripts/open_set_launch.py --profile b200 --seeds 42 123 7 99 256 11 22 33 44 55 \
+ --arms dtd_s4 cutmix_s4 --train-slots 12 --stagger 10 --stages plan dtd cutmix check train tables >> launch_s4_dtd_cutmix.out 2>&1
+```
+`--train-slots 12 --stagger 10` are process settings (12 trainings in parallel; 12 new runs per seed).
+The launcher was started 14:05 with the default 8 slots and restarted 14:08 with 12, before any training had
+started (seed 42 plan / dtd / cutmix had finished; existing images are skipped).
+
+Manifests: the 10 `results/open_set_v2/manifest/seed_*.json` were NOT rebuilt (`stage_plan` only writes a missing
+manifest); md5 checked unchanged after the plan stage; all 10 archived in `b200_results/open_set_v2/manifest.tar.xz`
+(commit ac67f71). Preps were reused (plan skips existing meta.json).
+
+Result: 120 new runs (dtd_s4, cutmix_s4 x 6 folds x 10 seeds), all 20 epochs; `TABLES.md` rows:
+```
+| DTD | 4 | 60 | 0.832 ± 0.122 | 0.923 ± 0.102 | 0.829 ± 0.123 | 0.784 ± 0.094 | +0.056 | 40 of 60 |
+| CutMix | 4 | 60 | 0.804 ± 0.142 | 0.891 ± 0.111 | 0.804 ± 0.149 | 0.734 ± 0.150 | +0.028 | 36 of 60 |
+| DTD | 4 | 0.907 | 0.929 | 0.856 | 0.962 | 0.668 | 0.668 |
+| CutMix | 4 | 0.923 | 0.922 | 0.801 | 0.936 | 0.584 | 0.656 |
+```
+Failed stages / runs on 10-09: none
+
+`b200_results/open_set_v2/results_json.tar.xz` now holds all 1,080 results.json; TABLES.md, per_epoch_aurocs.csv,
+lists.tar.xz, launch.log and launch_s4_dtd_cutmix.out updated. Not verified: that the s4 DTD / CutMix images are
+byte-identical to what a Windows run would make (only file counts / run lists were checked by the launcher).
