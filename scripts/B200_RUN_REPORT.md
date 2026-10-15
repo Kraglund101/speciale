@@ -251,3 +251,26 @@ Note (section 13): the image paths are stored under the key **`files`** (plus `f
 commit a696235, which was pushed while these runs were training. The server version of `score_runner.py` (the one that
 produced the 300 dumps) is kept in this commit. Checked after the run: all 64,800 entries of the 300 `image_scores.json`
 have `files`, 0 mismatches (count and labels agree with the shuffle=False test dataset).
+
+## 10. Mode 3 repeat (ORDER 2026-10-15)
+
+All 17 synthetic arms x 6 folds x 10 seeds = 1,020 runs with `--hero mode3` (`--modes 3 --lkd-mode local --backbone
+convnext_b`, code 8bbde60 from the Windows side; no server-side code change), results in `results/open_set_v2/runs_mode3/`.
+Same run lists / images / seeds as the CAAO runs; no generation, no manifest rebuild (10 manifests byte-identical to
+the 2026-10-09 backup). Runner sha256 0110be259b605cc049748a09fb2d3891aaeff5d056d07dd3d2d7a4e2b9079fa0 (= Windows copy), anomalib 2.2.0, torch 2.7.1+cu128, whole B200.
+Process settings as section 9 (OMP/MKL 4 threads, MPS, 12 trainings in parallel, stagger 10 s).
+
+Stop-gradient: Mode 3 uses UniNetLossControllable; it never reads `no_detach_any`, and with the default (no
+`--stop-gradient`) the KD target is not detached (`tf_n_kd = tf_n`) - i.e. no detaching; the frozen source teacher runs
+under no_grad in Mode 3 and Mode 4 alike. Checked in the runner source, not by a gradient test.
+
+Bootstrap: commit bca9fe9 had mode3 with --backbone wrn50; a 2-epoch smoke test with it was killed and deleted before
+finishing; after 8bbde60 the smoke test (seed 42, fold holes, cutmix_s1 + diffusion_in_s1, 2 epochs) passed and was
+deleted before the full run.
+
+Result: 1,020 runs, all 20 epochs, results key "Mode 3 ...". Failed stages / runs: none
+
+Packed: `b200_results/open_set_v2/results_json_mode3.tar.xz` (1,020 results.json), `launch_mode3.out`,
+`launch_mode3_lines.log`. `open_set_tables.py` reads `runs/` only, so no Mode 3 table was made here.
+The automatic push (finish_mode3.sh) failed at 22:01: a script edit had dropped the line that copies `launch_mode3.out`,
+so `git add` failed and nothing was committed. Verification had passed; the files were committed and pushed by hand.
