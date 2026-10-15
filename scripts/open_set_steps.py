@@ -73,6 +73,11 @@ ONLY_SETS = tuple(x for x in os.environ.get("OPEN_SET_SETS", "s2,s3,s4").split("
 # runs_mode3/ (never mixed with the caao runs in runs/). m1 always uses --hero m1.
 HERO = os.environ.get("OPEN_SET_HERO", "caao")
 RUNS_SUB = "runs" if HERO == "caao" else f"runs_{HERO}"
+# OPEN_SET_TRAIN_EPOCHS=n (2026-10-15, e.g. 50): train n epochs instead of E; runs go to <RUNS_SUB>_e<n>/ so the 20-epoch runs
+# are never touched. The 20 per-epoch synthetic pools are cycled by the runner (EpochPoolSampler: pool epoch % 20).
+TRAIN_EPOCHS = int(os.environ.get("OPEN_SET_TRAIN_EPOCHS", E))
+if TRAIN_EPOCHS != E:
+    RUNS_SUB += f"_e{TRAIN_EPOCHS}"
 
 
 def rebase(p) -> str:
@@ -461,6 +466,8 @@ def command(s: int, fold: str, method: str, step: int, extra: list[str]) -> list
     cmd += ["--baseline-extra-list", str(r["m1_extra"])] if method == "m1" else ["--synthetic-epochs", str(r["epochs"])]
     if EPOCH_LIMIT < E:
         cmd += ["--epochs", str(EPOCH_LIMIT)]
+    elif TRAIN_EPOCHS != E:
+        cmd += ["--epochs", str(TRAIN_EPOCHS)]
     return cmd + extra
 
 

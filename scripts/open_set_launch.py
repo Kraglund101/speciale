@@ -93,6 +93,8 @@ def main() -> None:
     ap.add_argument("--keep-checkpoints", action="store_true")
     ap.add_argument("--hero", choices=["caao", "mode3"], default="caao",
                     help="UniNet setting for the synthetic arms; mode3 -> runs_mode3/, m1 is not re-run, no tables stage")
+    ap.add_argument("--train-epochs", type=int, default=20,
+                    help="epochs per training (default 20); other values write to runs[_<hero>]_e<n>/ and skip the tables stage")
     ap.add_argument("--cpu-procs", type=int, default=12, help="parallel processes for the CPU stages dtd / cutmix (outputs identical)")
     ap.add_argument("--sets", default=None, help="only these image sets, e.g. s2 (stages 1-2) or s2,s3")
     ap.add_argument("--gpus", type=int, default=0, help="number of GPUs (default 0 = detect with nvidia-smi: slices of a split GPU "
@@ -115,9 +117,12 @@ def main() -> None:
     if a.sets:
         env["OPEN_SET_SETS"] = a.sets
     env["OPEN_SET_HERO"] = a.hero
+    if a.train_epochs != 20:
+        env["OPEN_SET_TRAIN_EPOCHS"] = str(a.train_epochs); epochs = a.train_epochs
+        a.stages = [x for x in a.stages if x != "tables"]               # open_set_tables.py reads runs/ (20-epoch) only
     if a.smoke:
         a.seeds, a.folds, epochs = [42], a.folds or ["holes"], 2; env["OPEN_SET_EPOCH_LIMIT"] = "2"
-    os.environ.update({k: v for k, v in env.items() if k in ("OPEN_SET_EPOCH_LIMIT", "OPEN_SET_SETS", "OPEN_SET_HERO")})
+    os.environ.update({k: v for k, v in env.items() if k in ("OPEN_SET_EPOCH_LIMIT", "OPEN_SET_SETS", "OPEN_SET_HERO", "OPEN_SET_TRAIN_EPOCHS")})
     sys.path.insert(0, str(ROOT / "scripts"))
     import open_set_steps as S                                             # after the env var is set
     folds = a.folds or S.CLASSES; fargs = ["--folds", *folds] if a.folds else []
@@ -148,12 +153,12 @@ def main() -> None:
                     cmd = S.command(s, k, m, stp, []); time.sleep(stagger)
                 g = free_gpus.get()
                 try:
-                    t0 = time.time(); rc = run(cmd, L / f"train_{name}{'' if a.hero == 'caao' else '_' + a.hero}_seed{s}_{k}.log", gpu_env(g))
+                    t0 = time.time(); rc = run(cmd, L / f"train_{name}{'' if a.hero == 'caao' else '_' + a.hero}{'' if epochs == 20 or a.smoke else f'_e{epochs}'}_seed{s}_{k}.log", gpu_env(g))
                 finally:
                     free_gpus.put(g)
                 if not a.keep_checkpoints:
                     shutil.rmtree(out / "checkpoints", ignore_errors=True)
-                log(f"seed {s} fold {k} {name} [{a.hero}]: rc {rc}, {(time.time() - t0) / 60:.1f} min")
+                log(f"seed {s} fold {k} {name} [{a.hero}{'' if epochs == 20 else f' e{epochs}'}]: rc {rc}, {(time.time() - t0) / 60:.1f} min")
 
             log(f"seed {s}: training {len(jobs)} runs, {slots} at a time")
             with ThreadPoolExecutor(slots) as ex:
