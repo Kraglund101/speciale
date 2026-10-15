@@ -247,3 +247,45 @@ nohup python scripts/open_set_mix.py run --seeds 42 123 7 99 256 11 22 33 44 55 
 into `b200_results/open_set_v2/results_json_mix_s6.tar.xz`, copy `launch_mix_s6.out` and the `[mix_s6]` lines of
 `launch.log` into `b200_results/open_set_v2/`, add a section "11. Mix-synthetic (configuration 6)" to
 `scripts/B200_RUN_REPORT.md`, commit on `b200-open-set` and **push**.
+
+## ORDER 2026-10-15 (3): per-image score dump, seed 42, configuration 1 (30 runs)
+
+**What.** Score histograms (normals vs anomalies, 0x and 1-4x) for Normal-only, CutMix, DTD, Target-object, Cross-object,
+configuration 1, seed 42, all 6 held-out folds. results.json has no per-image scores and the checkpoints were deleted,
+so these 30 runs are re-trained. `scripts/open_set_scores.py` uses EXACTLY the launcher's command
+(`open_set_steps.command(42, fold, method, 1)`: same lists, hero, seed, flags); only the runner is
+`scripts/score_runner.py`, which imports run_uninet_cashew.py unchanged and re-compiles its `evaluate()` with one
+added line that records labels + image scores (metrics unchanged). Output: `results/open_set_v2/score_dist_c1/<arm>/
+seed_42/fold_<k>/{results.json,image_scores.json,stdout.log}`; checkpoints are deleted. **No generation, no manifest
+rebuild, nothing in runs/ is touched.** Verified on Windows with a fake training loop (records epoch + main/0x..4x
+correctly) and the histogram script on fake data; NOT trained on Windows (GPU busy).
+
+```bash
+git pull                                                   # branch b200-open-set
+ls results/open_set_v2/manifest | wc -l                    # must be 10; STOP if not (do NOT rebuild manifests)
+# smoke test: 2 epochs, one run
+python scripts/open_set_scores.py --seeds 42 --folds holes --methods dtd --epochs 2 --sub smoke --slots 1 --stagger 0
+python - <<'PY'
+import json; d = "results/open_set_v2/score_dist_c1/smoke/dtd_s1/seed_42/fold_holes/"
+L = json.load(open(d + "image_scores.json")); print(len(L), sorted({(x["epoch"], x["shift"]) for x in L}))
+PY
+grep -m1 "EpochPoolSampler" results/open_set_v2/score_dist_c1/smoke/dtd_s1/seed_42/fold_holes/stdout.log
+rm -rf results/open_set_v2/score_dist_c1/smoke
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4                 # + MPS as in section 8 if used before
+nohup python scripts/open_set_scores.py --seeds 42 --slots 12 --stagger 10 > launch_scores_c1.out 2>&1 &
+# when all 30 print "scores ok":
+python scripts/open_set_score_hist.py --seeds 42         # -> results/open_set_v2/figures/score_hist_c1/seed_42_<type>.png
+```
+- Smoke test must list epochs 0 and 1, each with "main", "0x", "1x", "2x", "3x", "4x" (other entries with epoch None
+  from post-training evaluation are fine), and stdout.log must show the EpochPoolSampler line. If the runner's
+  `evaluate()` changed, score_runner stops with "anchor line not found once": STOP and report, do not edit around it.
+- `open_set_score_hist.py` asserts that the AUROC recomputed from the dumped scores equals results.json at every level;
+  an AssertionError -> STOP and report.
+- Reproduction check (report it): for each of the 30 runs, best-0x AUROC here vs the existing
+  `runs/<arm>/seed_42/fold_<k>/results.json` (same seed; small differences = GPU nondeterminism).
+- If the Mode 3 or mix-synthetic orders run at the same time, lower `--slots` so the GPU is not oversubscribed.
+
+**When finished:** pack `score_dist_c1/*/seed_42/fold_*/{results.json,image_scores.json}` into
+`b200_results/open_set_v2/score_dist_c1.tar.xz`, copy the 6 PNGs to `b200_results/open_set_v2/figures/score_hist_c1/`,
+add a section "13. Score dump seed 42, configuration 1" to `scripts/B200_RUN_REPORT.md` (incl. the reproduction
+check table), commit on `b200-open-set` and **push**.
