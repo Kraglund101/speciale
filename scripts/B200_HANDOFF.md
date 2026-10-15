@@ -164,14 +164,14 @@ any code change), commit on `b200-open-set` and **push**. Frederik will pull on 
 ## ORDER 2026-10-15: repeat EVERY synthetic arm with UniNet Mode 3 (1,020 runs)
 
 **What.** Frederik wants the whole open-set experiment repeated with **Mode 3** of the runner ("Mode 3 - Supervised
-(synthetic)": original UniNet loss with the synthetic masks + its BCE head, WRN-50-2 teacher/student, no canvas
-alignment, no projection consistency) instead of the CAAO hero (Mode 4). This is a new, ordered setting - the "do not
+(synthetic)": original UniNet loss with the synthetic masks + its BCE head, ConvNeXt-B backbone as in the CAAO runs,
+no canvas alignment, no projection consistency) instead of the CAAO hero (Mode 4). This is a new, ordered setting - the "do not
 change the model settings" rule above still holds for everything else. All 17 synthetic arms (`dtd/cutmix/diffusion_in/
 diffusion_cross` x stages 1-4 + `diffusion_cross_s5`) x 6 folds x 10 seeds = **1,020 runs**. `m1` is NOT re-run (it has
 no synthetics; it is Mode 1 already) - the launcher drops it automatically with `--hero mode3`.
 
 **Code (pushed on `b200-open-set`, no server-side change needed):**
-- `scripts/train_uninet.py`: new hero `mode3` = `--modes 3 --lkd-mode local --backbone wrn50` (same shared flags as `m1`).
+- `scripts/train_uninet.py`: new hero `mode3` = `--modes 3 --lkd-mode local --backbone convnext_b` (backbone as `caao`; the runner swaps WRN-50-2 to ConvNeXt for every mode). The smoke-test log must contain "ConvNeXt decoder upsample mode" (printed only with --backbone convnext_b).
 - `scripts/open_set_launch.py --hero mode3` (sets `OPEN_SET_HERO=mode3` for `open_set_steps.py`): synthetic arms train
   with `--hero mode3`; runs go to **`results/open_set_v2/runs_mode3/<arm>/seed_<s>/fold_<k>/`** (the CAAO runs in
   `runs/` are never touched); train logs `logs/train_<arm>_mode3_seed<s>_<k>.log`; the `tables` stage is skipped
@@ -192,6 +192,7 @@ ls results/open_set_v2/manifest | wc -l                    # 10
 python scripts/open_set_launch.py --profile b200 --smoke --hero mode3 --arms cutmix_s1 diffusion_in_s1 --stages train
 grep -m1 "Mode 3" results/open_set_v2/logs/train_cutmix_s1_mode3_seed42_holes.log      # must show the Mode 3 run
 grep "EpochPoolSampler" results/open_set_v2/logs/train_cutmix_s1_mode3_seed42_holes.log # per-epoch synthetic pools in use
+grep -m1 "ConvNeXt decoder upsample mode" results/open_set_v2/logs/train_cutmix_s1_mode3_seed42_holes.log  # ConvNeXt-B, not WRN-50-2
 python -c "import json;r=json.load(open('results/open_set_v2/runs_mode3/cutmix_s1/seed_42/fold_holes/results.json'));print([k for k in r if ' @ ' not in k])"
 rm -rf results/open_set_v2/runs_mode3                       # smoke runs are 2-epoch; remove before the full run
 ```
