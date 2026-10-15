@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Drop-in for run_uninet_cashew.py: identical training, plus <output-dir>/image_scores.json = the per-image score and
-label of every evaluate() call (epoch, test set: "main" or the shift level 0x..4x, aggregation). evaluate() is
+label (+ image path) of every evaluate() call (epoch, test set: "main" or the shift level 0x..4x, aggregation). evaluate() is
 re-compiled from its own source with ONE added line after the image-AUROC line, so every metric stays as it is.
 Used through train_uninet.py with train_uninet.RUNNER pointed here (scripts/open_set_scores.py)."""
 import inspect
@@ -23,7 +23,10 @@ def _score_log(agg: str, labels, scores) -> None:
         fr = fr.f_back
     f = fr.f_locals if fr is not None else {}
     names = {id(v): k for k, v in f.get("shift_loaders", {}).items()}; names[id(f.get("test_loader"))] = "main"
-    LOG.append({"epoch": f.get("epoch"), "shift": names.get(id(dl), "?"), "agg": agg,
+    smp = getattr(getattr(dl, "dataset", None), "samples", None)  # CashewDataset: (img, mask, label, canvas); test loaders are not shuffled
+    imgs = [str(x[0]) for x in smp] if smp is not None else None
+    assert imgs is None or (len(imgs) == len(labels) and [int(x[2]) for x in smp] == [int(x) for x in labels]), "image order"
+    LOG.append({"epoch": f.get("epoch"), "shift": names.get(id(dl), "?"), "agg": agg, "images": imgs,
                 "labels": [int(x) for x in labels], "scores": [float(x) for x in scores]})
 
 
