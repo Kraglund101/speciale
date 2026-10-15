@@ -193,3 +193,19 @@ Failed stages / runs on 10-09: none
 `b200_results/open_set_v2/results_json.tar.xz` now holds all 1,080 results.json; TABLES.md, per_epoch_aurocs.csv,
 lists.tar.xz, launch.log and launch_s4_dtd_cutmix.out updated. Not verified: that the s4 DTD / CutMix images are
 byte-identical to what a Windows run would make (only file counts / run lists were checked by the launcher).
+
+## 12. Mix-synthetic (configuration 6), 50 epochs (order 2026-10-15 (2))
+
+60 runs (10 seeds x 6 folds), `scripts/open_set_mix.py` (Windows commit 620829d) with three server changes (this commit):
+(1) `build` does not call `run_lists` (it rewrote the shared train/test/epoch lists that the Mode 3 job on another UCloud
+job was reading); it reads the existing configuration-1 lists and asserts each equals `fold_epochs()` computed in memory
+(all 240 equal; shared list md5 unchanged); (2) runs go to `results/open_set_v2/runs_mix_synthetic_s6_e50/` (`runs/` is
+read-only); (3) `--epochs 50` (user decision): the 20-epoch mix lists are kept and the runner cycles the pools
+(epoch % 20); since 20 % 4 == 0 the rotation METHODS[(j + e) % 4] continues: per slot each method 12-13 of 50 epochs,
+562-563 slot-epochs per method per run. CAAO (Mode 4), no photometric, same train normals / test / seeds as the other arms.
+Machine: separate whole B200 (UCloud job j-12422456), anomalib 2.2.0, OMP/MKL 4 threads, MPS, 12 runs in
+parallel. Smoke test (seed 42 fold holes, 2 epochs, scratch dir) passed (EpochPoolSampler 20 pools) and was deleted.
+
+Result: 60 runs, all 50 epochs. Failed runs: none. Packed: `results_json_mix_s6_e50.tar.xz` (60 results.json +
+60 epochs_mix_s6.json), `launch_mix_s6.out`, `launch_mix_s6_lines.log`. No table here (50 epochs; compare with the
+50-epoch CAAO runs of section 11 for seeds 42/123/7, or with the 20-epoch table only with that caveat).

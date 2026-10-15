@@ -1,0 +1,82 @@
+10-15 10:14  [mix_s6] seed 42: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:14  [mix_s6] seed 123: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:14  [mix_s6] seed 7: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:14  [mix_s6] seed 99: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:14  [mix_s6] seed 256: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:14  [mix_s6] seed 11: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:14  [mix_s6] seed 22: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:14  [mix_s6] seed 33: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:14  [mix_s6] seed 44: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:14  [mix_s6] seed 55: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:17  [mix_s6] seed 42: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:18  [mix_s6] seed 123: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:18  [mix_s6] seed 7: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:18  [mix_s6] seed 99: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:18  [mix_s6] seed 256: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:18  [mix_s6] seed 11: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:18  [mix_s6] seed 22: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:18  [mix_s6] seed 33: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:18  [mix_s6] seed 44: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:18  [mix_s6] seed 55: mix lists built + checked (base configuration 1, folds ['holes', 'breakage', 'burnt', 'colour_diff', 'colour_same', 'scratches'])
+10-15 10:18  [mix_s6] training 60 runs, 12 at a time, 50 epochs -> /work/Jobs/data/other/speciale/results/open_set_v2/runs_mix_synthetic_s6_e50
+10-15 10:40  [mix_s6] seed 42 fold colour_diff: rc 0, 21.9 min
+10-15 10:41  [mix_s6] seed 42 fold burnt: rc 0, 22.4 min
+10-15 10:41  [mix_s6] seed 42 fold colour_same: rc 0, 22.6 min
+10-15 10:42  [mix_s6] seed 123 fold colour_diff: rc 0, 22.3 min
+10-15 10:42  [mix_s6] seed 123 fold burnt: rc 0, 22.8 min
+10-15 10:42  [mix_s6] seed 123 fold colour_same: rc 0, 22.8 min
+10-15 10:43  [mix_s6] seed 42 fold scratches: rc 0, 24.2 min
+10-15 10:44  [mix_s6] seed 123 fold scratches: rc 0, 24.0 min
+10-15 10:45  [mix_s6] seed 42 fold breakage: rc 0, 26.6 min
+10-15 10:45  [mix_s6] seed 42 fold holes: rc 0, 26.9 min
+10-15 10:45  [mix_s6] seed 123 fold holes: rc 0, 26.3 min
+10-15 10:46  [mix_s6] seed 123 fold breakage: rc 0, 26.7 min
+10-15 11:03  [mix_s6] seed 7 fold burnt: rc 0, 21.9 min
+10-15 11:03  [mix_s6] seed 7 fold colour_diff: rc 0, 21.5 min
+10-15 11:04  [mix_s6] seed 7 fold colour_same: rc 0, 22.2 min
+10-15 11:06  [mix_s6] seed 7 fold holes: rc 0, 25.9 min
+10-15 11:07  [mix_s6] seed 7 fold breakage: rc 0, 26.1 min
+10-15 11:07  [mix_s6] seed 7 fold scratches: rc 0, 24.4 min
+10-15 11:07  [mix_s6] seed 99 fold colour_diff: rc 0, 22.0 min
+10-15 11:07  [mix_s6] seed 99 fold burnt: rc 0, 22.3 min
+10-15 11:08  [mix_s6] seed 99 fold colour_same: rc 0, 22.4 min
+10-15 11:09  [mix_s6] seed 99 fold holes: rc 0, 25.7 min
+10-15 11:09  [mix_s6] seed 99 fold breakage: rc 0, 25.3 min
+10-15 11:10  [mix_s6] seed 99 fold scratches: rc 0, 24.0 min
+10-15 11:26  [mix_s6] seed 256 fold burnt: rc 0, 21.5 min
+10-15 11:28  [mix_s6] seed 256 fold colour_diff: rc 0, 21.3 min
+10-15 11:29  [mix_s6] seed 256 fold colour_same: rc 0, 22.0 min
+10-15 11:29  [mix_s6] seed 256 fold breakage: rc 0, 25.8 min
+10-15 11:29  [mix_s6] seed 256 fold holes: rc 0, 26.2 min
+10-15 11:30  [mix_s6] seed 11 fold burnt: rc 0, 22.1 min
+10-15 11:31  [mix_s6] seed 11 fold colour_diff: rc 0, 21.7 min
+10-15 11:31  [mix_s6] seed 256 fold scratches: rc 0, 23.9 min
+10-15 11:31  [mix_s6] seed 11 fold colour_same: rc 0, 22.0 min
+10-15 11:34  [mix_s6] seed 11 fold holes: rc 0, 26.5 min
+10-15 11:34  [mix_s6] seed 11 fold scratches: rc 0, 23.9 min
+10-15 11:34  [mix_s6] seed 11 fold breakage: rc 0, 26.6 min
+10-15 11:51  [mix_s6] seed 22 fold burnt: rc 0, 21.6 min
+10-15 11:51  [mix_s6] seed 22 fold colour_diff: rc 0, 21.4 min
+10-15 11:52  [mix_s6] seed 22 fold colour_same: rc 0, 21.9 min
+10-15 11:52  [mix_s6] seed 22 fold holes: rc 0, 26.3 min
+10-15 11:53  [mix_s6] seed 33 fold burnt: rc 0, 21.8 min
+10-15 11:54  [mix_s6] seed 22 fold breakage: rc 0, 25.7 min
+10-15 11:54  [mix_s6] seed 22 fold scratches: rc 0, 24.0 min
+10-15 11:55  [mix_s6] seed 33 fold colour_diff: rc 0, 21.4 min
+10-15 11:56  [mix_s6] seed 33 fold colour_same: rc 0, 21.8 min
+10-15 11:57  [mix_s6] seed 33 fold holes: rc 0, 25.7 min
+10-15 11:58  [mix_s6] seed 33 fold breakage: rc 0, 26.4 min
+10-15 11:58  [mix_s6] seed 33 fold scratches: rc 0, 23.8 min
+10-15 12:13  [mix_s6] seed 44 fold burnt: rc 0, 21.5 min
+10-15 12:14  [mix_s6] seed 44 fold colour_diff: rc 0, 21.4 min
+10-15 12:16  [mix_s6] seed 44 fold colour_same: rc 0, 22.4 min
+10-15 12:17  [mix_s6] seed 44 fold holes: rc 0, 25.8 min
+10-15 12:17  [mix_s6] seed 44 fold breakage: rc 0, 25.7 min
+10-15 12:17  [mix_s6] seed 44 fold scratches: rc 0, 23.6 min
+10-15 12:18  [mix_s6] seed 55 fold burnt: rc 0, 21.5 min
+10-15 12:18  [mix_s6] seed 55 fold colour_diff: rc 0, 21.0 min
+10-15 12:19  [mix_s6] seed 55 fold colour_same: rc 0, 20.9 min
+10-15 12:19  [mix_s6] seed 55 fold holes: rc 0, 24.7 min
+10-15 12:20  [mix_s6] seed 55 fold breakage: rc 0, 24.4 min
+10-15 12:20  [mix_s6] seed 55 fold scratches: rc 0, 21.9 min
+10-15 12:20  [mix_s6] all runs finished
