@@ -37,6 +37,12 @@ HEROES = {
         "desc": "Mode 1 — normal-only baseline (WRN-50-2, local KD)",
         "flags": ["--modes", "1", "--lkd-mode", "local", "--backbone", "wrn50"],
     },
+    # Mode 3 = original UniNet supervised loss on the synthetics (masks + BCE head), WRN-50-2 (hard-coded in the runner
+    # for modes 1-3); same shared flags as m1. Open-set repeat of every synthetic arm (2026-10-15, OPEN_SET_HERO=mode3).
+    "mode3": {
+        "desc": "Mode 3 — supervised UniNet on synthetic anomalies (WRN-50-2, local KD, BCE head)",
+        "flags": ["--modes", "3", "--lkd-mode", "local", "--backbone", "wrn50"],
+    },
     # CAAO hero = thesis Table 16 (final_thesis.pdf p.141) and Table 13 / §6.7: lambda_cons 0.20, NO SG, local, w_canvas 1.
     # Thesis SG modes (§6.7 p.136): partial = SG only on the canvas target + the consistency target = the runner's
     # DEFAULT; full = --stop-gradient; no = --no-detach-any. The Table 16 CAAO row is the server run

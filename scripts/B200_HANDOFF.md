@@ -160,3 +160,52 @@ OPEN_SET_ACCEPT_EXISTING=1 nohup python scripts/open_set_launch.py --profile b20
 (the 960 old + 120 new `runs/<arm>/seed_<s>/fold_<k>/results.json`), copy the new TABLES.md and launch log into
 `b200_results/open_set_v2/`, add a section 9 to `scripts/B200_RUN_REPORT.md` (what ran, failures with the log line,
 any code change), commit on `b200-open-set` and **push**. Frederik will pull on the Windows side.
+
+## ORDER 2026-10-15: repeat EVERY synthetic arm with UniNet Mode 3 (1,020 runs)
+
+**What.** Frederik wants the whole open-set experiment repeated with **Mode 3** of the runner ("Mode 3 - Supervised
+(synthetic)": original UniNet loss with the synthetic masks + its BCE head, WRN-50-2 teacher/student, no canvas
+alignment, no projection consistency) instead of the CAAO hero (Mode 4). This is a new, ordered setting - the "do not
+change the model settings" rule above still holds for everything else. All 17 synthetic arms (`dtd/cutmix/diffusion_in/
+diffusion_cross` x stages 1-4 + `diffusion_cross_s5`) x 6 folds x 10 seeds = **1,020 runs**. `m1` is NOT re-run (it has
+no synthetics; it is Mode 1 already) - the launcher drops it automatically with `--hero mode3`.
+
+**Code (pushed on `b200-open-set`, no server-side change needed):**
+- `scripts/train_uninet.py`: new hero `mode3` = `--modes 3 --lkd-mode local --backbone wrn50` (same shared flags as `m1`).
+- `scripts/open_set_launch.py --hero mode3` (sets `OPEN_SET_HERO=mode3` for `open_set_steps.py`): synthetic arms train
+  with `--hero mode3`; runs go to **`results/open_set_v2/runs_mode3/<arm>/seed_<s>/fold_<k>/`** (the CAAO runs in
+  `runs/` are never touched); train logs `logs/train_<arm>_mode3_seed<s>_<k>.log`; the `tables` stage is skipped
+  (`open_set_tables.py` reads `runs/` only).
+- Same run lists, same synthetic images, same seeds as the CAAO runs: **NO generation, NO manifest rebuild.**
+
+**Before starting, check (STOP and tell Frederik if any fails):**
+```bash
+git pull                                                   # branch b200-open-set
+python -c "import anomalib; print(anomalib.__version__)"   # must be 2.2.0 (Mode 3 uses anomalib's UniNetModel like m1)
+sha256sum anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/experiment_UniNet/temp_uninet_experiment/run_uninet_cashew.py
+#   Windows copy: 0110be259b605cc049748a09fb2d3891aaeff5d056d07dd3d2d7a4e2b9079fa0  (report the server hash if it differs; do not edit the runner)
+ls results/open_set_v2/manifest | wc -l                    # 10
+```
+
+**Smoke test (2 epochs, seed 42, fold holes, two arms), then delete its output:**
+```bash
+python scripts/open_set_launch.py --profile b200 --smoke --hero mode3 --arms cutmix_s1 diffusion_in_s1 --stages train
+grep -m1 "Mode 3" results/open_set_v2/logs/train_cutmix_s1_mode3_seed42_holes.log      # must show the Mode 3 run
+grep "EpochPoolSampler" results/open_set_v2/logs/train_cutmix_s1_mode3_seed42_holes.log # per-epoch synthetic pools in use
+python -c "import json;r=json.load(open('results/open_set_v2/runs_mode3/cutmix_s1/seed_42/fold_holes/results.json'));print([k for k in r if ' @ ' not in k])"
+rm -rf results/open_set_v2/runs_mode3                       # smoke runs are 2-epoch; remove before the full run
+```
+`results.json` must have a key starting with "Mode 3". If the smoke test crashes, STOP and report the traceback.
+
+**Full run** (same process settings as section 9 of `B200_RUN_REPORT.md`):
+```bash
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4                 # + MPS as in section 8 if used before
+OPEN_SET_ACCEPT_EXISTING=1 nohup python scripts/open_set_launch.py --profile b200 --hero mode3 \
+    --seeds 42 123 7 99 256 11 22 33 44 55 --train-slots 12 --stagger 10 --stages check train > launch_mode3.out 2>&1 &
+```
+`check` must report 0 missing files per seed (it only reads). `train` skips finished 20-epoch runs, so a restart resumes.
+
+**When finished:** pack all `runs_mode3/<arm>/seed_<s>/fold_<k>/results.json` (1,020) into
+`b200_results/open_set_v2/results_json_mode3.tar.xz`, copy `launch_mode3.out` and the mode3 lines of `launch.log` into
+`b200_results/open_set_v2/`, add a section "10. Mode 3 repeat" to `scripts/B200_RUN_REPORT.md` (what ran, runner hash,
+anomalib version, failures with the log line, any code change), commit on `b200-open-set` and **push**.

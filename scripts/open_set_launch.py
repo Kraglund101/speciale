@@ -91,6 +91,8 @@ def main() -> None:
     ap.add_argument("--gen-procs", type=int); ap.add_argument("--train-slots", type=int); ap.add_argument("--stagger", type=int)
     ap.add_argument("--smoke", action="store_true", help="2 epochs, seed 42, fold holes: end-to-end check")
     ap.add_argument("--keep-checkpoints", action="store_true")
+    ap.add_argument("--hero", choices=["caao", "mode3"], default="caao",
+                    help="UniNet setting for the synthetic arms; mode3 -> runs_mode3/, m1 is not re-run, no tables stage")
     ap.add_argument("--cpu-procs", type=int, default=12, help="parallel processes for the CPU stages dtd / cutmix (outputs identical)")
     ap.add_argument("--sets", default=None, help="only these image sets, e.g. s2 (stages 1-2) or s2,s3")
     ap.add_argument("--gpus", type=int, default=0, help="number of GPUs (default 0 = detect with nvidia-smi: slices of a split GPU "
@@ -112,15 +114,18 @@ def main() -> None:
     env = dict(os.environ, PYTHONIOENCODING="utf-8"); epochs = 20
     if a.sets:
         env["OPEN_SET_SETS"] = a.sets
+    env["OPEN_SET_HERO"] = a.hero
     if a.smoke:
         a.seeds, a.folds, epochs = [42], a.folds or ["holes"], 2; env["OPEN_SET_EPOCH_LIMIT"] = "2"
-    os.environ.update({k: v for k, v in env.items() if k in ("OPEN_SET_EPOCH_LIMIT", "OPEN_SET_SETS")})
+    os.environ.update({k: v for k, v in env.items() if k in ("OPEN_SET_EPOCH_LIMIT", "OPEN_SET_SETS", "OPEN_SET_HERO")})
     sys.path.insert(0, str(ROOT / "scripts"))
     import open_set_steps as S                                             # after the env var is set
     folds = a.folds or S.CLASSES; fargs = ["--folds", *folds] if a.folds else []
-    arms = [(m, st) for m, st in S.ARMS if a.arms is None or S.run_name(m, st) in a.arms]
+    arms = [(m, st) for m, st in S.ARMS if (a.arms is None or S.run_name(m, st) in a.arms) and not (a.hero != "caao" and m == "m1")]
+    if a.hero != "caao":
+        a.stages = [x for x in a.stages if x != "tables"]           # open_set_tables.py reads runs/ (caao) only
     py = [sys.executable, "-u", STEPS]; L = OUT / "logs"
-    log(f"=== launch profile {a.profile}{' SMOKE' if a.smoke else ''}: seeds {a.seeds}, folds {folds}, {len(arms)} arms, stages {a.stages}, "
+    log(f"=== launch profile {a.profile} hero {a.hero}{' SMOKE' if a.smoke else ''}: seeds {a.seeds}, folds {folds}, {len(arms)} arms, stages {a.stages}, "
         f"gen procs {gen_procs}, train slots {slots}, gpus {a.gpus}{' (MIG slices)' if mig else ''}{' pinned: ' + ' '.join(ids) if pin else ''}")
     for s in a.seeds:
         sa = ["--seeds", str(s), *fargs]
@@ -136,19 +141,19 @@ def main() -> None:
             jobs = [(m, stp, k) for k in folds for m, stp in arms]; gate = threading.Lock()
 
             def one(job: tuple) -> None:
-                m, stp, k = job; name = S.run_name(m, stp); out = OUT / "runs" / name / f"seed_{s}" / f"fold_{k}"
+                m, stp, k = job; name = S.run_name(m, stp); out = OUT / S.RUNS_SUB / name / f"seed_{s}" / f"fold_{k}"
                 if done(out / "results.json", epochs):
                     return
                 with gate:                                               # stagger the start-ups
                     cmd = S.command(s, k, m, stp, []); time.sleep(stagger)
                 g = free_gpus.get()
                 try:
-                    t0 = time.time(); rc = run(cmd, L / f"train_{name}_seed{s}_{k}.log", gpu_env(g))
+                    t0 = time.time(); rc = run(cmd, L / f"train_{name}{'' if a.hero == 'caao' else '_' + a.hero}_seed{s}_{k}.log", gpu_env(g))
                 finally:
                     free_gpus.put(g)
                 if not a.keep_checkpoints:
                     shutil.rmtree(out / "checkpoints", ignore_errors=True)
-                log(f"seed {s} fold {k} {name}: rc {rc}, {(time.time() - t0) / 60:.1f} min")
+                log(f"seed {s} fold {k} {name} [{a.hero}]: rc {rc}, {(time.time() - t0) / 60:.1f} min")
 
             log(f"seed {s}: training {len(jobs)} runs, {slots} at a time")
             with ThreadPoolExecutor(slots) as ex:

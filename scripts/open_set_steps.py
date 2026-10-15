@@ -69,6 +69,10 @@ _EXT: dict | None = None
 EPOCH_LIMIT = int(os.environ.get("OPEN_SET_EPOCH_LIMIT", E))
 # OPEN_SET_SETS="s2" (or "s2,s3"): restrict plan / generate / refine / dtd / cutmix to these image sets (partial pilots).
 ONLY_SETS = tuple(x for x in os.environ.get("OPEN_SET_SETS", "s2,s3,s4").split(",") if x)
+# OPEN_SET_HERO=mode3: train the synthetic arms with train_uninet.py --hero mode3 instead of caao; runs then go to
+# runs_mode3/ (never mixed with the caao runs in runs/). m1 always uses --hero m1.
+HERO = os.environ.get("OPEN_SET_HERO", "caao")
+RUNS_SUB = "runs" if HERO == "caao" else f"runs_{HERO}"
 
 
 def rebase(p) -> str:
@@ -450,9 +454,9 @@ def run_name(method: str, step: int) -> str:
 
 def command(s: int, fold: str, method: str, step: int, extra: list[str]) -> list[str]:
     r = run_lists(s, fold, method, step)
-    cmd = [sys.executable, "-u", str(ROOT / "scripts/train_uninet.py"), "--hero", "m1" if method == "m1" else "caao", "--no-photometric",
+    cmd = [sys.executable, "-u", str(ROOT / "scripts/train_uninet.py"), "--hero", "m1" if method == "m1" else HERO, "--no-photometric",
            "--cashew-100-dir", str(ROOT / THESIS["set"]), "--prep-dir", str(ROOT / THESIS["prep"]), "--mask-dir", str(ROOT / THESIS["masks"]),
-           "--output-dir", str(OUT / "runs" / run_name(method, step) / f"seed_{s}" / f"fold_{fold}"), "--seed", str(s), "--",
+           "--output-dir", str(OUT / RUNS_SUB / run_name(method, step) / f"seed_{s}" / f"fold_{fold}"), "--seed", str(s), "--",
            "--train-normal-list", str(r["train_normals"]), "--test-anomaly-list", str(r["test"]), "--fg-anomaly-dir", str(CASHEW / "birefnet_masks_anomaly")]
     cmd += ["--baseline-extra-list", str(r["m1_extra"])] if method == "m1" else ["--synthetic-epochs", str(r["epochs"])]
     if EPOCH_LIMIT < E:
