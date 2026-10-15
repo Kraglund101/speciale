@@ -210,3 +210,40 @@ OPEN_SET_ACCEPT_EXISTING=1 nohup python scripts/open_set_launch.py --profile b20
 `b200_results/open_set_v2/results_json_mode3.tar.xz`, copy `launch_mode3.out` and the mode3 lines of `launch.log` into
 `b200_results/open_set_v2/`, add a section "10. Mode 3 repeat" to `scripts/B200_RUN_REPORT.md` (what ran, runner hash,
 anomalib version, failures with the log line, any code change), commit on `b200-open-set` and **push**.
+
+## ORDER 2026-10-15 (2): new arm "mix-synthetic" = configuration 6 (60 runs)
+
+**What.** One new arm that mixes the four synthetic methods equally, open-set like every other arm. Script:
+`scripts/open_set_mix.py` (pushed; no other code change). Per held-out fold k, the run trains on the 45 slots of the
+five TRAINING types (9 per type; the held-out type never occurs - asserted). Each slot (canvas + placed footprint) has
+four fillings = the configuration-1 run lists of CutMix (fold-k images), DTD, Target-object, Cross-object, read via
+`open_set_steps.run_lists` exactly as the launcher does. Epoch e gives slot j the method `METHODS[(j + e) % 4]`
+-> 11-12 slots per method per epoch, every slot gets every method exactly 5 times over 20 epochs. Same train normals,
+test anomalies, seed, `--hero caao` (Mode 4), no photometric, 20 epochs. **No generation; no manifest rebuild.**
+Verified on Windows on your configuration-1 run lists (lists.tar.xz) for all 60 (seed, fold): slots and canvases agree
+across the 4 methods, no held-out slot, 5 x each method per slot.
+
+```bash
+git pull                                                  # branch b200-open-set
+ls results/open_set_v2/manifest | wc -l                   # must be 10; STOP if not (do NOT rebuild manifests)
+ls results/open_set_v2/runs/cutmix_s1/seed_55/fold_scratches/results.json   # configuration-1 data present
+python scripts/open_set_mix.py build --seeds 42 123 7 99 256 11 22 33 44 55   # writes lists/seed_*/fold_*/epochs_mix_s6.json, all checks
+# smoke test: 2 epochs, one run, then delete it
+python scripts/train_uninet.py --help > /dev/null && python - <<'PY'
+import sys, subprocess; sys.path.insert(0, "scripts"); import open_set_mix as M
+c = M.command(42, "holes"); c[c.index("--output-dir") + 1] += "_smoke"; subprocess.check_call(c + ["--epochs", "2"])
+PY
+grep -m1 "EpochPoolSampler" -r results/open_set_v2/runs/mix_synthetic_s6/ 2>/dev/null; rm -rf results/open_set_v2/runs/mix_synthetic_s6/seed_42/fold_holes_smoke
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4                # + MPS as in section 8 if used before
+nohup python scripts/open_set_mix.py run --seeds 42 123 7 99 256 11 22 33 44 55 --slots 12 --stagger 10 > launch_mix_s6.out 2>&1 &
+```
+- If `build` raises an AssertionError (slots / canvases differ between methods, missing files, held-out slot): STOP and
+  report the message; do not work around it.
+- The smoke run must print "EpochPoolSampler: 100 normals + 45 synthetics per epoch (20 pools)" in its output and finish
+  2 epochs. `run` skips finished 20-epoch runs, so a restart resumes.
+- If the Mode 3 order above is running at the same time, run this after it or lower `--slots` so the GPU is not oversubscribed.
+
+**When finished:** pack `runs/mix_synthetic_s6/seed_*/fold_*/results.json` (60) and the 60 `lists/seed_*/fold_*/epochs_mix_s6.json`
+into `b200_results/open_set_v2/results_json_mix_s6.tar.xz`, copy `launch_mix_s6.out` and the `[mix_s6]` lines of
+`launch.log` into `b200_results/open_set_v2/`, add a section "11. Mix-synthetic (configuration 6)" to
+`scripts/B200_RUN_REPORT.md`, commit on `b200-open-set` and **push**.
