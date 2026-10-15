@@ -209,3 +209,45 @@ parallel. Smoke test (seed 42 fold holes, 2 epochs, scratch dir) passed (EpochPo
 Result: 60 runs, all 50 epochs. Failed runs: none. Packed: `results_json_mix_s6_e50.tar.xz` (60 results.json +
 60 epochs_mix_s6.json), `launch_mix_s6.out`, `launch_mix_s6_lines.log`. No table here (50 epochs; compare with the
 50-epoch CAAO runs of section 11 for seeds 42/123/7, or with the 20-epoch table only with that caveat).
+
+## 13. Score dump, configuration 1, all 10 seeds (order 2026-10-15 (3), extended to 10 seeds by Frederik)
+
+300 runs (m1, cutmix_s1, dtd_s1, diffusion_in_s1, diffusion_cross_s1 x 6 folds x 10 seeds), `scripts/open_set_scores.py` +
+`score_runner.py` + `open_set_score_hist.py` (Windows commit b844fd3) with two server changes (this commit): (1)
+`open_set_scores.command` uses a read-only `run_lists` (asserts every list on disk equals what run_lists would write;
+no list is rewritten, because the Mode 3 job on another UCloud job reads them); (2) `score_runner` also stores the test
+image paths per entry (`files`, from the shuffle=False test dataset; `files_mismatch` true if count / labels disagree).
+Machine: whole B200 (UCloud job
+j-12422456), anomalib 2.2.0, OMP/MKL 4 threads, MPS, 12 runs in parallel. Smoke test (dtd_s1, fold holes, 2
+epochs) passed: epochs 0/1 x main/0x-4x, 70 scores each, EpochPoolSampler 20 pools; a second smoke test (seed 7,
+diffusion_cross_s1, fold scratches) checked the `files` field (65 paths, 0 mismatches); both deleted before the full run.
+All 1,260 run-list files byte-identical before and after (md5). `runs/` untouched (read-only).
+
+All 300 runs 'scores ok'; `open_set_score_hist.py` AUROC check passed (it asserts recomputed AUROC == results.json).
+Reproduction check (rerun vs original `runs/<arm>/seed_<s>/fold_<k>/results.json`, same seed and command):
+
+Seed 42, best-0x rerun / original:
+
+| arm | holes | breakage | burnt | colour_diff | colour_same | scratches |
+|---|---|---|---|---|---|---|
+| m1 | 0.999 / 0.999 | 0.998 / 0.998 | 0.962 / 0.962 | 1.000 / 1.000 | 0.724 / 0.724 | 0.916 / 0.916 |
+| cutmix_s1 | 0.999 / 1.000 | 0.971 / 0.995 | 0.980 / 0.960 | 1.000 / 1.000 | 0.758 / 0.766 | 0.869 / 0.903 |
+| dtd_s1 | 1.000 / 1.000 | 0.998 / 0.997 | 0.990 / 0.978 | 1.000 / 1.000 | 0.834 / 0.822 | 0.893 / 0.869 |
+| diffusion_in_s1 | 1.000 / 1.000 | 1.000 / 1.000 | 1.000 / 0.998 | 1.000 / 1.000 | 0.870 / 0.860 | 0.795 / 0.885 |
+| diffusion_cross_s1 | 1.000 / 1.000 | 1.000 / 0.996 | 1.000 / 0.996 | 1.000 / 1.000 | 0.844 / 0.928 | 0.899 / 0.887 |
+
+All 10 seeds, best-0x rerun minus original (60 runs per arm): mean / mean |diff| / max |diff|:
+
+- m1: +0.0000 / 0.0000 / 0.0000
+- cutmix_s1: +0.0007 / 0.0033 / 0.0920
+- dtd_s1: +0.0021 / 0.0022 / 0.0467
+- diffusion_in_s1: +0.0000 / 0.0030 / 0.0907
+- diffusion_cross_s1: -0.0011 / 0.0019 / 0.0840
+
+Packed: `score_dist_c1.tar.xz` (300 x results.json + image_scores.json), `figures/score_hist_c1/seed_<s>_<type>.png` (60),
+`launch_scores_c1.out`.
+
+Note (section 13): the image paths are stored under the key **`files`** (plus `files_mismatch`), NOT `images` as in Windows
+commit a696235, which was pushed while these runs were training. The server version of `score_runner.py` (the one that
+produced the 300 dumps) is kept in this commit. Checked after the run: all 64,800 entries of the 300 `image_scores.json`
+have `files`, 0 mismatches (count and labels agree with the shuffle=False test dataset).

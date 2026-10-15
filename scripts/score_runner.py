@@ -23,11 +23,10 @@ def _score_log(agg: str, labels, scores) -> None:
         fr = fr.f_back
     f = fr.f_locals if fr is not None else {}
     names = {id(v): k for k, v in f.get("shift_loaders", {}).items()}; names[id(f.get("test_loader"))] = "main"
-    smp = getattr(getattr(dl, "dataset", None), "samples", None)  # CashewDataset: (img, mask, label, canvas); test loaders are not shuffled
-    imgs = [str(x[0]) for x in smp] if smp is not None else None
-    assert imgs is None or (len(imgs) == len(labels) and [int(x[2]) for x in smp] == [int(x) for x in labels]), "image order"
-    LOG.append({"epoch": f.get("epoch"), "shift": names.get(id(dl), "?"), "agg": agg, "images": imgs,
-                "labels": [int(x) for x in labels], "scores": [float(x) for x in scores]})
+    lab = [int(x) for x in labels]; smp = getattr(dl.dataset, "samples", None)      # test loaders use shuffle=False
+    files = [str(x[0]) for x in smp] if smp is not None and len(smp) == len(lab) and [int(x[2]) for x in smp] == lab else None
+    LOG.append({"epoch": f.get("epoch"), "shift": names.get(id(dl), "?"), "agg": agg, "labels": lab,
+                "scores": [float(x) for x in scores], "files": files, "files_mismatch": files is None})
 
 
 src = inspect.getsource(M.evaluate); assert src.count(ANCHOR) == 1, "runner evaluate() changed: anchor line not found once"
