@@ -274,3 +274,42 @@ Packed: `b200_results/open_set_v2/results_json_mode3.tar.xz` (1,020 results.json
 `launch_mode3_lines.log`. `open_set_tables.py` reads `runs/` only, so no Mode 3 table was made here.
 The automatic push (finish_mode3.sh) failed at 22:01: a script edit had dropped the line that copies `launch_mode3.out`,
 so `git add` failed and nothing was committed. Verification had passed; the files were committed and pushed by hand.
+
+## 11. Mode 4 (CAAO) with 50 epochs, seeds 42 / 123 / 7 (order 2026-10-15)
+
+All 18 arms (m1 + 17 CAAO synthetic arms) x 6 folds x seeds 42, 123, 7 = 324 runs, 50 epochs instead of 20, otherwise
+the same settings, run lists and images as section 3 / 8 / 9. Results in `results/open_set_v2/runs_e50/` (the 20-epoch
+`runs/` and `runs_mode3/` were not touched). Code change (server, this commit): `open_set_launch.py --train-epochs N` /
+`OPEN_SET_TRAIN_EPOCHS`: passes `--epochs N` to the runner, writes to `runs[_<hero>]_e<N>/`, logs
+`train_<arm>_e<N>_seed<s>_<k>.log`, skips the tables stage. The runner cycles the 20 per-epoch synthetic pools
+(`EpochPoolSampler`: pool = epoch % 20), so epochs 21-50 reuse pools 1-20 - no new images. M1 also ran 50 epochs.
+LR schedule and other epoch-dependent behaviour follow the runner's handling of --epochs (not changed, not checked).
+
+Protection: before the run all finished 20-epoch results.json (runs/, runs_mode3/) were made read-only (chmod a-w) and
+their md5 recorded; after the run all 2100 were byte-identical (checked by finish_e50.sh).
+
+Table: `TABLES_e50.md` (open_set_tables.py code on runs_e50/, 'late' = epochs 45-50, paired with the 50-epoch M1).
+```
+| arm | stage | runs | composite, late | clean (0x), late | composite, last | strong blur (3x-4x), late | composite vs M1 (paired) | runs better than M1 |
+|---|---|---|---|---|---|---|---|---|
+| normal-only (M1) | – | 18 | 0.684 ± 0.064 | 0.941 ± 0.075 | 0.687 ± 0.072 | 0.467 ± 0.116 | – | – |
+| target-object | 1 | 18 | 0.773 ± 0.165 | 0.829 ± 0.176 | 0.758 ± 0.161 | 0.724 ± 0.148 | +0.088 | 11 of 18 |
+| cross-object | 1 | 18 | 0.791 ± 0.155 | 0.827 ± 0.166 | 0.800 ± 0.150 | 0.743 ± 0.132 | +0.107 | 12 of 18 |
+| DTD | 1 | 18 | 0.713 ± 0.144 | 0.817 ± 0.193 | 0.712 ± 0.139 | 0.660 ± 0.095 | +0.029 | 10 of 18 |
+| CutMix | 1 | 18 | 0.760 ± 0.163 | 0.817 ± 0.166 | 0.740 ± 0.160 | 0.744 ± 0.144 | +0.076 | 13 of 18 |
+| target-object | 2 | 18 | 0.803 ± 0.157 | 0.848 ± 0.169 | 0.802 ± 0.150 | 0.741 ± 0.151 | +0.119 | 12 of 18 |
+| cross-object | 2 | 18 | 0.824 ± 0.139 | 0.852 ± 0.153 | 0.818 ± 0.137 | 0.765 ± 0.136 | +0.140 | 14 of 18 |
+| DTD | 2 | 18 | 0.732 ± 0.147 | 0.845 ± 0.176 | 0.721 ± 0.155 | 0.668 ± 0.114 | +0.048 | 10 of 18 |
+| CutMix | 2 | 18 | 0.803 ± 0.159 | 0.842 ± 0.146 | 0.802 ± 0.162 | 0.764 ± 0.152 | +0.118 | 13 of 18 |
+| target-object | 3 | 18 | 0.800 ± 0.157 | 0.854 ± 0.169 | 0.801 ± 0.155 | 0.737 ± 0.146 | +0.116 | 12 of 18 |
+| cross-object | 3 | 18 | 0.816 ± 0.142 | 0.834 ± 0.165 | 0.809 ± 0.143 | 0.757 ± 0.139 | +0.132 | 14 of 18 |
+| DTD | 3 | 18 | 0.714 ± 0.154 | 0.835 ± 0.181 | 0.724 ± 0.142 | 0.646 ± 0.120 | +0.030 | 9 of 18 |
+| CutMix | 3 | 18 | 0.803 ± 0.166 | 0.836 ± 0.157 | 0.793 ± 0.172 | 0.762 ± 0.165 | +0.119 | 12 of 18 |
+| target-object | 4 | 18 | 0.800 ± 0.158 | 0.843 ± 0.175 | 0.802 ± 0.156 | 0.736 ± 0.148 | +0.116 | 12 of 18 |
+| cross-object | 4 | 18 | 0.817 ± 0.145 | 0.843 ± 0.163 | 0.814 ± 0.142 | 0.760 ± 0.138 | +0.133 | 13 of 18 |
+| DTD | 4 | 18 | 0.727 ± 0.146 | 0.835 ± 0.198 | 0.709 ± 0.147 | 0.652 ± 0.113 | +0.043 | 10 of 18 |
+| CutMix | 4 | 18 | 0.800 ± 0.164 | 0.841 ± 0.137 | 0.797 ± 0.166 | 0.757 ± 0.167 | +0.116 | 14 of 18 |
+| cross-object | 5 | 18 | 0.813 ± 0.151 | 0.842 ± 0.169 | 0.806 ± 0.152 | 0.759 ± 0.141 | +0.129 | 12 of 18 |
+
+```
+Failed stages / runs: none. Packed: `results_json_e50.tar.xz` (324), `launch_e50.out`, `launch_e50_lines.log`.
