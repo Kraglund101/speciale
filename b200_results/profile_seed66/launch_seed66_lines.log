@@ -1,0 +1,63 @@
+10-21 20:22  seed 66 plan: rc [1] in 0.1 min
+10-21 20:22  seed 66: STOP, plan failed (see /work/Jobs/data/other/speciale/results/open_set_v2/logs)
+10-21 20:22  seed 66: training 108 runs, 12 at a time
+10-21 21:21  seed 66 plan: rc [0] in 3.5 min
+10-21 23:11  seed 66 generate: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 109.9 min
+10-21 23:18  seed 66 refine: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 7.3 min
+10-21 23:20  seed 66 dtd: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 2.0 min
+10-21 23:24  seed 66 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 3.3 min
+10-21 23:25  seed 66 check: rc [0] in 1.4 min
+10-21 23:25  seed 66: training 108 runs, 12 at a time
+10-21 23:39  seed 66 fold holes m1 [caao]: rc 0, 14.0 min
+10-21 23:52  seed 66 fold holes diffusion_in_s1 [caao]: rc 0, 26.0 min
+10-21 23:52  seed 66 fold holes diffusion_cross_s1 [caao]: rc 0, 25.9 min
+10-21 23:52  seed 66 fold holes dtd_s1 [caao]: rc 0, 25.9 min
+10-21 23:53  seed 66 fold holes cutmix_s1 [caao]: rc 0, 26.7 min
+10-21 23:53  seed 66 fold holes diffusion_in_s2 [caao]: rc 0, 26.8 min
+10-21 23:54  seed 66 fold holes diffusion_cross_s2 [caao]: rc 0, 27.0 min
+10-21 23:54  seed 66 fold holes dtd_s2 [caao]: rc 0, 27.2 min
+10-21 23:54  seed 66 fold holes diffusion_in_s3 [caao]: rc 0, 27.2 min
+10-21 23:54  seed 66 fold holes cutmix_s2 [caao]: rc 0, 27.4 min
+10-21 23:55  seed 66 fold holes diffusion_cross_s3 [caao]: rc 0, 27.3 min
+10-21 23:55  seed 66 fold holes dtd_s3 [caao]: rc 0, 27.7 min
+10-22 00:06  seed 66 fold holes cutmix_s3 [caao]: rc 0, 26.7 min
+10-22 00:16  seed 66 fold breakage m1 [caao]: rc 0, 22.8 min
+10-22 00:24  seed 66 fold holes diffusion_in_s4 [caao]: rc 0, 32.0 min
+10-22 00:24  seed 66 fold holes diffusion_cross_s4 [caao]: rc 0, 32.3 min
+10-22 00:25  seed 66 fold holes dtd_s4 [caao]: rc 0, 32.6 min
+10-22 00:26  seed 66 fold holes cutmix_s4 [caao]: rc 0, 32.6 min
+10-22 00:26  seed 66 fold holes diffusion_cross_s5 [caao]: rc 0, 32.6 min
+10-22 00:27  seed 66 fold breakage diffusion_in_s1 [caao]: rc 0, 33.3 min
+10-22 00:28  seed 66 fold breakage dtd_s1 [caao]: rc 0, 33.1 min
+10-22 00:28  seed 66 fold breakage cutmix_s1 [caao]: rc 0, 33.0 min
+10-22 00:28  seed 66 fold breakage diffusion_cross_s1 [caao]: rc 0, 33.4 min
+10-22 00:29  seed 66 fold breakage diffusion_in_s2 [caao]: rc 0, 33.4 min
+10-22 00:33  seed 66 fold breakage diffusion_cross_s2 [caao]: rc 0, 26.4 min
+10-22 00:41  seed 66 fold breakage dtd_s2 [caao]: rc 0, 24.8 min
+10-22 00:47  seed 66 fold burnt m1 [caao]: rc 0, 14.1 min
+10-22 00:49  seed 66 fold breakage cutmix_s2 [caao]: rc 0, 25.2 min
+10-22 00:50  seed 66 fold breakage diffusion_in_s3 [caao]: rc 0, 25.6 min
+10-22 00:51  seed 66 fold breakage diffusion_cross_s3 [caao]: rc 0, 26.0 min
+10-22 00:52  seed 66 fold breakage cutmix_s3 [caao]: rc 0, 25.4 min
+10-22 00:52  seed 66 fold breakage dtd_s3 [caao]: rc 0, 26.0 min
+10-22 00:53  seed 66 fold breakage diffusion_in_s4 [caao]: rc 0, 25.2 min
+10-22 00:53  seed 66 fold breakage diffusion_cross_s4 [caao]: rc 0, 25.2 min
+10-22 00:54  seed 66 fold breakage dtd_s4 [caao]: rc 0, 25.8 min
+10-22 00:54  seed 66 fold breakage cutmix_s4 [caao]: rc 0, 25.7 min
+10-22 00:55  seed 66 fold breakage diffusion_cross_s5 [caao]: rc 0, 25.7 min
+10-22 01:02  seed 66 fold burnt diffusion_in_s1 [caao]: rc 0, 19.9 min
+10-22 01:08  seed 66 fold burnt diffusion_cross_s1 [caao]: rc 0, 20.0 min
+10-22 01:10  seed 66 fold burnt dtd_s1 [caao]: rc 0, 20.1 min
+10-22 01:11  seed 66 fold burnt cutmix_s1 [caao]: rc 0, 20.3 min
+10-22 01:12  seed 66 fold burnt diffusion_in_s2 [caao]: rc 0, 20.9 min
+10-22 01:13  seed 66 fold burnt diffusion_cross_s2 [caao]: rc 0, 21.0 min
+10-22 01:13  seed 66 fold burnt dtd_s2 [caao]: rc 0, 20.9 min
+10-22 01:14  seed 66 fold burnt diffusion_in_s3 [caao]: rc 0, 20.2 min
+10-22 01:14  seed 66 fold burnt cutmix_s2 [caao]: rc 0, 20.8 min
+10-22 01:15  seed 66 fold burnt diffusion_cross_s3 [caao]: rc 0, 20.6 min
+10-22 01:15  seed 66 fold burnt dtd_s3 [caao]: rc 0, 20.9 min
+10-22 01:15  seed 66 fold burnt cutmix_s3 [caao]: rc 0, 20.6 min
+10-22 01:21  seed 66 fold burnt diffusion_in_s4 [caao]: rc 0, 19.5 min
+10-22 01:26  seed 66 fold colour_diff m1 [caao]: rc 0, 12.5 min
+10-22 01:28  seed 66 fold burnt diffusion_cross_s4 [caao]: rc 0, 19.8 min
+10-22 01:30  seed 66 fold burnt dtd_s4 [caao]: rc 0, 20.5 min

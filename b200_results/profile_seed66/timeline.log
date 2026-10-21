@@ -1,0 +1,3 @@
+2026-10-21 21:18:12 start prep stages (plan generate refine dtd cutmix check)
+2026-10-21 23:25:45 prep stages done; start train stage (108 runs)
+2026-10-22 01:32:00 first train stage stopped at 53/108 runs: py-spy at 20 Hz over ~230 processes used ~40 of 48 cores (CPU throttled every period, GPU 15-23 %) - timings of those 53 runs are distorted (results valid)
