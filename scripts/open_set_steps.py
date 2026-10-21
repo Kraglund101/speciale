@@ -148,11 +148,28 @@ def anomaly_plan(refs: dict) -> dict:
     return plan
 
 
+def extra_budget(s: int, refs: dict) -> dict:
+    """Budget anomalies for a seed outside the 10-seed plan (2026-10-21, e.g. the profiling seed 66): same rule as
+    anomaly_plan - fewest-used first over the 10 planned seeds, random tie-break (rng seeded by s) - stored in
+    anomaly_plan_b<BUDGET>_extra.json; the 10-seed plan file is never changed."""
+    f = OUT / f"anomaly_plan_b{BUDGET}_extra.json"; extra = json.loads(f.read_text()) if f.exists() else {}
+    if str(s) not in extra:
+        plan = anomaly_plan(refs); rng = np.random.default_rng([2026, s]); extra[str(s)] = {}
+        for cls in CLASSES:
+            cnt = {r["id"]: 0 for r in refs[cls]}
+            for p_ in plan.values():
+                for a in p_[cls]:
+                    cnt[a] += 1
+            extra[str(s)][cls] = sorted(sorted(cnt, key=lambda a: (cnt[a], rng.random()))[:BUDGET])
+        json.dump(extra, open(f, "w"), indent=1)
+    return extra[str(s)]
+
+
 def build_manifest(s: int, refs: dict, pool: list[str]) -> dict:
     rng = np.random.default_rng([s, 1]); R = K // BUDGET
     canv = [str(x) for x in rng.choice(pool, size=len(CLASSES) * K, replace=False)]
     groups = {t: sorted(canv[g * K:(g + 1) * K]) for g, t in enumerate(CLASSES)}
-    budget = anomaly_plan(refs)[str(s)]
+    budget = anomaly_plan(refs).get(str(s)) or extra_budget(s, refs)
     s2 = {}                                                            # same anomalies, same canvases, re-paired per epoch
     for t in CLASSES:
         r2 = np.random.default_rng(P.method_seed(s, t, -1, "s2")); A, G, steps = budget[t], groups[t], []
