@@ -5,6 +5,11 @@
 2026-10-21 21:18:12 start prep stages (plan generate refine dtd cutmix check)
 2026-10-21 23:25:45 prep stages done; start train stage (108 runs)
 2026-10-22 01:32:00 first train stage stopped at 53/108 runs: py-spy at 20 Hz over ~230 processes used ~40 of 48 cores (CPU throttled every period, GPU 15-23 %) - timings of those 53 runs are distorted (results valid)
+Created autostash: 2184112
+Applied autostash.
+2026-10-22 01:32:06 PUSHED 7d1bc1e Seed-66 profile, part 1: prep stages (plan..check) profile + stage times (training restarting at 2 Hz)
+2026-10-22 01:32:06 restart train stage (remaining runs), py-spy 2 Hz
+2026-10-22 01:35:08 first train stage stopped at 53/108 runs: py-spy at 20 Hz over ~230 processes used ~40 of 48 cores (CPU throttled every period, GPU 15-23 %) - timings of those 53 runs are distorted (results valid)
 ```
 
 ## Stage wall times (launch.log)
@@ -19,9 +24,10 @@
 10-21 23:24  seed 66 cutmix: rc [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] in 3.3 min
 10-21 23:25  seed 66 check: rc [0] in 1.4 min
 10-21 23:25  seed 66: training 108 runs, 12 at a time
+10-22 01:32  seed 66: training 108 runs, 12 at a time
 ```
 
-Trainings: 53 runs rc 0, wall per run mean 25.0 min (min 12.5, max 33.4); 12 in parallel; runs of the clean (2 Hz) training restart only.
+Trainings: 53 runs rc 0, wall per run mean 25.0 min (min 12.5, max 33.4); 12 in parallel; runs of the 1 Hz training restart only.
 
 ## py-spy: prep stages (24.91 h process-time sampled at 20 Hz, idle included, main threads only)
 
@@ -44,4 +50,4 @@ Mean CPU use 29.4 cores; throttled in 74275 of 151851 scheduler periods.
 Power mean 477 W (cap 1000 W); SM activity mean 64 %; memory-bandwidth activity mean 12 %; 1518 samples.
 
 Raw profiles: `pyspy_prep.txt`, `pyspy_train.txt` (collapsed stacks; open in https://www.speedscope.app or
-any flamegraph tool). Process-time = main-thread samples / rate (prep 20 Hz, train 2 Hz) per process (secondary threads excluded), so 12 parallel trainings add up to ~12x wall time.
+any flamegraph tool). Process-time = main-thread samples / rate (prep 20 Hz, train 1 Hz) per process (secondary threads excluded), so 12 parallel trainings add up to ~12x wall time.

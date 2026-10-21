@@ -61,3 +61,4 @@
 10-22 01:26  seed 66 fold colour_diff m1 [caao]: rc 0, 12.5 min
 10-22 01:28  seed 66 fold burnt diffusion_cross_s4 [caao]: rc 0, 19.8 min
 10-22 01:30  seed 66 fold burnt dtd_s4 [caao]: rc 0, 20.5 min
+10-22 01:32  seed 66: training 108 runs, 12 at a time
