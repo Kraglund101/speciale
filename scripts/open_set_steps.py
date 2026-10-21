@@ -78,6 +78,11 @@ RUNS_SUB = "runs" if HERO == "caao" else f"runs_{HERO}"
 TRAIN_EPOCHS = int(os.environ.get("OPEN_SET_TRAIN_EPOCHS", E))
 if TRAIN_EPOCHS != E:
     RUNS_SUB += f"_e{TRAIN_EPOCHS}"
+# OPEN_SET_RUNS_TAG=<tag> (2026-10-21, e.g. "profile"): runs go to <RUNS_SUB>_<tag>/ - for extra seeds / tests that must not
+# enter runs/ (open_set_tables.py reads every seed found in runs/).
+RUNS_TAG = os.environ.get("OPEN_SET_RUNS_TAG", "")
+if RUNS_TAG:
+    RUNS_SUB += f"_{RUNS_TAG}"
 
 
 def rebase(p) -> str:
