@@ -62,3 +62,28 @@
 10-22 01:28  seed 66 fold burnt diffusion_cross_s4 [caao]: rc 0, 19.8 min
 10-22 01:30  seed 66 fold burnt dtd_s4 [caao]: rc 0, 20.5 min
 10-22 01:32  seed 66: training 108 runs, 12 at a time
+10-22 01:35  seed 66: training 108 runs, 12 at a time
+10-22 01:47  seed 66 fold colour_diff diffusion_in_s2 [caao]: rc 0, 11.7 min
+10-22 01:47  seed 66 fold colour_diff diffusion_in_s4 [caao]: rc 0, 11.9 min
+10-22 01:47  seed 66 fold colour_diff dtd_s4 [caao]: rc 0, 12.0 min
+10-22 01:48  seed 66 fold colour_diff dtd_s3 [caao]: rc 0, 12.2 min
+10-22 01:48  seed 66 fold colour_diff diffusion_cross_s2 [caao]: rc 0, 12.5 min
+10-22 01:48  seed 66 fold colour_diff cutmix_s2 [caao]: rc 0, 12.4 min
+10-22 01:49  seed 66 fold colour_diff diffusion_cross_s3 [caao]: rc 0, 12.5 min
+10-22 01:49  seed 66 fold colour_diff cutmix_s3 [caao]: rc 0, 12.6 min
+10-22 01:49  seed 66 fold colour_diff diffusion_in_s3 [caao]: rc 0, 12.6 min
+10-22 01:49  seed 66 fold colour_diff dtd_s2 [caao]: rc 0, 12.5 min
+10-22 01:49  seed 66 fold colour_diff cutmix_s1 [caao]: rc 0, 12.4 min
+10-22 01:49  seed 66 fold colour_diff diffusion_cross_s4 [caao]: rc 0, 12.4 min
+10-22 01:54  seed 66 fold colour_same m1 [caao]: rc 0, 7.0 min
+10-22 01:58  seed 66 fold colour_diff cutmix_s4 [caao]: rc 0, 11.6 min
+10-22 01:59  seed 66 fold colour_diff diffusion_cross_s5 [caao]: rc 0, 11.6 min
+10-22 02:01  seed 66 fold colour_same diffusion_in_s1 [caao]: rc 0, 12.9 min
+10-22 02:02  seed 66 fold colour_same diffusion_cross_s1 [caao]: rc 0, 13.2 min
+10-22 02:02  seed 66 fold colour_same dtd_s1 [caao]: rc 0, 13.1 min
+10-22 02:02  seed 66 fold colour_same cutmix_s1 [caao]: rc 0, 13.1 min
+10-22 02:02  seed 66 fold colour_same dtd_s2 [caao]: rc 0, 13.1 min
+10-22 02:02  seed 66 fold colour_same diffusion_cross_s2 [caao]: rc 0, 13.3 min
+10-22 02:02  seed 66 fold colour_same cutmix_s2 [caao]: rc 0, 12.9 min
+10-22 02:03  seed 66 fold colour_same diffusion_in_s2 [caao]: rc 0, 13.5 min
+10-22 02:03  seed 66 fold colour_same diffusion_in_s3 [caao]: rc 0, 13.0 min
