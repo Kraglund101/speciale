@@ -1,0 +1,44 @@
+[
+ {
+  "id": "001",
+  "raw": "burnt",
+  "image": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Images/Anomaly/easy_imgs/001.JPG",
+  "gt_mask": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Masks/Anomaly/001.png"
+ },
+ {
+  "id": "004",
+  "raw": "burnt",
+  "image": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Images/Anomaly/easy_imgs/004.JPG",
+  "gt_mask": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Masks/Anomaly/004.png"
+ },
+ {
+  "id": "005",
+  "raw": "burnt",
+  "image": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Images/Anomaly/easy_imgs/005.JPG",
+  "gt_mask": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Masks/Anomaly/005.png"
+ },
+ {
+  "id": "007",
+  "raw": "burnt",
+  "image": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Images/Anomaly/easy_imgs/007.JPG",
+  "gt_mask": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Masks/Anomaly/007.png"
+ },
+ {
+  "id": "008",
+  "raw": "burnt",
+  "image": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Images/Anomaly/easy_imgs/008.JPG",
+  "gt_mask": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Masks/Anomaly/008.png"
+ },
+ {
+  "id": "010",
+  "raw": "burnt",
+  "image": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Images/Anomaly/easy_imgs/010.JPG",
+  "gt_mask": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Masks/Anomaly/010.png"
+ },
+ {
+  "id": "011",
+  "raw": "burnt",
+  "image": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Images/Anomaly/easy_imgs/011.JPG",
+  "gt_mask": "/work/Jobs/data/other/speciale/anomverse_extension/datasets/VisA_validation_dataset/datasets/easy_test/cashew/Data/Masks/Anomaly/011.png"
+ }
+]

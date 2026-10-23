@@ -1,0 +1,12 @@
+2026-10-23 15:39:02 start generate
+2026-10-23 15:49:16 generate finished; shards without 'done': 0
+2026-10-23 15:49:16 start refine
+2026-10-23 15:50:16 refine finished; shards without 'done': 0
+2026-10-23 15:50:31 check rc 0: check: 0 problem(s)
+2026-10-23 15:50:31 PREP OK
+2026-10-23 15:50:52 check all variants: check: 0 problem(s)
+2026-10-23 15:50:52 smoke test start
+2026-10-23 15:53:30 smoke OK: 6 of 6 runs
+2026-10-23 15:53:31 full run start (360 runs)
+2026-10-23 21:06:31 full run exited: 360 ok, 0 bad
+2026-10-23 21:06:51 eval rc 0

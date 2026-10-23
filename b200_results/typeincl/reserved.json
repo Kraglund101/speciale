@@ -1,0 +1,139 @@
+{
+ "rule": "3 per type, by ground-truth defect area (no AUROC involved): the images at the 1/6, 1/2 and 5/6 positions of the\n    area-sorted list (small / medium / large). If all 3 share one raw subtype while the type has several, the middle pick\n    is replaced by the median-area image of the other subtype. Written once; never re-chosen.",
+ "reserved": {
+  "holes": [
+   "069",
+   "075",
+   "076"
+  ],
+  "breakage": [
+   "021",
+   "035",
+   "048"
+  ],
+  "burnt": [
+   "003",
+   "006",
+   "052"
+  ],
+  "colour_diff": [
+   "030",
+   "031",
+   "068"
+  ],
+  "colour_same": [
+   "044",
+   "056",
+   "059"
+  ],
+  "scratches": [
+   "085",
+   "087",
+   "090"
+  ]
+ },
+ "details": {
+  "holes": [
+   {
+    "id": "069",
+    "raw": "small holes",
+    "gt_area_pct": 0.0147
+   },
+   {
+    "id": "075",
+    "raw": "small holes",
+    "gt_area_pct": 0.0278
+   },
+   {
+    "id": "076",
+    "raw": "small holes",
+    "gt_area_pct": 0.0708
+   }
+  ],
+  "breakage": [
+   {
+    "id": "048",
+    "raw": "corner or edge breakage",
+    "gt_area_pct": 0.2043
+   },
+   {
+    "id": "021",
+    "raw": "corner or edge breakage",
+    "gt_area_pct": 0.3115
+   },
+   {
+    "id": "035",
+    "raw": "middle breakage",
+    "gt_area_pct": 0.6701
+   }
+  ],
+  "burnt": [
+   {
+    "id": "052",
+    "raw": "burnt",
+    "gt_area_pct": 0.0904
+   },
+   {
+    "id": "003",
+    "raw": "burnt",
+    "gt_area_pct": 0.147
+   },
+   {
+    "id": "006",
+    "raw": "burnt",
+    "gt_area_pct": 0.2405
+   }
+  ],
+  "colour_diff": [
+   {
+    "id": "068",
+    "raw": "different colour spot",
+    "gt_area_pct": 0.0192
+   },
+   {
+    "id": "031",
+    "raw": "different colour spot",
+    "gt_area_pct": 0.0902
+   },
+   {
+    "id": "030",
+    "raw": "different colour spot",
+    "gt_area_pct": 0.1302
+   }
+  ],
+  "colour_same": [
+   {
+    "id": "059",
+    "raw": "same colour spot",
+    "gt_area_pct": 0.0673
+   },
+   {
+    "id": "044",
+    "raw": "same colour spot",
+    "gt_area_pct": 0.0695
+   },
+   {
+    "id": "056",
+    "raw": "same colour spot",
+    "gt_area_pct": 0.1585
+   }
+  ],
+  "scratches": [
+   {
+    "id": "085",
+    "raw": "small scratches",
+    "gt_area_pct": 0.1067
+   },
+   {
+    "id": "087",
+    "raw": "small scratches",
+    "gt_area_pct": 0.1615
+   },
+   {
+    "id": "090",
+    "raw": "small scratches",
+    "gt_area_pct": 0.2541
+   }
+  ]
+ }
+}
