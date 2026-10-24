@@ -1,0 +1,6 @@
+[repro_a262] 2 runs, 1 per slice on 4 slices
+10-24 12:38  [repro_a262] open diffusion_cross seed 42 fold colour_same on MIG-3ba1288b: rc 0, 13.5 min, scores ok
+10-24 12:39  [repro_a262] open diffusion_in seed 42 fold holes on MIG-0fcece85: rc 0, 14.7 min, scores ok
+GATE diffusion_cross seed 42 fold colour_same: EXACT (0 differing values)
+GATE diffusion_in seed 42 fold holes: EXACT (0 differing values)
+GATE SCRIPT EXITED rc 0

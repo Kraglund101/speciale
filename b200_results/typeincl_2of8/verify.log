@@ -1,0 +1,26 @@
+diffusion_in seed 42 fold holes: EXACT
+diffusion_in seed 42 fold breakage: EXACT
+diffusion_in seed 42 fold burnt: EXACT
+diffusion_in seed 42 fold colour_diff: EXACT
+diffusion_in seed 42 fold colour_same: EXACT
+diffusion_in seed 42 fold scratches: EXACT
+diffusion_cross seed 42 fold holes: EXACT
+diffusion_cross seed 42 fold breakage: EXACT
+diffusion_cross seed 42 fold burnt: EXACT
+diffusion_cross seed 42 fold colour_diff: EXACT
+diffusion_cross seed 42 fold colour_same: EXACT
+diffusion_cross seed 42 fold scratches: EXACT
+diffusion_in seed 123 fold holes: EXACT
+diffusion_in seed 123 fold breakage: EXACT
+diffusion_in seed 123 fold burnt: EXACT
+diffusion_in seed 123 fold colour_diff: EXACT
+diffusion_in seed 123 fold colour_same: EXACT
+diffusion_in seed 123 fold scratches: EXACT
+diffusion_cross seed 123 fold holes: EXACT
+diffusion_cross seed 123 fold breakage: EXACT
+diffusion_cross seed 123 fold burnt: EXACT
+diffusion_cross seed 123 fold colour_diff: EXACT
+diffusion_cross seed 123 fold colour_same: EXACT
+diffusion_cross seed 123 fold scratches: EXACT
+VERIFY: 24/24 exact
+VERIFY EXITED rc 0

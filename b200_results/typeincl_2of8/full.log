@@ -1,0 +1,31 @@
+[repro_a262] 46 runs, 2 per slice on 4 slices
+10-24 15:00  [repro_a262] gate finished: 2 more slots
+10-24 15:13  [repro_a262] open diffusion_cross seed 123 fold colour_diff on MIG-2a95e10e: rc 0, 12.4 min, scores ok
+10-24 15:14  [repro_a262] open diffusion_cross seed 123 fold colour_same on MIG-fadd22c0: rc 0, 13.3 min, scores ok
+10-24 15:17  [repro_a262] ti diffusion_in seed 42 fold burnt on MIG-90767de9: rc 0, 15.8 min, scores ok
+10-24 15:17  [repro_a262] ti diffusion_in seed 42 fold colour_diff on MIG-0aa43ce0: rc 0, 16.0 min, scores ok
+10-24 15:18  [repro_a262] open diffusion_cross seed 123 fold scratches on MIG-0aa43ce0: rc 0, 17.8 min, scores ok
+10-24 15:18  [repro_a262] open diffusion_cross seed 123 fold breakage on MIG-90767de9: rc 0, 18.3 min, scores ok
+10-24 15:19  [repro_a262] ti diffusion_in seed 42 fold holes on MIG-2a95e10e: rc 0, 18.3 min, scores ok
+10-24 15:19  [repro_a262] ti diffusion_in seed 42 fold breakage on MIG-fadd22c0: rc 0, 18.2 min, scores ok
+10-24 15:28  [repro_a262] ti diffusion_in seed 42 fold colour_same on MIG-2a95e10e: rc 0, 15.4 min, scores ok
+10-24 15:31  [repro_a262] ti diffusion_in seed 42 fold scratches on MIG-fadd22c0: rc 0, 17.5 min, scores ok
+10-24 15:33  [repro_a262] ti diffusion_cross seed 42 fold burnt on MIG-0aa43ce0: rc 0, 14.8 min, scores ok
+10-24 15:33  [repro_a262] ti diffusion_cross seed 42 fold colour_diff on MIG-90767de9: rc 0, 14.8 min, scores ok
+10-24 15:34  [repro_a262] ti diffusion_cross seed 42 fold colour_same on MIG-2a95e10e: rc 0, 15.1 min, scores ok
+10-24 15:36  [repro_a262] ti diffusion_cross seed 42 fold holes on MIG-90767de9: rc 0, 19.1 min, scores ok
+10-24 15:36  [repro_a262] ti diffusion_cross seed 42 fold breakage on MIG-0aa43ce0: rc 0, 18.8 min, scores ok
+10-24 15:36  [repro_a262] ti diffusion_cross seed 42 fold scratches on MIG-fadd22c0: rc 0, 17.0 min, scores ok
+10-24 15:46  [repro_a262] ti diffusion_in seed 123 fold holes on MIG-2a95e10e: rc 0, 17.5 min, scores ok
+10-24 15:48  [repro_a262] ti diffusion_in seed 123 fold burnt on MIG-0aa43ce0: rc 0, 14.5 min, scores ok
+10-24 15:48  [repro_a262] ti diffusion_in seed 123 fold colour_diff on MIG-90767de9: rc 0, 14.4 min, scores ok
+10-24 15:49  [repro_a262] ti diffusion_in seed 123 fold colour_same on MIG-2a95e10e: rc 0, 14.4 min, scores ok
+10-24 15:50  [repro_a262] ti diffusion_in seed 123 fold breakage on MIG-fadd22c0: rc 0, 18.7 min, scores ok
+10-24 15:51  [repro_a262] ti diffusion_in seed 123 fold scratches on MIG-90767de9: rc 0, 14.7 min, scores ok
+10-24 15:52  [repro_a262] ti diffusion_cross seed 123 fold holes on MIG-0aa43ce0: rc 0, 15.8 min, scores ok
+10-24 15:53  [repro_a262] ti diffusion_cross seed 123 fold breakage on MIG-fadd22c0: rc 0, 16.1 min, scores ok
+10-24 15:58  [repro_a262] ti diffusion_cross seed 123 fold colour_diff on MIG-0aa43ce0: rc 0, 10.4 min, scores ok
+10-24 15:58  [repro_a262] ti diffusion_cross seed 123 fold colour_same on MIG-90767de9: rc 0, 10.3 min, scores ok
+10-24 16:00  [repro_a262] ti diffusion_cross seed 123 fold burnt on MIG-2a95e10e: rc 0, 13.6 min, scores ok
+10-24 16:02  [repro_a262] ti diffusion_cross seed 123 fold scratches on MIG-2a95e10e: rc 0, 13.1 min, scores ok
+FULL SCRIPT EXITED rc 0
